@@ -1,0 +1,8 @@
+# 统一用 LF 存，检出时交给 Git 处理，避免跨平台 diff 全红
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.jar binary
+*.keystore binary
+*.png binary
+*.jpg binary

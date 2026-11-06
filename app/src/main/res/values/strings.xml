@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">月溯</string>
+    <string name="service_label">月溯（让 AI 操作本机）</string>
+    <string name="service_desc">允许本应用读取屏幕内容、点击、输入与截图，用来完成你在对话里交代的任务。权限只在本开关开启期间有效，随时可以关闭，关闭后立即失效。</string>
+</resources>

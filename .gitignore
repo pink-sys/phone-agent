@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------- 构建产物
+/build/
+/app/build/
+*.apk
+*.aab
+
+# ---------------------------------------------------------------- 凭据与本地配置
+# 真实凭证写在本地 secrets.properties，构建时生成 Secrets.kt —— 两者都不进仓库
+/secrets.properties
+/app/src/main/java/cn/wbphone/agent/Secrets.kt
+/local.properties
+/.gradle/
+/.idea/
+*.iml
+
+# 签名文件：构建时缺了会自动生成；换签名等于换应用，不要跨机器共用
+/tools/debug.keystore
+
+# ---------------------------------------------------------------- 个人资料
+# 设计稿与内部网关说明留在本地，不属于仓库内容
+/docs/design-preview.html
+/docs/ui-mist-preview.html
+/docs/dsh-go-setup.md
+
+# ---------------------------------------------------------------- 杂项
+*.log
+.DS_Store
+Thumbs.db

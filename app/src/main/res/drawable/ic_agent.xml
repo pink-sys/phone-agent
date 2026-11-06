@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 月溯：深蓝夜空 + 米白月牙 + 一点星光（照用户提供的 logo 图重画） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 深蓝圆角方底 -->
+    <path
+        android:fillColor="#122646"
+        android:pathData="M26,0h56a26,26 0 0 1 26,26v56a26,26 0 0 1 -26,26h-56a26,26 0 0 1 -26,-26v-56a26,26 0 0 1 26,-26z" />
+    <!-- 月牙：外弧沿大圆走左侧，内弧沿偏移圆收回（开口朝右上） -->
+    <path
+        android:fillColor="#FCF5E2"
+        android:pathData="M42.9,16.3 A40,40 0 1 0 84.2,73.1 A36,36 0 0 1 42.9,16.3 Z" />
+    <!-- 四角星光，落在月牙开口里 -->
+    <path
+        android:fillColor="#FCF5E2"
+        android:pathData="M75,24 Q77.3,37.5 89,40 Q77.3,42.5 75,56 Q72.7,42.5 61,40 Q72.7,37.5 75,24 Z" />
+</vector>
