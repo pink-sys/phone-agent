@@ -18,7 +18,7 @@
 │  AgentLoop   模型 → 工具 → 结果回填 → 再问模型，直到收敛      │
 │    ├── CloudClient   POST /v2/chat/completions，读 SSE 流     │
 │    ├── Auth          轮询式登录 + Keystore 加密存令牌         │
-│    ├── PhoneToolbox  21 个工具 ──→ Approval 拦截敏感动作      │
+│    ├── PhoneToolbox  22 个工具 ──→ Approval 拦截敏感动作      │
 │    │                    └──────→ 无障碍服务（读屏/点按/输入）  │
 │    └── Workbench     文件、文档、网页、记忆、技能、shell       │
 └──────────────────────────────┬───────────────────────────────┘
@@ -74,7 +74,7 @@
 | `phone_swipe` | 直线滑动（滚动列表、拖动滑块） |
 | `phone_screenshot` | 截图给模型看；支持只截一块并放大 |
 
-### 工作台（11 个）
+### 工作台（12 个）
 
 `fs_list` `fs_read` `fs_write` `fs_edit` `fs_search` `web_fetch`
 `pdf_write` `pptx_write` `docx_write` `memory_save` `skill_load` `shell`（默认关闭）
