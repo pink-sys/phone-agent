@@ -10,12 +10,15 @@
   apksigner  APK 签名
 
 用法：
-    python tools/build_apk.py            # 默认 debug 签名
+    python tools/build_apk.py            # 日常构建，产出 build/app-debug.apk
+    python tools/build_apk.py --release  # 发布构建，产出 build/yueshu-<版本>.apk
     JAVA_HOME=... WB_ANDROID_TOOLS=... python tools/build_apk.py
 
-产出的 APK 在 build/app-debug.apk。
+两种构建的字节码与签名完全相同，区别只在产物文件名和结尾多打一行 SHA-256，
+方便发版时把校验值贴进 release 说明。
 """
 import glob
+import hashlib
 import os
 import re
 import shutil
@@ -135,6 +138,9 @@ def need(path, what):
 
 
 def main():
+    release = "--release" in sys.argv[1:]
+    out_name = "yueshu-%s.apk" % VERSION_NAME if release else "app-debug.apk"
+
     # 凭证文件先就位：Secrets.kt 是生成的（gitignored），没有就生成空值版本
     has_secrets = write_secrets()
     if not has_secrets:
@@ -293,7 +299,7 @@ def main():
         print("已生成常驻签名 tools/debug.keystore（之后所有构建都用它）")
     keystore = os.path.join(work, "debug.keystore")
     shutil.copyfile(persistent_ks, keystore)
-    signed = os.path.join(work, "app-debug.apk")
+    signed = os.path.join(work, out_name)
     signer_src = os.path.join(ROOT, "tools", "SignApk.java")
     need(signer_src, "SignApk.java")
     signer_out = os.path.join(work, "signer")
@@ -314,13 +320,17 @@ def main():
 
     # 拷回工程目录
     os.makedirs(BUILD, exist_ok=True)
-    final = os.path.join(BUILD, "app-debug.apk")
+    final = os.path.join(BUILD, out_name)
     shutil.copyfile(signed, final)
     if cleanup:
         shutil.rmtree(work_root, ignore_errors=True)
 
     size = os.path.getsize(final) / 1024.0
     print("\n完成：%s（%.0f KB）" % (final, size))
+    if release:
+        digest = hashlib.sha256(open(final, "rb").read()).hexdigest()
+        # 发版时把这行贴进 GitHub Release 说明，用户下载后可以自己核对
+        print("SHA-256：%s" % digest)
     print("安装：adb install -r \"%s\"" % final)
 
 

@@ -28,6 +28,23 @@
 
 ---
 
+## 下载安装
+
+到 [Releases](https://github.com/pink-sys/phone-agent/releases) 下载 `yueshu-1.0.0.apk`
+传到手机上安装，然后按 App 内的引导开启三项权限：**无障碍服务**（手和眼）、
+**悬浮窗**（任务跑到别的应用上时显示状态胶囊）、**通知**（审批提醒）。
+
+- 最低 Android 8.0（`minSdk 26`）；截图相关能力要 Android 11 及以上，低版本会自动降级成读屏大纲。
+- APK 用仓库里的本地 keystore 签名。自己构建时首次会生成**一台机器一份**的证书，
+  所以自建包和 Release 包不能互相覆盖安装，切换时要先卸载；同一来源的后续版本直接覆盖安装，数据保留。
+- 每个 Release 都附 SHA-256，下载后可以自己核对：
+
+  ```bash
+  sha256sum yueshu-1.0.0.apk     # Windows: certutil -hashfile yueshu-1.0.0.apk SHA256
+  ```
+
+---
+
 ## 它能做什么
 
 - 「打开微信给小罗发个你好」——启动应用、点搜索框、写文字、点发送
@@ -169,8 +186,13 @@ phone_tap_at(x, y)         → 重新截图，点菜单里的「粘贴」
 脚本自动完成 `aapt2 → kotlinc → d8 → 签名 → 验签`：
 
 ```bash
-python tools/build_apk.py
+python tools/build_apk.py              # 日常构建 → build/app-debug.apk
+python tools/build_apk.py --release    # 发版构建 → build/yueshu-<版本>.apk（末尾打印 SHA-256）
 ```
+
+两种构建的字节码和签名完全一样，只是产物文件名不同——`--release` 多打一行校验值，
+方便直接贴进 Release 说明。版本号写在 `tools/build_apk.py` 顶部的
+`VERSION_CODE / VERSION_NAME`，与 `app/build.gradle.kts` 保持一致。
 
 工具链位置用 `WB_ANDROID_TOOLS` 指定，清单见 [`tools/README.md`](tools/README.md)。
 工程路径含中文时脚本会自动复制到 ASCII 临时目录再编译（`aapt2` 按系统代码页解析参数）。
