@@ -451,6 +451,12 @@ def static_checks():
     client = src("CloudClient.kt")
     for key in ["temperature", "top_p", "max_tokens"]:
         check("请求体带上 %s" % key, 'put("%s", Config.' % key in client)
+    # keep-alive：流读完只关流。disconnect 会连底层 socket 一起关，连接池永远空着，
+    # 每轮都重付一次握手——这条一旦被人「顺手清理」回去，性能就悄悄回退了。
+    check("流式读完只关流不 disconnect（保住连接复用）",
+          "completed = true" in client and client.count("conn.disconnect()") == 1
+          and "conn.inputStream?.close()" in client,
+          "disconnect 出现 %d 次" % client.count("conn.disconnect()"))
 
     loop = src("AgentLoop.kt")
     check("AgentLoop 挂了动作核对提示", "withVerifyHint(call.name" in loop)
@@ -863,10 +869,11 @@ def main():
     wb_mem = src("Workbench.kt")
     st_mem = src("AgentSettings.kt")
     ph_mem = src("PhonePrompt.kt")
-    check("长期记忆：拼在系统提示尾部，没有附加段时保持原样",
+    check("长期记忆：附在最后一条 user 消息上（不进 system，保前缀稳定）",
           "private val memory: () -> String" in al_mem
           and "extras.joinToString(\"\\n\\n\")" in al_mem
-          and "if (extras.isEmpty()) PhonePrompt.SYSTEM" in al_mem,
+          and "private fun injectExtras" in al_mem
+          and "EXTRAS_HEADER" in al_mem,
           "missing memory injection")
     check("长期记忆：每次请求现取（这一轮记下的下一轮就生效）+ 开关可关",
           "Memory.digest(workDir())" in ah_mem and "settings?.memoryOn == true" in ah_mem,
@@ -1227,7 +1234,7 @@ def main():
     else:
         check("恢复历史后，新请求里带着上次的任务原文", False, "H 请求数 %d" % len(h_reqs))
 
-    # N：技能索引注入——system 里带清单，且每轮现取（第二轮清空后不该再有）
+    # N：记忆/技能注入——不进 system（保前缀稳定），附在最后一条 user 消息上，且每轮现取
     n_reqs = requests_by_scenario.get("N", [])
     check("N 场景共 2 次请求（两次独立任务）", len(n_reqs) == 2, len(n_reqs))
     if len(n_reqs) == 2:
@@ -1237,15 +1244,40 @@ def main():
                     return m.get("content") or ""
             return ""
 
-        n0, n1 = sys_text(n_reqs[0]), sys_text(n_reqs[1])
-        check("技能索引进了 system（不是塞成 user 消息）",
-              "weekly-report" in n0 and "skill_load" in n0, n0[-200:])
-        # 提示词正文里也出现过「长期记忆」这个词，所以用记忆条目的独特文本来定位
-        check("技能索引排在长期记忆之前（记忆贴着对话历史）",
-              "用户叫罗唯珍" in n0 and n0.find("weekly-report") < n0.find("用户叫罗唯珍"),
-              "%d vs %d" % (n0.find("weekly-report"), n0.find("用户叫罗唯珍")))
+        def last_user_text(req):
+            c = ""
+            for m in req.get("messages") or []:
+                if m.get("role") == "user":
+                    c = m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content"), ensure_ascii=False)
+            return c
+
+        n0, n1 = n_reqs[0], n_reqs[1]
+        s0, s1 = sys_text(n0), sys_text(n1)
+        check("system 保持纯净：不拼记忆也不拼技能索引",
+              "weekly-report" not in s0 and "用户叫罗唯珍" not in s0, s0[-150:])
+        check("system 只有一条（网关对 role=system 敏感，不添乱）",
+              sum(1 for m in n0.get("messages") or [] if m.get("role") == "system") == 1, "")
+        tail0 = last_user_text(n0)
+        check("技能索引附在最后一条 user 消息上",
+              "weekly-report" in tail0 and "不是本轮指令" in tail0, tail0[-160:])
+        check("索引仍排在长期记忆之前（顺序与旧版一致）",
+              "用户叫罗唯珍" in tail0 and tail0.find("weekly-report") < tail0.find("用户叫罗唯珍"),
+              "%d vs %d" % (tail0.find("weekly-report"), tail0.find("用户叫罗唯珍")))
+        check("附带的背景资料有明确分隔头（模型不会当成用户指令）",
+              "不是本轮指令" in tail0, tail0[-120:])
+        # 每轮现取：源清空后，整个请求里（不只 system）都不该再有它
         check("索引每轮现取：源清空后第二次请求里不再有它",
-              "weekly-report" not in n1, n1[-200:])
+              "weekly-report" not in json.dumps(n1, ensure_ascii=False), s1[-150:])
+        # 前缀稳定的核心证据：两轮请求的 system 逐字节相同
+        check("两轮请求的 system 逐字节一致（上下文缓存可命中）", s0 == s1, "")
+
+    # A：无记忆无技能的普通任务——除历史追加外前缀必须纹丝不动
+    if a_reqs:
+        sys_set = {json.dumps(r.get("messages", [])[0], ensure_ascii=False, sort_keys=True)
+                   for r in a_reqs if r.get("messages")}
+        check("A 场景所有轮次的 system 逐字节一致", len(sys_set) == 1, len(sys_set))
+        check("A 场景没有任何背景资料注入（extras 为空就什么都不附）",
+              all("不是本轮指令" not in json.dumps(r.get("messages", []), ensure_ascii=False) for r in a_reqs), "")
 
     expected = [
         "loop_no_error", "loop_tool_sequence", "loop_tap_center_1", "loop_tap_center_2",

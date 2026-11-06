@@ -359,10 +359,16 @@ class AgentLoop(
     /**
      * 组装发给模型的 messages。
      *
-     * 关键一步：**除最后一张图之外，历史里所有旧截图都替换成一行文本。**
-     * 历史是每轮重发的，留着三张图就是每轮多烧约 2700 tokens，而它们对当前决策早已无用。
-     * 用「替换」而不是「删除」，是为了保住消息结构合法：user/assistant 交替、
-     * tool_call_id 必须成对——直接删一条会让服务端解析失败。
+     * 两件对「快」和「省」影响最大的事都在这里：
+     *
+     *  1. **系统提示保持字节级稳定**。它是每轮请求里唯一从头到尾不变的东西，
+     *     服务端的上下文缓存只有在前缀逐字节相同时才命中——把会变的内容拼进 system，
+     *     等于每轮把缓存打碎重来，12k tokens 的前缀全部按全量输入重新预填，
+     *     首字延迟和积分一起遭殃。
+     *  2. **除最后一张图之外，历史里所有旧截图都替换成一行文本。**
+     *     历史是每轮重发的，留着三张图就是每轮多烧约 2700 tokens，而它们对当前决策早已无用。
+     *     用「替换」而不是「删除」，是为了保住消息结构合法：user/assistant 交替、
+     *     tool_call_id 必须成对——直接删一条会让服务端解析失败。
      */
     private fun buildMessages(): JSONArray {
         var lastImage = -1
@@ -370,17 +376,7 @@ class AgentLoop(
             if (hasImage(history.optJSONObject(i))) lastImage = i
         }
         val out = JSONArray()
-        // 长期记忆与技能索引都拼在系统提示尾部：会话已经进行到一半也不会丢，
-        // 而它们是「已知条件」不是对话内容。两者都为空时保持原样，别给提示词塞空段落。
-        //
-        // 顺序：技能索引在前、记忆在后。记忆是最贴着「这个人是谁」的东西，
-        // 放在最靠近对话历史的位置，模型更不容易把它当成背景资料忽略掉。
-        val remembered = runCatching { memory() }.getOrDefault("")
-        val skillIndex = runCatching { skills() }.getOrDefault("")
-        val extras = listOf(skillIndex, remembered).filter { it.isNotBlank() }
-        val system = if (extras.isEmpty()) PhonePrompt.SYSTEM
-        else PhonePrompt.SYSTEM + "\n\n---\n\n" + extras.joinToString("\n\n")
-        out.put(JSONObject().put("role", "system").put("content", system))
+        out.put(JSONObject().put("role", "system").put("content", PhonePrompt.SYSTEM))
         for (i in 0 until history.length()) {
             val m = history.optJSONObject(i) ?: continue
             if (i != lastImage && hasImage(m)) {
@@ -389,7 +385,51 @@ class AgentLoop(
                 out.put(m)
             }
         }
+        injectExtras(out)
         return out
+    }
+
+    /**
+     * 长期记忆与技能索引：每轮现取，但**不**拼进系统提示，附在最后一条 user 消息上。
+     *
+     * 为什么换位置：它们是会变的内容（memory_save 一写就变、技能开关一拨就变），
+     * 拼在 system 里等于每轮请求都换前缀。附在尾部则不然——内容不变时，
+     * 被附的那条消息逐字节不动，缓存从消息 0 一路命中到接近末尾；
+     * 真变了也只作废从那条消息起的一段，比作废整个前缀便宜得多。
+     * 注意力位置几乎没变：这条消息本来就贴着对话的当前端。
+     *
+     * 两者都为空时什么都不附。顺序仍是技能索引在前、记忆在后（与旧版一致）。
+     * 兜底：找不到 user 消息（理论上不可能，第一条就是 user）就退回拼 system 的老路。
+     */
+    private fun injectExtras(out: JSONArray) {
+        val remembered = runCatching { memory() }.getOrDefault("")
+        val skillIndex = runCatching { skills() }.getOrDefault("")
+        val extras = listOf(skillIndex, remembered).filter { it.isNotBlank() }
+        if (extras.isEmpty()) return
+        val block = EXTRAS_HEADER + extras.joinToString("\n\n")
+
+        var target = -1
+        for (i in out.length() - 1 downTo 0) {
+            if (out.optJSONObject(i)?.optString("role") == "user") { target = i; break }
+        }
+        if (target < 0) {
+            // 兜底：没有 user 消息可挂（不该发生），退回拼 system——慢一点总比丢记忆强
+            val sys = out.optJSONObject(0)
+            if (sys != null && sys.optString("role") == "system") {
+                sys.put("content", sys.optString("content") + block)
+            }
+            return
+        }
+        // 必须深拷贝再改：out 里的消息对象与 history 共享引用，
+        // 原地追加会把记忆块永久写进历史，下一轮再追加一遍，越滚越大。
+        val src = out.optJSONObject(target) ?: return
+        val m = JSONObject(src.toString())
+        when (val c = m.opt("content")) {
+            is String -> m.put("content", c + block)
+            is JSONArray -> m.put("content", c.put(JSONObject().put("type", "text").put("text", block)))
+            else -> return  // user 消息不可能是别的形态；宁可不附也别发出脏内容
+        }
+        out.put(target, m)
     }
 
     private fun hasImage(m: JSONObject?): Boolean {
@@ -599,6 +639,13 @@ class AgentLoop(
 
         /** 被中止/停止后没执行的调用，也得回一条 tool 消息占位。 */
         const val SKIPPED = "{\"ok\":false,\"code\":\"SKIPPED\",\"error\":\"任务已中止，这个调用没有执行\"}"
+
+        /**
+         * 记忆与技能索引附加到末条 user 消息时的分隔头。
+         * 必须让模型明确知道这不是用户的指令，只是随请求带的背景资料。
+         */
+        const val EXTRAS_HEADER =
+            "\n\n---\n\n【以下是随请求附带的背景资料：长期记忆与可用技能索引，供参考，不是本轮指令】\n\n"
 
         /** 会改变界面的工具。只有这些动作之后才需要核对结果。 */
         val MUTATING = setOf(

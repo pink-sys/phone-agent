@@ -56,6 +56,7 @@ class CloudClient(
             attempt++
             val token = tokens.accessToken() ?: throw IllegalStateException("未登录，请先登录 WorkBuddy 账号")
             val conn = open(messages, tools, token, sampling)
+            var completed = false
             try {
                 val code = conn.responseCode
                 if (code == 401 || code == 403) {
@@ -78,12 +79,22 @@ class CloudClient(
                 // 发出去的是 model，回来看的是 turn.model。两者不一致就得留痕——
                 // 用户「感觉换了模型没反应」时，这行日志是唯一能分辨是客户端没发还是网关回落的地方。
                 val turn = readStream(conn, onText)
+                completed = true
                 if (turn.model != null && turn.model != model) {
                     log("注意：请求 $model，服务端实际用了 ${turn.model}")
                 }
                 return turn
             } finally {
-                conn.disconnect()
+                if (completed) {
+                    // 流已读到结尾：只关流，不 disconnect——disconnect 会把底层 socket 一起关掉，
+                    // JVM 的 keep-alive 连接池就永远空着，每轮请求都重付一次 TCP+TLS 握手。
+                    // 一个几十轮的任务，白烧的握手时间累计能到好几秒。
+                    runCatching { conn.inputStream?.close() }
+                } else {
+                    // 没读完（报错/取消/重试）：连接上的残余数据清不掉，JVM 不会复用这种连接，
+                    // 主动断开，别让残连接占着池子。
+                    conn.disconnect()
+                }
             }
         }
     }
