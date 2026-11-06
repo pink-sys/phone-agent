@@ -187,12 +187,16 @@ phone_tap_at(x, y)         → 重新截图，点菜单里的「粘贴」
 
 ```bash
 python tools/build_apk.py              # 日常构建 → build/app-debug.apk
-python tools/build_apk.py --release    # 发版构建 → build/yueshu-<版本>.apk（末尾打印 SHA-256）
+python tools/build_apk.py --release    # 发版构建 → build/yueshu-<版本>.apk
 ```
 
-两种构建的字节码和签名完全一样，只是产物文件名不同——`--release` 多打一行校验值，
-方便直接贴进 Release 说明。版本号写在 `tools/build_apk.py` 顶部的
-`VERSION_CODE / VERSION_NAME`，与 `app/build.gradle.kts` 保持一致。
+两者共用同一套工具链和同一份 keystore。`--release` 额外做两件事：
+
+1. **不编入任何凭证**——`Secrets.kt` 按空值生成，APK 里的字符串能被原样抠出来，
+   编进去就等于公开；发布包的语音听写因此是关闭的，用的人填自己的 `secrets.properties` 重构建即可。
+2. 产物命名为 `build/yueshu-<版本>.apk`，并在末尾打印 SHA-256，直接贴进 Release 说明。
+
+版本号写在 `tools/build_apk.py` 顶部的 `VERSION_CODE / VERSION_NAME`，与 `app/build.gradle.kts` 保持一致。
 
 工具链位置用 `WB_ANDROID_TOOLS` 指定，清单见 [`tools/README.md`](tools/README.md)。
 工程路径含中文时脚本会自动复制到 ASCII 临时目录再编译（`aapt2` 按系统代码页解析参数）。

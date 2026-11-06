@@ -14,8 +14,9 @@
     python tools/build_apk.py --release  # 发布构建，产出 build/yueshu-<版本>.apk
     JAVA_HOME=... WB_ANDROID_TOOLS=... python tools/build_apk.py
 
-两种构建的字节码与签名完全相同，区别只在产物文件名和结尾多打一行 SHA-256，
-方便发版时把校验值贴进 release 说明。
+两种构建共用同一套工具链和同一份 keystore，区别有两点：发布构建额外做两件事——
+**不编入任何凭证**（语音听写关闭），以及产物命名为 `build/yueshu-<版本>.apk` 并多打一行
+SHA-256，方便贴进 Release 说明。
 """
 import glob
 import hashlib
@@ -68,9 +69,13 @@ def load_secrets():
     return out
 
 
-def write_secrets(dest=SECRETS_KT):
-    """按 secrets.properties 生成 Secrets.kt。没有该文件就生成空值版本。"""
-    values = load_secrets()
+def write_secrets(dest=SECRETS_KT, enabled=True):
+    """按 secrets.properties 生成 Secrets.kt。
+
+    enabled=False 时生成全空值版本——发布包必须走这条路：APK 里的字符串是可以
+    直接抠出来的，凭证一旦编进 dex 就等于公开。
+    """
+    values = load_secrets() if enabled else {}
     lines = [
         "package cn.wbphone.agent",
         "",
@@ -141,9 +146,12 @@ def main():
     release = "--release" in sys.argv[1:]
     out_name = "yueshu-%s.apk" % VERSION_NAME if release else "app-debug.apk"
 
-    # 凭证文件先就位：Secrets.kt 是生成的（gitignored），没有就生成空值版本
-    has_secrets = write_secrets()
-    if not has_secrets:
+    # 凭证文件先就位：Secrets.kt 是生成的（gitignored）。
+    # 发布包一律按空值生成——APK 里的字符串可以被原样抠出来，编进去就等于公开。
+    has_secrets = write_secrets(enabled=not release)
+    if release:
+        print("发布构建：Secrets.kt 按空值生成，APK 内不含任何凭证（语音听写关闭）")
+    elif not has_secrets:
         print("提示：没有 secrets.properties，语音听写的凭据为空（其他功能不受影响）")
 
     javabin = find_java()
@@ -328,6 +336,9 @@ def main():
     size = os.path.getsize(final) / 1024.0
     print("\n完成：%s（%.0f KB）" % (final, size))
     if release:
+        # 发布包已经打好了，把本地 Secrets.kt 恢复成带真实凭证的版本，
+        # 免得下一次日常构建的语音听写莫名其妙失效。
+        write_secrets()
         digest = hashlib.sha256(open(final, "rb").read()).hexdigest()
         # 发版时把这行贴进 GitHub Release 说明，用户下载后可以自己核对
         print("SHA-256：%s" % digest)
