@@ -89,8 +89,36 @@ App     GET  /v2/plugin/auth/token?state=…  每 1 秒问一次，拿到 access
 - 每发一句话、每次读屏、每次截图，都是一次真实的模型请求，服务端按账号的计费倍率扣积分。
 - 一个「打开微信给某人发条消息」这样的任务，通常是**十几到几十轮**请求
   （读屏 → 判断 → 动作 → 再读屏），积分按轮累加；截图更贵，一张图加一轮看图就上千 token。
-- 默认模型是 **Hy3，当前倍率 `x0.00`（免费）**。设置里可以换 快速 `x0.15` / 均衡 `x0.50` /
-  极致 `x1.00`，以及各厂商的具体模型，**换档即换倍率**（清单见 `ModelRegistry.kt`）。
+- 默认模型是 **Hy3，当前倍率 `x0.00`（免费）**。设置里可以换其他档位或具体模型，
+  **换档即换倍率**。完整清单如下（由 `tools/gen_docs.py` 从 `ModelRegistry.kt` 生成，
+  改了模型清单就重跑一次脚本，倍率以 App 设置页实时显示为准）：
+
+<!-- model-table:start -->
+| 档位 | `model` 字段 | 倍率 | 说明 |
+| --- | --- | --- | --- |
+| 快速 | `fast-model` | x0.15 | 优先速度，适合简单任务 |
+| 均衡 | `balanced-model` | x0.50 | 速度与质量兼顾 |
+| 极致 | `deep-model` | x1.00 | 优先深度与准确性 |
+| Hy4 preview | `hy4-preview` | x0.29 | 1M 上下文，思考模型 |
+| Hy3（默认） | `hy3` | 免费 | 默认，实测工具调用与截图都正常 |
+| DeepSeek-V4.1-Flash | `deepseek-v4.1-flash` | x0.11 | 1M 上下文，原生多模态 |
+| GLM-5.3 | `glm-5.3` | x0.69 | 旗舰，复杂长程任务 |
+| GLM-5.3-Flash | `glm-5.3-flash` | x0.08 | 原生多模态，便宜 |
+| GLM-5.2 | `glm-5.2` | x0.79 | 1M 上下文，长程任务 |
+| Space-Bunny | `space-bunny` | x0.08 | 极快，原生多模态 |
+| MiniMax-M3.1-Flash | `minimax-m3.1-flash` | x0.08 | 原生多模态 |
+| MiMo-V2.6-Pro | `mimo-v2.6-pro` | x0.13 | 长程复杂工作流 |
+| Step-5-Preview | `step-5-preview` | x0.33 | 新一代旗舰基模 |
+| DeepSeek-V4-Pro | `deepseek-v4-pro` | x0.51 | 旗舰，1M 上下文 |
+| Kimi-K2.8-Preview | `kimi-k2.8-preview` | x0.77 | 长程自主任务 |
+| Kimi-K3.1-Pro | `kimi-k3.1-pro` | x0.97 | Kimi 旗舰 |
+| Kimi-K3 | `kimi-k3-1` | x1.62 | 最贵一档，前端与科研突出 |
+
+> 本表由 `tools/gen_docs.py` 从 `ModelRegistry.kt` 生成，别手改；
+> 改了模型清单就重跑一次脚本。倍率以 App 设置页实时显示为准，
+> 真实扣费以服务端返回的 `usage` 为准。
+<!-- model-table:end -->
+
 - 真实扣费以服务端返回的 `usage` 为准，App 不推算价格，只把每一轮的扣费写进日志。
 - **积分用完就是报错停下**：不会偷偷降级到便宜模型，也没有本地模型兜底。
 - 想省积分：能用序号点就别用坐标点（省一次截图 + 一次看图）、别让它对着同一屏反复截图确认、
@@ -352,6 +380,7 @@ app/src/main/
   res/xml/accessibility_service_config.xml  无障碍服务配置
 tools/
   build_apk.py                            无 SDK 构建脚本（含凭证注入）
+  gen_docs.py                             从 ModelRegistry.kt 生成 README 的模型倍率表
   test_agent.py                           agent loop 的离线验证（假模型服务器）
   SignApk.java                            APK 签名/验签
   jvmtest/AgentHarness.kt                 测试驱动：假设备 + 剧本断言
