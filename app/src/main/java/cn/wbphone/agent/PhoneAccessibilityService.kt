@@ -11,10 +11,14 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.AlarmClock
+import android.provider.CalendarContract
+import android.provider.Settings
 import android.util.Base64
 import android.util.DisplayMetrics
 import android.view.Display
@@ -852,6 +856,137 @@ class PhoneAccessibilityService : AccessibilityService(), DeviceApi {
             ok("package" to pkg, "navigatedTo" to currentPackage(), "note" to note)
         } catch (e: Exception) {
             fail("启动失败：${e.message}", "LAUNCH_FAILED")
+        }
+    }
+
+    /**
+     * 系统意图：把「设个明早 7 点的闹钟」这类一句话的事直接交给系统应用。
+     *
+     * 和无障碍操作的区别：这些是 Android 公开的接口，一步到位、不怕界面改版；
+     * 走 UI 要点进时钟 App、翻到闹钟页、点加号、输时间——十几步、十几轮 token，
+     * 中间任何一次界面变动都可能点空。所以能走 Intent 的绝不模拟点击。
+     *
+     * 拼完就 startActivity：调用方（PhoneTools）已经校验过必填参数，
+     * 这里再挡一次是防「参数缺失时打开一个空白页，模型却以为成功了」。
+     */
+    override fun startIntent(action: String, args: JSONObject): JSONObject {
+        val intent: Intent
+        val opened: String
+        try {
+            when (action) {
+                "alarm" -> {
+                    val hour = args.optInt("hour", -1)
+                    val minute = args.optInt("minute", -1)
+                    if (hour !in 0..23 || minute !in 0..59) {
+                        return fail("alarm 需要 hour（0-23）和 minute（0-59）", "BAD_ARGS")
+                    }
+                    opened = "闹钟 $hour:${minute.toString().padStart(2, '0')}"
+                    intent = Intent(AlarmClock.ACTION_SET_ALARM)
+                        .putExtra(AlarmClock.EXTRA_HOUR, hour)
+                        .putExtra(AlarmClock.EXTRA_MINUTES, minute)
+                        .putExtra(AlarmClock.EXTRA_MESSAGE, args.optString("message", "闹钟"))
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, args.optBoolean("skip_ui", false))
+                }
+                "timer" -> {
+                    val secs = args.optInt("seconds", -1)
+                    if (secs <= 0) return fail("timer 需要 seconds（秒）", "BAD_ARGS")
+                    opened = "计时器 ${secs} 秒"
+                    intent = Intent(AlarmClock.ACTION_SET_TIMER)
+                        .putExtra(AlarmClock.EXTRA_LENGTH, secs)
+                        .putExtra(AlarmClock.EXTRA_MESSAGE, args.optString("message", "计时器"))
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, args.optBoolean("skip_ui", false))
+                }
+                "calendar" -> {
+                    val title = args.optString("title", "").trim()
+                    if (title.isEmpty()) return fail("calendar 需要 title", "BAD_ARGS")
+                    opened = "日历「$title」"
+                    intent = Intent(Intent.ACTION_INSERT)
+                        .setData(CalendarContract.Events.CONTENT_URI)
+                        .putExtra(CalendarContract.Events.TITLE, title)
+                        .putExtra(CalendarContract.Events.DESCRIPTION, args.optString("description", ""))
+                    val begin = args.optLong("begin_ms", 0L)
+                    if (begin > 0) {
+                        intent.putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, begin)
+                        val durMin = args.optInt("duration_min", 60).coerceIn(1, 24 * 60)
+                        intent.putExtra(CalendarContract.EXTRA_EVENT_END_TIME, begin + durMin * 60_000L)
+                    }
+                }
+                "dial" -> {
+                    val number = args.optString("number", "").trim()
+                    if (number.isEmpty()) return fail("dial 需要 number", "BAD_ARGS")
+                    // ACTION_DIAL 只打开拨号盘并填好号码，不会拨出去——外呼是 ACTION_CALL，要权限也不礼貌
+                    opened = "拨号盘 $number"
+                    intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(number)))
+                }
+                "sms" -> {
+                    val number = args.optString("number", "").trim()
+                    opened = if (number.isEmpty()) "短信" else "短信 → $number"
+                    intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number"))
+                        .putExtra("sms_body", args.optString("text", ""))
+                }
+                "share" -> {
+                    val text = args.optString("text", "")
+                    if (text.isBlank()) return fail("share 需要 text", "BAD_ARGS")
+                    opened = "分享面板"
+                    intent = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+                    args.optString("subject").takeIf { it.isNotBlank() }
+                        ?.let { intent.putExtra(Intent.EXTRA_SUBJECT, it) }
+                }
+                "navigate" -> {
+                    val q = args.optString("query", "").trim()
+                    if (q.isEmpty()) return fail("navigate 需要 query（地点或地址）", "BAD_ARGS")
+                    opened = "导航 → $q"
+                    // geo:0,0?q= 各家地图都认；直接给经纬度时走 ll
+                    val uri = if (args.optDouble("lat", Double.NaN).isNaN())
+                        "geo:0,0?q=" + Uri.encode(q)
+                    else "geo:${args.optDouble("lat")},${args.optDouble("lng")}?q=" + Uri.encode(q)
+                    intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri))
+                }
+                "open_url" -> {
+                    val url = args.optString("url", "").trim()
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                        return fail("open_url 只接受 http/https 链接", "BAD_ARGS")
+                    }
+                    opened = url
+                    intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                }
+                "settings" -> {
+                    val panel = args.optString("panel", "").trim().lowercase()
+                    opened = "设置页${if (panel.isEmpty()) "" else "（$panel）"}"
+                    intent = Intent(
+                        when (panel) {
+                            "wifi", "wlan" -> Settings.ACTION_WIFI_SETTINGS
+                            "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+                            "apps", "app" -> Settings.ACTION_APPLICATION_SETTINGS
+                            "display" -> Settings.ACTION_DISPLAY_SETTINGS
+                            "sound" -> Settings.ACTION_SOUND_SETTINGS
+                            "battery" -> Settings.ACTION_BATTERY_SAVER_SETTINGS
+                            "location", "gps" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+                            "accessibility" -> Settings.ACTION_ACCESSIBILITY_SETTINGS
+                            "storage" -> Settings.ACTION_INTERNAL_STORAGE_SETTINGS
+                            else -> Settings.ACTION_SETTINGS
+                        }
+                    )
+                }
+                "app_info" -> {
+                    val pkg = args.optString("package", "").trim()
+                    if (pkg.isEmpty()) return fail("app_info 需要 package", "BAD_ARGS")
+                    opened = "$pkg 的应用信息页"
+                    intent = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:$pkg")
+                    )
+                }
+                else -> return fail("不认识的 action：$action", "BAD_ACTION")
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            Thread.sleep(500)
+            return ok("action" to action, "opened" to opened, "now" to currentPackage())
+        } catch (e: android.content.ActivityNotFoundException) {
+            return fail("这台机器上没有能处理「$action」的应用", "NO_HANDLER")
+        } catch (e: Exception) {
+            return fail("打不开：${e.message}", "INTENT_FAILED")
         }
     }
 

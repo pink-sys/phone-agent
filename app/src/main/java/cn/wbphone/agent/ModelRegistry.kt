@@ -24,7 +24,7 @@ object ModelRegistry {
         /** 一句话说明，帮助选 */
         val note: String = "",
     ) {
-        /** 「Hy3 · 免费」这种一行摘要，给列表和设置项用 */
+        /** 「Hy4 flash · 免费」这种一行摘要，给列表和设置项用 */
         fun summary(): String {
             val c = when {
                 credit.isEmpty() -> ""
@@ -35,23 +35,34 @@ object ModelRegistry {
         }
     }
 
-    /** 默认模型：免费且实测工具调用、截图都正常，新用户不该先花钱。 */
-    const val DEFAULT_ID = "hy3"
+    /**
+     * 默认模型：桌面端当前默认就是它，且 11/16–11/30 限时免费（`x0.00` 来自活动折扣，不是原价）。
+     * 活动结束后它会按原价计费，届时再看要不要换——所以这里的注释带了日期。
+     */
+    const val DEFAULT_ID = "hy4flash-free"
 
     /**
-     * 顺序照抄桌面端选择器：先是三档通用档位，再是具体模型。
-     * 只放能在 agent 场景用（会返回 tool_calls）的模型；纯补全、文生图那类不放进来。
+     * 顺序照抄桌面端选择器：先是 Auto 与三档通用档位，再是具体模型。
+     * 只放能在 agent 场景用（`supportsToolCall = true`）的模型；纯补全、文生图那类不放进来。
+     *
+     * 数据来源是客户端本地缓存的整份 models 目录（`~/.workbuddy/local_storage`），
+     * 60 个模型里筛出 craft 场景可用的这批。2026-11-16 这版的变化：
+     *  - `hy3`、`hy4-preview` 下线（hy3 的免费活动 11-16 00:00 到期，桌面端已看不到）；
+     *  - 换成 `hy4std` / `hy4flash-free` / `hy4flash` 三个变体；
+     *  - 新增 `auto`（倍率浮动，服务端不返回固定倍率，所以 credit 留空）。
      */
     val OPTIONS: List<Option> = listOf(
+        Option("auto", "Auto", "", "自动匹配最优模型，倍率随之浮动"),
         Option("fast-model", "快速", "x0.15", "优先速度，适合简单任务"),
         Option("balanced-model", "均衡", "x0.50", "速度与质量兼顾"),
         Option("deep-model", "极致", "x1.00", "优先深度与准确性"),
-        Option("hy4-preview", "Hy4 preview", "x0.29", "1M 上下文，思考模型"),
-        Option("hy3", "Hy3", "x0.00", "默认，实测工具调用与截图都正常"),
+        Option("hy4std", "Hy4", "x0.29", "最新旗舰，Agent 与多模态专长"),
+        Option("hy4flash-free", "Hy4 flash", "x0.00", "限时免费至 11/30，轻量日常主力"),
+        Option("hy4flash", "Hy4 flash", "x0.03", "轻量高效，适合高频日常任务"),
         Option("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", "x0.11", "1M 上下文，原生多模态"),
         Option("glm-5.3", "GLM-5.3", "x0.69", "旗舰，复杂长程任务"),
         Option("glm-5.3-flash", "GLM-5.3-Flash", "x0.08", "原生多模态，便宜"),
-        Option("glm-5.2", "GLM-5.2", "x0.79", "1M 上下文，长程任务"),
+        Option("glm-5.2", "GLM-5.2", "x0.79", "1M 上下文，夜间 5 折"),
         Option("space-bunny", "Space-Bunny", "x0.08", "极快，原生多模态"),
         Option("minimax-m3.1-flash", "MiniMax-M3.1-Flash", "x0.08", "原生多模态"),
         Option("mimo-v2.6-pro", "MiMo-V2.6-Pro", "x0.13", "长程复杂工作流"),

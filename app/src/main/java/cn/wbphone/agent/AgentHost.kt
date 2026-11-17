@@ -34,6 +34,14 @@ object AgentHost {
 
     private const val MAX_LOG_LINES = 400
 
+    /**
+     * 日志文件的上限。
+     *
+     * 内存里只留 400 行，落盘多留一些——出问题时要看的是「崩之前那几分钟」，
+     * 而崩溃恰恰会把内存里的日志一起带走，所以磁盘这份才是唯一能事后看的。
+     */
+    private const val MAX_LOG_BYTES = 256 * 1024
+
     private val listeners = CopyOnWriteArrayList<Listener>()
     private val logLines = ArrayDeque<String>()
     private val logLock = Any()
@@ -79,9 +87,23 @@ object AgentHost {
         settings = AgentSettings(appContext)
         Auth.init(appContext)
 
+        // 先把上次运行的日志捞回来：崩溃之后那几分钟的记录，只有磁盘上有。
+        restoreLog()
+
         // 首次启动把内置技能种到工作台的 skills/ 里。只种一次，用户删掉的不再长回来。
         val seeded = runCatching { Skill.install(workDir()) }.getOrDefault(0)
         if (seeded > 0) log("已安装 $seeded 个内置技能包（工作台 skills/）")
+
+        // 工作台目录用应用专属外部目录：不需要任何存储权限，
+        // 用户用文件管理器也能看到 agent 写了什么，卸载时一起清掉。
+        val bench = Workbench(
+            workDir(),
+            // 用 lambda 而不是取值：设置里开关一拨，下一次请求就生效，不用重启服务。
+            // 走成员方法而不是直接读 settings——lateinit var 在 lambda 里拿不到 smart cast。
+            shellEnabled = { isShellOn() },
+            // PDF 引擎（PdfDocument 是 Android API，只能在真机注入；桌面测试为 null 时 pdf_write 自动摘除）
+            docEngine = PdfDoc.Engine,
+        )
 
         toolbox = PhoneToolbox(
             deviceProvider = { PhoneAccessibilityService.instance },
@@ -89,16 +111,28 @@ object AgentHost {
             // 提示词管住大方向，闸门管住那几条不能出错的线。
             // 判定 → 问人 → 记授权，都在 ApprovalGate 里，与 UI 无关。
             approval = ApprovalGate(ApprovalUi, ApprovalPolicy(), { log(it) }),
-            // 工作台目录用应用专属外部目录：不需要任何存储权限，
-            // 用户用文件管理器也能看到 agent 写了什么，卸载时一起清掉。
-            workbench = Workbench(
-                workDir(),
-                // 用 lambda 而不是取值：设置里开关一拨，下一次请求就生效，不用重启服务。
-                // 走成员方法而不是直接读 settings——lateinit var 在 lambda 里拿不到 smart cast。
-                shellEnabled = { isShellOn() },
-                // PDF 引擎（PdfDocument 是 Android API，只能在真机注入；桌面测试为 null 时 pdf_write 自动摘除）
-                docEngine = PdfDoc.Engine,
-            ),
+            workbench = bench,
+            // 派子代理：用同一个模型客户端，但走一套全新的、只有只读工具的小循环。
+            // 中间过程留在那个循环里，主线只拿到结论——这就是「隔离」的全部含义。
+            delegate = { goal, focus, onProgress, isCancelled ->
+                val c = client
+                if (c == null) {
+                    ToolResult(
+                        "{\"ok\":false,\"code\":\"NO_CLIENT\",\"error\":\"模型客户端还没就绪，这次没有派出去\"}"
+                    )
+                } else {
+                    // 流水账不用在这里补：task 本身也是一次工具调用，收尾时
+                    // onToolEnd 会把「名字 + 参数 + 结果摘要」整体记一条。
+                    SubAgent.run(
+                        client = c,
+                        bench = bench,
+                        goal = goal,
+                        focus = focus,
+                        onProgress = onProgress,
+                        parentCancelled = isCancelled,
+                    )
+                }
+            },
         )
 
         val tokens = object : TokenSource {
@@ -119,8 +153,29 @@ object AgentHost {
         }
 
         val preferred = ModelRegistry.resolve(settings?.model)
-        val client = CloudClient(Config.BASE_URL, preferred.id, tokens) { log(it) }
-        this.client = client
+        // 变量名不用 client：上面 delegate 里那个 client 指的是属性（初始化时才赋值），
+        // 同名会让人以为两边是同一个东西，其实一个是延迟可见的字段。
+        val cloud = CloudClient(
+            baseUrl = Config.BASE_URL,
+            model = preferred.id,
+            tokens = tokens,
+            log = { log(it) },
+            // 每轮现取：设置里改了档位，下一句话就该按新档发。
+            effort = { effortParam() },
+            onEffortRejected = { body ->
+                // 把「哪个模型不认」记下来，同一个模型之后就别再白打一次注定失败的请求。
+                // 服务端原话原样进日志——换模型要不要再试，全靠这句话判断。
+                log("思考深度参数被拒：$body")
+                val id = this.client?.model ?: ""
+                if (id.isNotEmpty()) settings?.effortRejectedFor = id
+                // 流水账也记一笔：这条能解释「低档那一轮为什么反而更慢」——
+                // 它其实是标准档，外加一次白跑的往返。
+                runCatching {
+                    Transcript.append(appContext, ensureSessionId(), TranscriptText.effortReject(body))
+                }
+            },
+        )
+        this.client = cloud
 
         // 单会话时代的历史迁移成第一个会话，只做一次。
         val legacy = ChatStore.load(appContext)
@@ -235,15 +290,20 @@ object AgentHost {
     /** 取（或建）一个会话的运行时。建的时候把落盘的历史装回去。 */
     private fun runtime(id: String): Runtime = synchronized(runtimeLock) {
         runtimes[id]?.let { return it }
-        val l = AgentLoop(client!!, toolbox!!, Config.MAX_TURNS, memory = {
+        val l = AgentLoop(client!!, toolbox!!, Config.MAX_TURNS, memory = { topic ->
             // 每次请求现取：这一轮记下的偏好，下一轮就能用上。开关一关立即失效。
-            if (settings?.memoryOn == true) Memory.digest(workDir()) else ""
+            // topic 是本轮用户说的最近几句话，记忆按它挑相关性，不再无脑取最近 20 条。
+            if (settings?.memoryOn == true) Memory.digest(workDir(), topic) else ""
         }, skills = {
             // 只注入清单。正文由模型自己 skill_load，按需付费。
             if (settings?.skillsOn == true) {
                 Skill.index(workDir(), settings?.disabledSkills ?: emptySet())
             } else ""
-        })
+        }, tone = {
+            // 人情味开关：开着就带语气段，关了整段不出现（不是留个「语气：正常」占位）。
+            // 每次请求现取——设置里一拨，下一条消息就生效，不用重建会话。
+            if (settings?.emotionOn == true) PhonePrompt.WARM_TONE else ""
+        }, owner = id)
         runCatching { sessions.load(id) }?.getOrNull()?.let { saved ->
             if (saved.length() > 0) l.restoreHistory(saved)
         }
@@ -279,7 +339,7 @@ object AgentHost {
         FloatStatus.taskStart(appContext, rt.id)
         setState(State.RUNNING, "执行中")
         // 流水账先记下用户说了什么：模型上下文怎么压缩、截断，这里都是完整原文
-        Transcript.append(appContext, rt.id, Transcript.user(text, !images.isNullOrEmpty()))
+        Transcript.append(appContext, rt.id, TranscriptText.user(text, !images.isNullOrEmpty()))
         // 任务临开始前再看一眼：上一句话之后可能刚被系统摘掉开关。
         A11yKeeper.check(appContext, force = true)
         worker.execute {
@@ -289,6 +349,9 @@ object AgentHost {
                 listener.onError(e.message ?: "运行失败")
             } finally {
                 rt.busy = false
+                // 交还手机：不管跑完、出错还是被停，都得放——否则别的会话再也碰不了屏幕，
+                // 而用户看到的只是「另一个会话在操作手机」，永远等不到。
+                PhoneLease.release(rt.id)
                 FloatStatus.taskEnd(appContext, rt.id)
                 // 不管是跑完、出错还是中途停了，历史都落一次盘。
                 // 注意落的是**这个会话**的盘——跑的时候用户可能已经切去别的会话了。
@@ -317,6 +380,13 @@ object AgentHost {
             FloatStatus.status(appContext, "正在回复…")
             t.onText(delta)
         }
+
+        // 思考增量也必须转发。接口里它是带默认空实现的——漏了这一行不会编译报错，
+        // 只会安静地把思考流吞掉，界面表现就是「怎么一直看不到思考」。
+        override fun onThinking(delta: String) {
+            FloatStatus.status(appContext, "正在思考…")
+            t.onThinking(delta)
+        }
         override fun onToolStart(name: String, args: JSONObject) {
             log("→ $name ${args.toString().take(120)}")
             lastToolName = name
@@ -325,12 +395,21 @@ object AgentHost {
             t.onToolStart(name, args)
         }
 
+        /**
+         * 子代理的进度也要进悬浮窗：那是最可能被用户看见的地方（他多半已经切走了）。
+         * 不转发的话，悬浮窗在十几轮里一直挂着「正在派子代理查…」，看着像死了。
+         */
+        override fun onSubProgress(note: String) {
+            FloatStatus.status(appContext, note)
+            t.onSubProgress(note)
+        }
+
         override fun onToolEnd(name: String, result: String, ok: Boolean) {
             log("← $name ${if (ok) "完成" else "失败"} ${result.length}字")
             // 流水账：压缩和截断动不到这里，事后想查「它当时点了哪儿、结果如何」全靠这份。
             Transcript.append(
                 appContext, rt.id,
-                Transcript.tool(name, lastToolArgs, ok, result)
+                TranscriptText.tool(name, lastToolArgs, ok, result)
             )
             t.onToolEnd(name, result, ok)
         }
@@ -340,11 +419,91 @@ object AgentHost {
             t.onImage(dataUrl)
         }
 
+        /** 网络层退避重发。流水账记一笔，事后能对上「这段时间为什么是空白的」。 */
+        override fun onRetry(why: String) {
+            log("网络重试：$why")
+            Transcript.append(appContext, rt.id, TranscriptText.retry(why))
+            t.onRetry(why)
+        }
+
+        /** 这一轮作废重来：已显示的半截要撤掉。 */
+        override fun onRestart() {
+            log("回复中断，已撤掉半截内容重发")
+            t.onRestart()
+        }
+
+        override fun onExtras(chars: Int, preview: String) {
+            // 背景资料（记忆/技能索引）变了：记一笔原文摘要。
+            // 「问主题四却答主题三」这种问题，只有这条能证明当时到底被喂了什么。
+            if (chars == 0) {
+                log("背景资料已清空（记忆/技能都不再注入）")
+            } else {
+                log("随请求附带背景资料 $chars 字：${preview.take(120)}")
+            }
+            Transcript.append(appContext, rt.id, TranscriptText.extras(chars, preview))
+            t.onExtras(chars, preview)
+        }
+
         override fun onArtifact(path: String) {
             // 产物卡（fs_write / pdf_write / pptx_write 的产出）。
             // 这层包装的每个回调都必须转发——接口里带默认空实现的尤其危险：
             // 忘了转发不报错，只是 UI 上永远收不到（产物卡不弹就是吃过这个亏）。
             t.onArtifact(path)
+        }
+
+        override fun onOpenHtml(path: String) {
+            // html_preview 的全屏渲染：同样必须转发，默认空实现漏了不报错
+            t.onOpenHtml(path)
+        }
+
+        override fun onTurnTiming(turn: CloudClient.Turn) {
+            // 耗时拆解进流水账，同时在诊断日志里留一行——用户说「感觉没变快」时，
+            // 这里能直接看出是网络、预填充还是模型在思考。
+            val u = turn.usage
+            Transcript.append(
+                appContext,
+                rt.id,
+                TranscriptText.turn(
+                    headerMs = turn.headerMs,
+                    firstTokenMs = turn.firstTokenMs,
+                    totalMs = turn.totalMs,
+                    inChars = turn.inputChars,
+                    inTokens = u?.optInt("prompt_tokens", 0) ?: 0,
+                    outTokens = u?.optInt("completion_tokens", 0) ?: 0,
+                    toolCalls = turn.toolCalls.size,
+                    model = turn.model,
+                    reasoningChars = turn.reasoningChars,
+                    reasoningFirstMs = turn.reasoningFirstMs,
+                    connectMs = turn.connectMs,
+                    cacheHit = turn.cacheHitTokens,
+                    cacheMiss = turn.cacheMissTokens,
+                    effort = turn.reasoningEffort ?: "",
+                    usageRaw = u?.toString() ?: "",
+                )
+            )
+            log(
+                "本轮 %.1fs（连接 %.1fs，首包 %.1fs，首字 %.1fs，输入 %d / 输出 %d tokens%s%s%s）".format(
+                    turn.totalMs / 1000.0,
+                    turn.connectMs / 1000.0,
+                    turn.headerMs / 1000.0,
+                    turn.firstTokenMs / 1000.0,
+                    u?.optInt("prompt_tokens", 0) ?: 0,
+                    u?.optInt("completion_tokens", 0) ?: 0,
+                    // 缓存命中是「输入里有多少不用重新算」。没报就写「未知」，
+                    // 别写成 0%——那会把「上游没说」误读成「一点没命中」。
+                    when {
+                        turn.cacheHitTokens < 0 -> "，缓存未知"
+                        else -> "，缓存 %d/%d（%d%%）".format(
+                            turn.cacheHitTokens,
+                            turn.cacheHitTokens + turn.cacheMissTokens.coerceAtLeast(0),
+                            if (turn.cacheHitTokens + turn.cacheMissTokens > 0)
+                                turn.cacheHitTokens * 100 / (turn.cacheHitTokens + turn.cacheMissTokens) else 0,
+                        )
+                    },
+                    if (turn.reasoningChars > 0) "，思考 ${turn.reasoningChars} 字" else "",
+                    if (turn.reasoningEffort != null) "，深度 ${Think.labelOfEffort(turn.reasoningEffort)}" else "",
+                )
+            )
         }
 
         override fun onTurnEnd(turn: Int) {
@@ -356,21 +515,21 @@ object AgentHost {
         override fun onCompact(removed: Int, kept: Int) {
             log("上下文已压缩：折叠 $removed 条旧消息，保留最近 $kept 条")
             // 压缩也记一笔流水账：模型忘了的不代表查不到。
-            Transcript.append(appContext, rt.id, Transcript.compact(removed, kept, ""))
+            Transcript.append(appContext, rt.id, TranscriptText.compact(removed, kept, ""))
             t.onCompact(removed, kept)
         }
 
         override fun onFinished(finalText: String, turns: Int, toolCalls: Int) {
             val used = "，token 输入 ${rt.loop.promptTokens} / 输出 ${rt.loop.completionTokens}"
             log("任务结束：$turns 轮、$toolCalls 次工具调用$used")
-            Transcript.append(appContext, rt.id, Transcript.assistant(finalText))
+            Transcript.append(appContext, rt.id, TranscriptText.assistant(finalText))
             t.onFinished(finalText, turns, toolCalls)
             returnToUi(finalText)
         }
 
         override fun onError(message: String) {
             log("出错：$message")
-            Transcript.append(appContext, rt.id, Transcript.error(message))
+            Transcript.append(appContext, rt.id, TranscriptText.error(message))
             t.onError(message)
             returnToUi("任务出错了，回来看看")
         }
@@ -480,9 +639,37 @@ object AgentHost {
         return sessions.load(id)
     }
 
+    /**
+     * 某个会话的流水账，渲染成人能读的文本。
+     *
+     * 这份东西是「模型上下文被压缩掉了、但事情确实发生过」的唯一证据：
+     * 用户原话、每次工具调用的参数与结果、每轮耗时拆解、压缩与重试。
+     * 之前只有 adb pull 能看，等于没有——现在从会话列表长按就能取。
+     */
+    fun transcriptText(id: String): String =
+        runCatching { TranscriptText.render(Transcript.read(appContext, id)) }.getOrDefault("")
+
+    /**
+     * 把流水账导出成工作台里的 Markdown，返回文件名；失败返回 null。
+     *
+     * 为什么不直接复制到剪贴板就够了：一段几十 KB 的记录粘到微信里根本没法读，
+     * 存成文件才能整份发出来（也是排查问题时最有用的东西）。
+     */
+    fun exportTranscript(id: String): String? {
+        val text = transcriptText(id)
+        if (text.isBlank()) return null
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.CHINA)
+            .format(java.util.Date())
+        val name = "流水账-$stamp.md"
+        return runCatching {
+            val f = java.io.File(workDir(), name)
+            f.writeText(text, Charsets.UTF_8)
+            name
+        }.getOrNull()
+    }
+
     /** 删会话。正在跑任务的会话不能删（任务还在往里写），删了返回 false。 */
-    fun deleteSession(id: String): Boolean {
-        if (isBusy(id)) {
+    fun deleteSession(id: String): Boolean {        if (isBusy(id)) {
             log("会话 $id 有任务在跑，不能删")
             return false
         }
@@ -601,6 +788,30 @@ object AgentHost {
         return nowOn
     }
 
+    // ------------------------------------------------------------ 长期记忆（管理页用）
+
+    /**
+     * 记忆管理页的四个动作。UI 不碰路径、不碰文件格式——
+     * 它只需要「给我列出来」「删这条」「记一条」「全清掉」。
+     */
+    fun memoryEntries(): List<String> = runCatching { Memory.entries(workDir()) }.getOrDefault(emptyList())
+
+    fun memoryOn(): Boolean = settings?.memoryOn == true
+
+    fun setMemoryOn(on: Boolean) {
+        settings?.memoryOn = on
+    }
+
+    /** 删一条。返回 false 表示这条已经不在了（页面拿到了旧列表），不是失败。 */
+    fun forgetMemory(entry: String): Boolean =
+        runCatching { Memory.remove(workDir(), entry) }.getOrDefault(false)
+
+    /** 手动记一条。返回 null 表示没记（空白或跟最近那条重复）。 */
+    fun rememberManually(text: String): String? =
+        runCatching { Memory.append(workDir(), text) }.getOrNull()
+
+    fun clearMemory(): Boolean = runCatching { Memory.clear(workDir()) }.getOrDefault(false)
+
     // ------------------------------------------------------------ 模型
 
     /** 当前模型 id。认不出来的历史值落回默认，不会把野字符串发出去。 */
@@ -622,6 +833,38 @@ object AgentHost {
     /** 上一轮服务端回传的模型名（不是我们请求的那个）。null 表示流里没带。 */
     fun lastServerModel(): String? = synchronized(runtimeLock) {
         currentSessionId()?.let { runtimes[it]?.loop?.lastModel }
+    }
+
+    // ------------------------------------------------------------ 思考深度
+
+    fun thinkLevel(): Int = settings?.thinkLevel ?: Config.THINK_LEVEL
+
+    /**
+     * 换档位。顺手清掉「这个模型不认」的记录——拒绝的是参数名，但换了档位值得再试一次，
+     * 而且下一次失败只花一次往返，换来的是又能省几秒。真要还是不行，客户端会再记一次。
+     */
+    fun setThinkLevel(level: Int) {
+        val s = settings ?: return
+        s.thinkLevel = level
+        s.effortRejectedFor = ""
+        log("思考深度已切到「${Think.label(level)}」")
+    }
+
+    /** 当前模型是不是已经明确拒绝过思考深度参数（拒绝过就不再发，免得每轮白跑一次）。 */
+    fun effortUnsupported(): Boolean {
+        val s = settings ?: return false
+        return s.effortRejectedFor.isNotEmpty() && s.effortRejectedFor == modelId()
+    }
+
+    /**
+     * 这次请求该带的 reasoning_effort。null = 不带。
+     *
+     * 三重闸门：标准档本来就不带；已知该模型拒绝过就不带；其余按档位映射。
+     */
+    private fun effortParam(): String? {
+        val s = settings ?: return null
+        if (s.effortRejectedFor.isNotEmpty() && s.effortRejectedFor == (client?.model ?: s.model)) return null
+        return Think.effort(s.thinkLevel)
     }
 
     /** 本次任务的用量，给界面底部那行小字用。 */
@@ -792,6 +1035,47 @@ object AgentHost {
             logLines.addLast(line)
             while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
         }
+        // 落盘放在锁外：写文件比加锁慢得多，别让 UI 线程的 log 卡在别人的 IO 后面
+        appendLogFile(line)
         for (l in listeners) l.onLogAppended(line)
+    }
+
+    private val logFile: File
+        get() = File(appContext.filesDir, "logs/agent.log")
+
+    /**
+     * 追加一行到日志文件。
+     *
+     * 满了就把前面截掉，只留后半——日志要回答的是「最近发生了什么」，
+     * 不是归档。无上限的话，一个跑了几天的 App 会攒出几十 MB 没人看的东西。
+     */
+    private fun appendLogFile(line: String) {
+        if (!::appContext.isInitialized) return
+        runCatching {
+            val f = logFile
+            f.parentFile?.mkdirs()
+            if (f.length() > MAX_LOG_BYTES) {
+                val kept = f.readLines().takeLast(MAX_LOG_LINES * 2)
+                f.writeText(kept.joinToString("\n") + "\n")
+            }
+            f.appendText(line + "\n")
+        }
+    }
+
+    /**
+     * 上次运行留下的日志读到内存里。
+     *
+     * 直接原因：崩溃最需要日志，而崩溃正好把内存那 400 行一起带走。
+     * 落盘之后重开还能看到上一次的最后几步，用户反馈问题时也能一键复制整份发过来。
+     */
+    private fun restoreLog() {
+        runCatching {
+            val f = logFile
+            if (!f.exists()) return
+            val kept = f.readLines().takeLast(MAX_LOG_LINES / 2).filter { it.isNotBlank() }
+            if (kept.isEmpty()) return
+            synchronized(logLock) { logLines.addAll(kept) }
+            log("—— 以上是上次运行的记录 ——")
+        }
     }
 }

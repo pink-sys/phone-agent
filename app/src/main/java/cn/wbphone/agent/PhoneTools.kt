@@ -14,6 +14,14 @@ import org.json.JSONObject
 data class ToolResult(
     val text: String,
     val imageDataUrl: String? = null,
+    /**
+     * 这个工具自己烧掉的 token（目前只有 task 会填）。
+     *
+     * 为什么必须报回 loop：子代理是用真实模型跑的，账单是真的。不把它算进本轮用量，
+     * 界面上就会出现「明明聊了十分钟，积分显示只花了一点点」——用户没法判断这个功能贵不贵。
+     */
+    val promptTokens: Int = 0,
+    val completionTokens: Int = 0,
 )
 
 /** 最近一次截图的坐标系：图片像素 ↔ 真实屏幕像素。 */
@@ -64,7 +72,14 @@ class PhoneToolbox(
      * 故意做成可选：手机操作这套逻辑不该被文件工具牵连，测试里也能分开验证。
      */
     private val workbench: Workbench? = null,
-) {
+    /**
+     * 派子代理。null 表示不给这个工具（纯 JVM 测试、没有模型的宿主）。
+     *
+     * 做成 lambda 而不是直接持有 SubAgent：这里不该知道模型怎么建、历史怎么放，
+     * 那些是宿主的事。工具层只负责「把目标交出去、把结论带回来、顺手报一下进度」。
+     */
+    private val delegate: ((goal: String, focus: String, onProgress: (String) -> Unit, isCancelled: () -> Boolean) -> ToolResult)? = null,
+) : Toolbox {
 
     @Volatile private var lastOutline: ScreenOutline.Rendered? = null
 
@@ -75,8 +90,20 @@ class PhoneToolbox(
 
     @Volatile private var lastShot: ShotFrame? = null
 
-    fun schemas(): JSONArray {
+    /**
+     * 本任务已经派出过几个子代理。
+     *
+     * 为什么要记账：子代理是**真金白银**——每个都是若干轮完整请求。不设上限的话，
+     * 一个「帮我看看这三个网站」的任务可能派出十几个，账单在用户完全无感的情况下翻几倍。
+     * 用完了也不再摘 schema（中途改工具列表会打碎缓存、还容易让模型以为工具坏了）。
+     */
+    @Volatile private var subTasks = 0
+
+    override fun schemas(): JSONArray {
         val base = JSONArray(SCHEMA_JSON)
+        // 派子代理这件事只有宿主真接了才有——不然模型会去调一个必然失败的 task，
+        // 白烧一轮，还会以为是自己参数写错了反复重试。
+        if (delegate != null) base.put(TASK_SCHEMA)
         val bench = workbench ?: return base
         // 只有真挂了工作台才把工具暴露给模型。否则模型会去调一个必然失败的工具，
         // 白烧一轮 token，还会以为是自己用错了。
@@ -92,31 +119,65 @@ class PhoneToolbox(
         lastShot = null
     }
 
-    /** 每个任务开始：清序号、清坐标系、清审批授权、清「已加载技能」。 */
-    fun beginTask() {
-        invalidate()
+    /**
+     * 每个任务开始：清序号、清坐标系、清审批授权、清「已加载技能」。
+     *
+     * 清序号这一条要分情况：现在可能还有别的会话正拿着手机在跑（见 [PhoneLease]），
+     * 这时候把 `lastOutline` / `lastShot` 清掉，等于把人家手里的序号和坐标一起废了——
+     * 那正是「点到了不该点的东西」的来源。所以只有手机空闲、或者本来就是自己在用时才作废。
+     */
+    override fun beginTask(owner: String) {
+        val holding = PhoneLease.holder()
+        if (holding == null || holding == owner) invalidate()
         approval?.beginTask()
         // 技能正文是进这个会话的历史的；跨会话留着「已加载」标记会让新会话拿到空壳
         workbench?.beginTask()
+        // 每个任务重新给满子代理额度：上一个任务派出去几个，不该算在这个任务头上
+        subTasks = 0
     }
 
     /** 连续被拒太多次，agent loop 该收手了。 */
-    fun shouldAbort(): Boolean = approval?.shouldAbort == true
+    override fun shouldAbort(): Boolean = approval?.shouldAbort == true
 
     /**
      * 执行一个工具调用。
      * 失败也返回文本（带 ok:false），不要抛异常——抛出会让模型看不到原因。
      */
-    fun execute(name: String, args: JSONObject): ToolResult {
+    override fun execute(
+        name: String,
+        args: JSONObject,
+        owner: String,
+        onProgress: (String) -> Unit,
+        isCancelled: () -> Boolean,
+    ): ToolResult {
         return try {
+            // 派子代理：不碰屏幕、不占租约，走自己的上下文，只把结论带回来。
+            // 放在最前面：这件事跟工作台/闸门都无关，宿主也不一定给了工作台。
+            if (name == "task") return subTask(args, onProgress, isCancelled)
+
             // 工作台工具不碰设备、不过闸门：它们被限制在自己的沙箱目录里，
             // 写坏东西的范围有边界，不需要每次都让人点头。放在闸门之前分发。
-            if (name.startsWith("fs_") || name == "web_fetch" || name == "pdf_write" ||
-                name == "pptx_write" || name == "docx_write" || name == "memory_save" || name == "skill_load"
+            if (name.startsWith("fs_") || name == "web_fetch" || name == "web_search" ||
+                name == "pdf_write" ||
+                name == "pptx_write" || name == "docx_write" || name == "html_preview" ||
+                name == "memory_save" || name == "skill_load"
             ) {
                 val bench = workbench
                     ?: return ToolResult(err("NO_WORKBENCH", "工作台没有启用"))
                 return ToolResult(bench.execute(name, args))
+            }
+
+            // 系统意图不碰屏幕：设闹钟、拨号盘、分享这类交给系统应用去办。不读序号、
+            // 不占屏幕租约——另一个会话正拿着手机操作时也能用，这是它和无障碍动作的区别。
+            if (name == "phone_intent") {
+                val d = device() ?: return ToolResult(err("NO_ACCESSIBILITY", "无障碍服务未开启"))
+                return ToolResult(attachScreenAfter(name, intent(d, args)))
+            }
+
+            // 碰屏幕之前先拿租约。手机只有一块屏幕，两个任务交错操作会让序号表和坐标系
+            // 互相作废——每一步单看都合法，合起来却点到了别的地方。拿不到就老实拒绝。
+            if (!ensureLease(owner)) {
+                return ToolResult(err("PHONE_BUSY", BUSY_TEXT))
             }
 
             // 参数问题先挡掉，别让用户为一次注定失败的动作去点审批
@@ -182,6 +243,65 @@ class PhoneToolbox(
         }
     }
 
+    /**
+     * 不带进度的调用方式。测试、以及所有「不需要报告过程」的工具都走这条，
+     * 免得每个调用点都塞一个空 lambda。
+     */
+    fun execute(name: String, args: JSONObject, owner: String = ""): ToolResult =
+        execute(name, args, owner, {}) { false }
+
+    /**
+     * 派一个子代理：给它一句能独立看懂的目标，它自己去查、自己烧自己的上下文，
+     * 只把结论带回来。
+     *
+     * 为什么值得：一次 web_search 能抓回三千字，这些字会跟着**每一轮**请求重发。
+     * 查资料/大范围审阅这类活，中间过程对主线几乎全是噪声——子代理把它们关在自己的
+     * 上下文里，主线只付一份结论的钱。这也是「压缩」做不到的：压缩是事后清理，
+     * 噪声已经烧过一遍了。
+     */
+    private fun subTask(
+        args: JSONObject,
+        onProgress: (String) -> Unit,
+        isCancelled: () -> Boolean,
+    ): ToolResult {
+        val run = delegate ?: return ToolResult(err("NO_DELEGATE", "这个版本没有开启子代理"))
+        val goal = args.optString("goal").trim()
+        if (goal.length < 4) {
+            return ToolResult(
+                err("BAD_REQUEST", "goal 要写成一句能独立看懂的话（子代理看不到当前对话）")
+            )
+        }
+        if (subTasks >= MAX_SUB_TASKS) {
+            return ToolResult(
+                err(
+                    "SUB_BUDGET",
+                    "这个任务已经派过 $MAX_SUB_TASKS 次子代理了，额度用完（每次都是真花钱的完整请求）。" +
+                        "剩下的用现有工具自己做，或者把已有结论整理好交给用户。"
+                )
+            )
+        }
+        subTasks += 1
+        return run(goal, args.optString("focus").trim(), onProgress, isCancelled)
+    }
+
+    /**
+     * 确认这个会话现在可以用手机。
+     *
+     * 第一次碰屏幕时才申请（纯聊天、写文件不需要所有权），拿到之后一直持有到任务结束，
+     * 由 [AgentHost] 在收尾时交还。不是「每次工具调用都申请一次」——读屏算序号、再按序号点，
+     * 这两步必须发生在同一个所有权窗口里，中间被插一脚那一步就已经错了。
+     */
+    private fun ensureLease(owner: String): Boolean {
+        // 没有会话身份（纯 JVM 测试）：不参与租约，保持老行为
+        if (owner.isEmpty()) return true
+        // 已经拿着了：同一任务里后续的每一次调用都走这条
+        if (PhoneLease.holder() == owner) return true
+        if (!PhoneLease.tryAcquire(owner)) return false
+        // 刚接手：上一屏的序号和坐标系不属于自己，必须重新看一遍
+        invalidate()
+        return true
+    }
+
     // ------------------------------------------------------------ 各工具
 
     private fun status(): String {
@@ -221,9 +341,11 @@ class PhoneToolbox(
      */
     private fun attachScreenAfter(name: String, text: String): String {
         if (name !in MUTATING_ACTIONS || name in NO_VERIFY_ACTIONS) return text
-        if (!text.startsWith("{\"ok\":true")) return text
+        // 按 JSON 解析判成功，不用字符串前缀：org.json 不保证键序，ok 未必排在最前
+        val okFlag = runCatching { JSONObject(text).optBoolean("ok", false) }.getOrDefault(false)
+        if (!okFlag) return text
         // 界面转场需要一点时间。太短会读到动画中间态，模型据此判断「点了没反应」就开始瞎点。
-        Thread.sleep(if (name == "phone_launch_app") 1200 else SETTLE_MS)
+        Thread.sleep(if (name == "phone_launch_app" || name == "phone_intent") 1200 else SETTLE_MS)
         val after = try { readScreen() } catch (e: Exception) { return text }
         // readScreen 成功时返回的是大纲文本（"1|设置" 这种），失败时才是 {"ok":false,...}。
         // 读屏失败不连坐：动作本身是成功的，别让核对失败把结果变成报错。
@@ -384,8 +506,33 @@ class PhoneToolbox(
         }
     }
 
-    private fun swipe(direction: String): String {
-        val d = device() ?: return err("NO_ACCESSIBILITY", "无障碍服务未开启")
+    /**
+     * 系统意图：设闹钟、计时器、日历、拨号盘、短信草稿、分享、导航、开链接、跳设置页。
+     *
+     * 白名单而不是开放「任意 Intent」：模型能拼出的 action 无穷多，个个都起一遍
+     * 等于给了它一个未审计的系统调用面。上面这些是日常真正用得上的。
+     */
+    private fun intent(d: DeviceApi, args: JSONObject): String {
+        val action = args.optString("action").trim().lowercase()
+        val known = INTENT_ACTIONS.joinToString("/")
+        if (action.isEmpty()) return err("BAD_ARGS", "action 不能为空。可用：$known")
+        if (action !in INTENT_ACTIONS) return err("BAD_ACTION", "不支持的 action：$action。可用：$known")
+
+        val result = d.startIntent(action, args)
+        if (!result.optBoolean("ok", false)) {
+            return err(result.optString("code", "INTENT_FAILED"), result.optString("error", "打不开"))
+        }
+        // 已经切到系统应用，旧序号和坐标系全部作废
+        invalidate()
+        return JSONObject()
+            .put("ok", true)
+            .put("action", action)
+            .put("opened", result.optString("opened"))
+            .put("now", result.optString("now"))
+            .toString()
+    }
+
+    private fun swipe(direction: String): String {        val d = device() ?: return err("NO_ACCESSIBILITY", "无障碍服务未开启")
         invalidate()
         val size = d.displaySize()
         val w = size[0]
@@ -488,10 +635,26 @@ class PhoneToolbox(
     /** 动作后等界面落定的毫秒数。 */
     private const val SETTLE_MS = 500L
 
+    /**
+     * 手机被别的会话占着时回给模型的话。
+     *
+     * 必须写明「不要重试」：不写的话模型会换个手机工具再试一次，一轮里连撞四五次，
+     * 既烧 token，界面上又是一片红字，用户看到的还只是「它坏了」。
+     */
+    private const val BUSY_TEXT =
+        "另一个会话正在操作手机（同一块屏幕只能由一个任务操作），这次调用没有执行。" +
+            "不要重试、也不要换别的手机工具再试。直接告诉用户：等那边跑完再让你继续，或者先把那个会话停掉。"
+
     /** 执行成功后要附带 screen_after 的动作：它们都会改变界面。 */
     private val MUTATING_ACTIONS = setOf(
         "phone_tap", "phone_tap_at", "phone_long_press", "phone_input",
-        "phone_press_key", "phone_swipe", "phone_launch_app",
+        "phone_press_key", "phone_swipe", "phone_launch_app", "phone_intent",
+    )
+
+    /** phone_intent 允许的动作。见 [intent]。 */
+    private val INTENT_ACTIONS = setOf(
+        "alarm", "timer", "calendar", "dial", "sms", "share",
+        "navigate", "open_url", "settings", "app_info",
     )
         /** 需要过闸门的动作：只读和纯移动不在里面。 */
         private val RISKY_ACTIONS = setOf("phone_tap", "phone_tap_at", "phone_long_press", "phone_input")
@@ -597,8 +760,37 @@ class PhoneToolbox(
           {
             "type": "function",
             "function": {
-              "name": "phone_swipe",
-              "description": "滑动屏幕，用于翻页或滚动列表。",
+              "name": "phone_intent",
+              "description": "用系统接口一步完成「一句话的事」：设闹钟/计时器、建日程、打开拨号盘、写短信草稿、分享文字、启动导航、打开链接、跳设置页。**比在设置页里一层层点快十倍**，凡是有对应 action 的都优先用它。action 取值：alarm(hour,minute,message) / timer(seconds,message) / calendar(title,begin_ms,duration_min) / dial(number) / sms(number,text) / share(text) / navigate(query) / open_url(url) / settings(panel=wifi|bluetooth|apps|display|sound|battery|location|accessibility|storage) / app_info(package)。拨号只填号码不拨打；短信只打开草稿不发送——发送/拨出这一步留给用户自己按。",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "action": {"type": "string", "enum": ["alarm", "timer", "calendar", "dial", "sms", "share", "navigate", "open_url", "settings", "app_info"]},
+                  "hour": {"type": "integer", "description": "alarm：几点（0-23）"},
+                  "minute": {"type": "integer", "description": "alarm：几分（0-59）"},
+                  "message": {"type": "string", "description": "alarm/timer：显示的标签，如「吃药」「泡面」"},
+                  "seconds": {"type": "integer", "description": "timer：时长（秒）"},
+                  "skip_ui": {"type": "boolean", "description": "alarm/timer：true 表示直接创建不弹确认（确认页被跳过时看不到效果，一般别用）"},
+                  "title": {"type": "string", "description": "calendar：日程标题"},
+                  "begin_ms": {"type": "integer", "description": "calendar：开始时间，毫秒时间戳（现在的时间用 shell 的 date +%s%3N 取，不要自己算）"},
+                  "duration_min": {"type": "integer", "description": "calendar：时长（分钟），默认 60"},
+                  "description": {"type": "string", "description": "calendar：备注"},
+                  "number": {"type": "string", "description": "dial/sms：电话号码"},
+                  "text": {"type": "string", "description": "sms/share：正文"},
+                  "subject": {"type": "string", "description": "share：标题（邮件用）"},
+                  "query": {"type": "string", "description": "navigate：地点或地址，如「郑州东站」"},
+                  "url": {"type": "string", "description": "open_url：http/https 链接"},
+                  "panel": {"type": "string", "description": "settings：直接跳的子页，wifi/bluetooth/apps/display/sound/battery/location/accessibility/storage"},
+                  "package": {"type": "string", "description": "app_info：包名"}
+                },
+                "required": ["action"]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "phone_swipe",              "description": "滑动屏幕，用于翻页或滚动列表。",
               "parameters": {
                 "type": "object",
                 "properties": {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}},
@@ -625,5 +817,41 @@ class PhoneToolbox(
           }
         ]
         """.trimIndent()
+
+        /**
+         * 「派子代理」的工具定义。只有宿主真接了 [delegate] 才会出现在工具列表里。
+         *
+         * 描述里把「什么时候该派」写得很具体，是因为模型很容易滥用：一句「查一下」
+         * 就派一个子代理，等于把本来两轮能答完的事变成十轮。反过来只写「派子代理」
+         * 它又永远不会用。所以这里给了三条判据：要读很多页 / 会抓回大量无关内容 /
+         * 有明确边界的一次性调研。
+         */
+        private val TASK_SCHEMA = JSONObject(
+            """
+            {
+              "type": "function",
+              "function": {
+                "name": "task",
+                "description": "派一个子代理去独立完成一件「读得多、产出少」的活：批量查资料、把一批页面/文件通读一遍挑出要点、对比多个来源。它在自己的上下文里干活，中间抓到的东西不会进你的上下文，你只拿到一份结论——所以它特别适合那种「要读十几个页面但最后只要几条结论」的任务。不要用它做：一句话就能答的事、需要操作手机的事（它碰不到屏幕）、需要写文件的事（它只能读，内容让它写进结论里你自己落盘）。它看不到当前对话，goal 必须写成能独立看懂的一句话。",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "goal": {"type": "string", "description": "子任务目标，一句话说清要查什么、到什么程度算完成。子代理看不到当前对话，别用「上面那个」「刚才说的」这类指代。"},
+                    "focus": {"type": "string", "description": "可选：只要哪几个字段 / 只回答哪几个问题。比如「每个项目只要：名称、最新版本号、下载地址」。填了它结论会更短、更准。"}
+                  },
+                  "required": ["goal"]
+                }
+              }
+            }
+            """.trimIndent()
+        )
+
+        /**
+         * 一个任务里最多派几次子代理。
+         *
+         * 三次是权衡的结果：常见任务（比价、批量查 release、通读几个文件）一两次够用；
+         * 再多通常说明任务本身没想清楚，该回到主线重新规划，而不是继续撒钱。
+         */
+        const val MAX_SUB_TASKS = 3
     }
 }

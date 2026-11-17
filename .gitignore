@@ -26,3 +26,6 @@
 *.log
 .DS_Store
 Thumbs.db
+
+# 本地调试产物（缓存、跑分截图）
+/.tmp/

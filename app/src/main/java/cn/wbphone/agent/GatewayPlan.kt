@@ -154,6 +154,17 @@ object GatewayPlan {
         for (key in listOf("temperature", "top_p", "stop", "response_format", "stream_options")) {
             if (src.has(key) && !src.isNull(key)) out.put(key, src.get(key))
         }
+        // 思考深度：外部客户端（dsh-Go / 调试脚本）想带就带，认不认由上游决定。
+        // 以前这里按白名单过滤，把它悄悄吞掉了——「设了没效果」有一半是这种静默丢弃造成的。
+        if (src.has("reasoning_effort") && !src.isNull("reasoning_effort")) {
+            out.put("reasoning_effort", src.get("reasoning_effort"))
+        }
+
+        // 内置联网搜索：各家参数名不一样（混元 enable_search / search_info，OpenAI web_search_options）。
+        // 原样透传——认不认由上游决定，网关不该替它判断。若上游认，客户端就不用再爬搜索引擎了。
+        for (key in listOf("enable_search", "search_info", "web_search_options", "search_mode")) {
+            if (src.has(key) && !src.isNull(key)) out.put(key, src.get(key))
+        }
 
         // 输出上限：网关认 32768，超出或非法就夹回来。
         var cap = when {

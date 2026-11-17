@@ -18,6 +18,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.BaseAdapter
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -45,11 +46,21 @@ class MainActivity : Activity(), AgentHost.Listener {
 
     private val stream = StringBuilder()
 
+    /**
+     * 上一轮结束时 [stream] 的长度，也就是「这一轮开始前」的位置。
+     *
+     * 网络断了要作废重来时必须回退到这儿：只撤这一轮吐出来的半截，
+     * 前面几轮已经答完的内容是完整的，跟着删就等于把对话吃掉一截。
+     */
+    private var streamMark = 0
+
     private var approvalSheet: ApprovalSheet? = null
     private var approvalShownFor = -1L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 越早越好：任何初始化都可能崩，handler 必须在前面就位
+        installCrashLog()
         settings = AgentSettings(this)
         AgentHost.init(this)
         ApprovalUi.init(this)
@@ -63,6 +74,9 @@ class MainActivity : Activity(), AgentHost.Listener {
 
         container = FrameLayout(this).apply { background = Ui.screen(this@MainActivity) }
         setContentView(container)
+        // 上次启动如果崩过，这里把异常抖出来：手机常年不接数据线，
+        // 用户口述「闪退了」等于没有信息，一行异常名就够定位了。
+        showLastCrash()
 
         // 常驻服务先起来：它是无障碍自愈的执行者，开关被关掉时正需要它活着。
         KeepAliveService.ensureRunning(this)
@@ -85,6 +99,46 @@ class MainActivity : Activity(), AgentHost.Listener {
         if (intent?.getBooleanExtra(EXTRA_OPEN_A11Y, false) == true) {
             intent.removeExtra(EXTRA_OPEN_A11Y)
             container.post { openAccessibilityDetails() }
+        }
+    }
+
+    /**
+     * 闪退留个尸检报告。
+     *
+     * 手机常年不接数据线，「一点历史会话就闪退」这种反馈只给得出「闪退了」三个字。
+     * 把未捕获异常的栈写到 files/crash.log，下次启动把最后一行异常弹出来——
+     * 看一眼异常名就能定位，比来回猜十轮强。
+     */
+    private fun installCrashLog() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching {
+                val f = java.io.File(filesDir, "crash.log")
+                if (f.length() > 200_000) f.delete()
+                val when_ = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+                    .format(java.util.Date())
+                f.appendText(
+                    "=== $when_ ${t.name} ===\n" + android.util.Log.getStackTraceString(e) + "\n"
+                )
+            }
+            prev?.uncaughtException(t, e)
+        }
+    }
+
+    /** 上次启动崩过就把最后的异常行抖出来，然后归档避免每次启动都弹。 */
+    private fun showLastCrash() {
+        val f = java.io.File(filesDir, "crash.log")
+        if (!f.exists() || f.length() == 0L) return
+        val last = runCatching {
+            f.readLines().lastOrNull {
+                it.isNotBlank() && !it.startsWith("===") && !it.startsWith("\tat ")
+            }
+        }.getOrNull()
+        runCatching { f.renameTo(java.io.File(filesDir, "crash.prev.log")) }
+        if (!last.isNullOrBlank()) {
+            container.post {
+                toast("上次闪退：${last.trim().take(140)}")
+            }
         }
     }
 
@@ -262,7 +316,11 @@ class MainActivity : Activity(), AgentHost.Listener {
                             val fname = content.substringAfter(marker, "").substringBefore("】")
                             "$head（含文件 $fname）".trim()
                         } else content
-                        if (shown.isNotEmpty()) view.addUser(shown)
+                        if (shown.isNotEmpty()) {
+                            // 上一轮在这里收尾：过程收进一个折叠行，跟跑完时同一个形态
+                            view.collapseTurn()
+                            view.addUser(shown)
+                        }
                     } else if (content is org.json.JSONArray) {
                         // 多模态消息（用户发的图片 / 屏幕截图）：只还原文字部分，
                         // base64 不进界面也不进气泡，末尾标一句「含图片」让上下文说得通。
@@ -275,11 +333,17 @@ class MainActivity : Activity(), AgentHost.Listener {
                         }
                         val shown = text.toString().trim()
                         if (shown.isNotEmpty()) {
+                            // 上一轮在这里收尾：过程收进一个折叠行，跟跑完时同一个形态
+                            view.collapseTurn()
                             view.addUser(if (hasImage) "$shown（含图片）" else shown)
                         }
                     }
                 }
                 "assistant" -> {
+                    // 思考先于正文出现：当时它就是在回答之前想的，顺序不能倒。
+                    // 只有工具调用的轮次也照样有思考，所以这段放在判断 content 之前。
+                    val think = m.optString(AgentLoop.THINK_KEY, "")
+                    if (think.isNotEmpty()) view.addThinkingHistory(think)
                     val content = m.opt("content")
                     if (content is String && content.isNotEmpty()) {
                         // 带上历史下标：长按菜单的「从这里分叉」按它切历史
@@ -318,6 +382,8 @@ class MainActivity : Activity(), AgentHost.Listener {
         // 把历史里所有回答扫一遍，认出工作台里真实存在的文件补卡——
         // 「闪退重启后产物卡消失」就是这么来的，光修渲染不够，入口也得还在。
         revealMentionedArtifacts(answers.toString())
+        // 最后一段对话没有下一条 user 消息来触发收拢，在这里补上
+        view.collapseTurn()
     }
 
     // ---------------------------------------------------------------- 登录
@@ -389,6 +455,7 @@ class MainActivity : Activity(), AgentHost.Listener {
             return
         }
         stream.setLength(0)
+        streamMark = 0
         view.addUser(text)
         if (withAttachment) view.clearPendingImage()
         view.resetFooter()
@@ -644,6 +711,8 @@ class MainActivity : Activity(), AgentHost.Listener {
         private val mine: Boolean get() = AgentHost.currentSessionId() == sid && uiSession == sid
 
         override fun onText(delta: String) = post { if (mine) uiOnText(delta) }
+        // 思考增量：不显示的话，用户面对的就是几秒纯空白，感觉「卡住了」
+        override fun onThinking(delta: String) = post { if (mine) uiOnThinking(delta) }
         override fun onToolStart(name: String, args: JSONObject) = post { if (mine) uiOnToolStart(name, args) }
         override fun onToolEnd(name: String, result: String, ok: Boolean) = post { if (mine) uiOnToolEnd(result, ok) }
         override fun onImage(dataUrl: String) = post { if (mine) uiOnImage(dataUrl) }
@@ -652,7 +721,24 @@ class MainActivity : Activity(), AgentHost.Listener {
         // 不会再像之前那样「闪退一次，整段对话和产物卡全没了」。
         override fun onTurnEnd(turn: Int) {
             AgentHost.saveSession(sid)
+            // 这一轮的文本已经落地，重来时的回退点就该推到这儿。
+            // 用 post 保证「回退点」一定排在 onText 的队列之后，不会抢在文本前面。
+            post { streamMark = stream.length }
         }
+
+        /** 网络层退避重发：界面必须说一句，否则就是一段没有任何动静的空白。 */
+        override fun onRetry(why: String) = post { if (mine) chat?.setRunningText(why) }
+
+        /** 这一轮作废重来：撤掉已经流出来的半截，重试的内容从头写。 */
+        override fun onRestart() = post { if (mine) uiOnRestart() }
+
+        /**
+         * 后台子代理的进度。
+         *
+         * 只更新状态条那一行字，绝不进气泡：子代理的中间过程不是主线说的话，
+         * 混进去用户会以为「它怎么开始自己聊起来了」。
+         */
+        override fun onSubProgress(note: String) = post { if (mine) chat?.setRunningText(note) }
 
         override fun onCompact(removed: Int, kept: Int) = post {
             if (mine) toast("较早的 $removed 条消息已折叠，保留最近 $kept 条")
@@ -661,6 +747,11 @@ class MainActivity : Activity(), AgentHost.Listener {
         override fun onArtifact(path: String) {
             AgentHost.saveSession(sid)
             post { if (mine) chat?.addArtifact(path) }
+        }
+
+        override fun onOpenHtml(path: String) {
+            AgentHost.saveSession(sid)
+            post { if (mine) showArtifactPreview(path) }
         }
 
         override fun onFinished(finalText: String, turns: Int, toolCalls: Int) = post {
@@ -686,6 +777,17 @@ class MainActivity : Activity(), AgentHost.Listener {
         chat?.setRunningText("正在回复…")
     }
 
+    /**
+     * 思考增量落到界面。
+     *
+     * 这是「感觉慢」的直接解药：同样 4.8 秒的一轮，空白 4.8 秒和文字从 1.4 秒开始流，
+     * 体感完全是两回事。文字压暗显示，明确它只是过程。
+     */
+    private fun uiOnThinking(delta: String) {
+        chat?.appendThinking(delta)
+        chat?.setRunningText("正在思考…")
+    }
+
     private fun uiOnToolStart(name: String, args: JSONObject) {
         chat?.addTool(toolLabel(name), compactArgs(args))
         chat?.setRunningText(toolRunningText(name))
@@ -693,6 +795,9 @@ class MainActivity : Activity(), AgentHost.Listener {
 
     private fun uiOnToolEnd(result: String, ok: Boolean) {
         chat?.finishTool(ok, toolSummary(result), prettyResult(result))
+        // 工具做完到模型出字之间有 1~3 秒的服务端处理（预填充/排队/思考），
+        // 不说点什么的话，状态条就停在上一个动作上，看着像卡死。
+        chat?.setRunningText("正在思考…")
     }
 
     private fun uiOnImage(dataUrl: String) {
@@ -711,14 +816,30 @@ class MainActivity : Activity(), AgentHost.Listener {
 
     private fun uiOnError(message: String) {
         stream.setLength(0)
-        chat?.addAssistant("这一步没成：$message")
+        streamMark = 0
+        // 提示语在 AgentLoop 那一层已经翻成人话了（Errors.humanize），这里不再套前缀，
+        // 否则会变成「这一步没成：请求太频繁……进度都还在」这种半截话。
+        chat?.addAssistant(message)
         chat?.setRunning(false)
         running = false
+    }
+
+    /**
+     * 网络断了、这一轮作废重来：把已经流出来的半截从界面上撤掉。
+     *
+     * 不撤的后果很具体：重发的内容会接在半截后面，用户看到的是「说了半句 + 又从开头说一遍」，
+     * 比直接报错还难受。回退点用 [streamMark]，只吃这一轮，不动前面几轮。
+     */
+    private fun uiOnRestart() {
+        if (stream.length > streamMark) stream.setLength(streamMark)
+        chat?.restartTurn()
+        chat?.setRunningText("连接断了，正在重试…")
     }
 
     private fun uiOnFinished(finalText: String) {
         val streamed = stream.toString()
         stream.setLength(0)
+        streamMark = 0
         if (streamed.isEmpty() && finalText.isNotEmpty()) {
             chat?.addAssistant(finalText)
         } else if (finalText.length > streamed.length && finalText.startsWith(streamed)) {
@@ -731,6 +852,9 @@ class MainActivity : Activity(), AgentHost.Listener {
         // 只要文件真的在工作台里，就补一张预览卡——用户要的是能点开的东西，不是一句话。
         revealMentionedArtifacts(finalText.ifEmpty { streamed })
         chat?.setRunning(false)
+        // 整轮跑完：工具调用与中途说明收进一个折叠行，眼前只留最终回答和产物卡。
+        // 放在 setRunning(false) 之后——它会把还没收的过程组先收掉。
+        chat?.collapseTurn()
         // 会话标题在落盘时才定（取第一条 user 消息），跑完这一轮顺手回填顶栏
         chat?.setSessionTitle(currentSessionTitle())
         chat?.showRoundSummary(AgentHost.lastServerModel(), AgentHost.modelLabel(), AgentHost.usageText())
@@ -1029,22 +1153,32 @@ class MainActivity : Activity(), AgentHost.Listener {
                 }
                 row.setOnLongClickListener {
                     android.app.AlertDialog.Builder(this)
-                        .setTitle("删除这个会话？")
-                        .setMessage("「${m.title}」的${m.count} 条消息会一起删掉，不可恢复。")
-                        .setPositiveButton("删除") { _, _ ->
-                            if (!AgentHost.deleteSession(m.id)) {
-                                toast("这个会话还有任务在跑，停了再删")
-                            } else {
-                                if (isCur) {
-                                    chat?.welcome()
-                                    chat?.resetFooter()
-                                }
-                                toast("已删除")
+                        .setTitle(m.title)
+                        .setItems(arrayOf("看流水账（每一步做了什么）", "删除这个会话")) { _, which ->
+                            if (which == 0) {
                                 sheet.dismiss()
-                                showSessions()
+                                showTranscript(m.id, m.title)
+                                return@setItems
                             }
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("删除这个会话？")
+                                .setMessage("「${m.title}」的${m.count} 条消息会一起删掉，不可恢复。")
+                                .setPositiveButton("删除") { _, _ ->
+                                    if (!AgentHost.deleteSession(m.id)) {
+                                        toast("这个会话还有任务在跑，停了再删")
+                                    } else {
+                                        if (isCur) {
+                                            chat?.welcome()
+                                            chat?.resetFooter()
+                                        }
+                                        toast("已删除")
+                                        sheet.dismiss()
+                                        showSessions()
+                                    }
+                                }
+                                .setNegativeButton("算了", null)
+                                .show()
                         }
-                        .setNegativeButton("算了", null)
                         .show()
                     true
                 }
@@ -1398,6 +1532,8 @@ class MainActivity : Activity(), AgentHost.Listener {
         body.addView(settingsGroup("AI", listOf(
             settingsRow("✦", Ui.BRAND_BG, Ui.ON_BRAND_BG, "模型",
                 ModelRegistry.resolve(AgentHost.modelId()).summary()) { showModelPicker() },
+            settingsRow("◐", Ui.BRAND_BG, Ui.ON_BRAND_BG, "思考深度",
+                thinkStatusText()) { showThinkPicker() },
             settingsRow("⇅", Ui.BRAND_BG, Ui.ON_BRAND_BG, "模型自检",
                 "发一条最小请求") { checkModel() },
             settingsRow("◇", Ui.BRAND_BG, Ui.ON_BRAND_BG, "网关自检",
@@ -1456,17 +1592,7 @@ class MainActivity : Activity(), AgentHost.Listener {
                     val dir = getExternalFilesDir(null) ?: filesDir
                     val n = Memory.entries(dir).size
                     if (n == 0) "暂无记忆" else "已记 $n 条"
-                }) {
-                if (settings.memoryOn) {
-                    settings.memoryOn = false
-                    toast("已关闭：新会话不再带长期记忆（文件还在）")
-                    if (settingsShowing) showSettings()
-                } else {
-                    settings.memoryOn = true
-                    toast("已开启：新会话会带上记下的偏好和事实")
-                    if (settingsShowing) showSettings()
-                }
-            },
+                }) { showMemory() },
             settingsRow("◈", Ui.BRAND_BG, Ui.BRAND, "技能包",
                 if (!settings.skillsOn) "关"
                 else {
@@ -1504,6 +1630,15 @@ class MainActivity : Activity(), AgentHost.Listener {
 
         // ---- 通用
         body.addView(settingsGroup("通用", listOf(
+            settingsRow("♡", Ui.BRAND_BG, Ui.BRAND, "人情味",
+                if (settings.emotionOn) "开 · 回答带温度" else "关") {
+                settings.emotionOn = !settings.emotionOn
+                toast(
+                    if (settings.emotionOn) "以后回答先接情绪再干活，像聊天一样（下一条消息生效）"
+                    else "已切回干练模式"
+                )
+                if (settingsShowing) showSettings()
+            },
             settingsRow("▢", Ui.SOFT2, Ui.INK2, "工作台目录",
                 "文件写在这里") { closeSettings(); showWorkspace("settings") },
             settingsRow("⇄", Ui.SOFT2, Ui.INK2, "任务后自动回对话页",
@@ -1518,6 +1653,12 @@ class MainActivity : Activity(), AgentHost.Listener {
                 newChat()
             },
             settingsRow("≡", Ui.SOFT2, Ui.INK2, "查看运行日志") { showLog() },
+            settingsRow("⌗", Ui.SOFT2, Ui.INK2, "这个会话的流水账",
+                "每一步调了什么、返回了什么") {
+                closeSettings()
+                val sid = uiSession ?: AgentHost.currentSessionId()
+                if (sid == null) toast("还没有会话") else showTranscript(sid, currentSessionTitle())
+            },
         )), Ui.margin(this, bottom = 18))
 
         // ---- 危险区
@@ -1801,6 +1942,24 @@ class MainActivity : Activity(), AgentHost.Listener {
             return
         }
         var tail: String? = null
+        // HTML 不进代码井：进内置 WebView 全屏渲染（真浏览器内核，localStorage、
+        // 相对路径资源都可用）。渲染服务起不来才退回文本预览。
+        if (ext in setOf("html", "htm")) {
+            try {
+                artifactShowing = true
+                container.removeAllViews()
+                container.addView(
+                    HtmlPreview.build(this, dir, f, path,
+                        onClose = { closeArtifact() },
+                        onOpenBrowser = { openHtmlInBrowser(path) }),
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                )
+                return
+            } catch (e: Exception) {
+                toast("网页渲染失败，退回文本预览：${e.message ?: ""}")
+            }
+        }
         val content = try {
             val cap = 400_000
             if (f.length() > cap) {
@@ -1848,8 +2007,34 @@ class MainActivity : Activity(), AgentHost.Listener {
         }
     }
 
+    /**
+     * 用系统浏览器打开工作台里的网页。
+     *
+     * 为什么不走 content://：手机浏览器普遍不认这个 scheme，vivo 自带浏览器直接把
+     * URI 整段当搜索词发给搜索引擎（2026-11-17 用户实测，cet6-reading-lab 打不开）。
+     * 改走 ArtifactServer 的 http://127.0.0.1 回环地址——浏览器全都认识。
+     */
+    private fun openHtmlInBrowser(path: String) {
+        val dir = getExternalFilesDir(null) ?: filesDir
+        if (!ArtifactServer.start(dir)) {
+            toast("本机网页服务没起来，稍后再试")
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(ArtifactServer.url(path)))
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            toast("手机上找不到浏览器：${e.message ?: ""}")
+        }
+    }
+
     /** 通过只读 provider 把文件交给别的应用（WPS、浏览器、文件管理器）。 */
     private fun shareArtifact(f: java.io.File, path: String) {
+        // 网页文件一律走本机 HTTP：content:// 交给浏览器只会变成一次搜索
+        if (path.substringAfterLast('.', "").lowercase() in setOf("html", "htm")) {
+            openHtmlInBrowser(path)
+            return
+        }
         val uri = android.net.Uri.Builder()
             .scheme("content")
             .authority("$packageName.artifacts")
@@ -1969,9 +2154,9 @@ class MainActivity : Activity(), AgentHost.Listener {
         box.addView(
             fieldRow(
                 "模型 ID",
-                "hy3（免费，先用它试通）· glm-5.3-flash · deepseek-v4.1-flash …",
+                "hy4flash-free（当前免费）· glm-5.3-flash · deepseek-v4.1-flash …",
                 modelIds,
-                "现在「获取模型」能直接拉到整份清单；拉不到就手动添加 hy3"
+                "现在「获取模型」能直接拉到整份清单；拉不到就手动添加 hy4flash-free"
             )
         )
 
@@ -2198,8 +2383,9 @@ class MainActivity : Activity(), AgentHost.Listener {
                     .apply { setPadding(0, dp(2), 0, 0) })
             }
 
+            // auto 这类由服务端按任务定价的，没有固定倍率——显示「浮动」，别留空让人以为没数据
             val cost = when {
-                o.credit.isEmpty() -> ""
+                o.credit.isEmpty() -> "浮动"
                 o.credit == "x0.00" -> "免费"
                 else -> o.credit
             }
@@ -2236,6 +2422,104 @@ class MainActivity : Activity(), AgentHost.Listener {
             ViewGroup.LayoutParams.MATCH_PARENT,
             (resources.displayMetrics.heightPixels * 0.52f).toInt()
         ))
+
+        scrim.addView(card, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        scrim.setOnClickListener { dialog.dismiss() }
+        card.setOnClickListener { }
+
+        dialog.setContentView(scrim)
+        dialog.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+            setGravity(android.view.Gravity.BOTTOM)
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        dialog.show()
+    }
+
+    // ---------------------------------------------------------------- 思考深度
+
+    /** 设置页那一行右侧的值。被上游拒过的模型要在这里说清楚，否则用户以为开关没生效。 */
+    private fun thinkStatusText(): String {
+        val level = AgentHost.thinkLevel()
+        if (level == Think.STD) return "标准"
+        return if (AgentHost.effortUnsupported()) "${Think.label(level)} · 此模型不支持"
+        else Think.label(level)
+    }
+
+    /**
+     * 思考深度选择器。
+     *
+     * 为什么值得单独一个入口：实测首字延迟 ≈ 1.35s + 0.0191 × 思考 token，
+     * 也就是每 100 个思考字约 1.9 秒。砍提示词只值 0.27 秒，想快只能从「少想」下手。
+     * 但这是**质量与速度的交换**，得让用户自己按任务挑，不能替他决定。
+     */
+    private fun showThinkPicker() {
+        val dialog = android.app.Dialog(this, android.R.style.Theme_Translucent_NoTitleBar)
+        val scrim = Ui.column(this)
+        scrim.setBackgroundColor(0x660B111F)
+        scrim.gravity = android.view.Gravity.BOTTOM
+
+        val card = Ui.column(this)
+        card.background = Ui.solidRadii(this, Ui.CARD, intArrayOf(dp(22), dp(22), 0, 0))
+        card.setPadding(dp(18), dp(16), dp(18), dp(18))
+
+        val head = Ui.row(this)
+        head.addView(Ui.text(this, "思考深度", 17f, Ui.INK, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        head.addView(Ui.text(this, "关闭", 13f, Ui.INK3).apply {
+            setPadding(dp(10), dp(6), dp(2), dp(6))
+            setOnClickListener { dialog.dismiss() }
+        })
+        card.addView(head)
+
+        // 把账算给用户看：慢的不是网络，是模型在「想」。同时也得说清这一档不是保票——
+        // 参数只对认它的上游有用，不认的时候和标准没差别，选错了反而白折腾。
+        card.addView(Ui.text(this,
+            "实测（同一道难题各跑三次）：低档思考量 1,221 tokens、整轮 36 秒；标准 4,592、" +
+                "94 秒；高档和标准没差别。所以只想要快就选低；步骤容易走偏的活留标准。下一句话生效。",
+            11.5f, Ui.INK3).apply {
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(0, dp(6), 0, dp(12))
+        })
+
+        val current = AgentHost.thinkLevel()
+        for (level in Think.LEVELS) {
+            val picked = level == current
+            val row = Ui.column(this)
+            row.setPadding(dp(14), dp(12), dp(14), dp(12))
+            row.background = if (picked) Ui.solid(this, Ui.BRAND_BG, 14)
+            else Ui.solid(this, Ui.CARD, 14, Ui.LINE, 1)
+            val line = Ui.row(this)
+            line.addView(Ui.text(this, Think.label(level), 14.5f,
+                if (picked) Ui.BRAND else Ui.INK, true),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (picked) line.addView(Ui.text(this, "✓", 13f, Ui.BRAND, true))
+            row.addView(line)
+            row.addView(Ui.text(this, Think.note(level), 11.5f, Ui.INK3)
+                .apply { setPadding(0, dp(3), 0, 0) })
+            row.setOnClickListener {
+                AgentHost.setThinkLevel(level)
+                toast(
+                    if (level == Think.STD) "已回到标准档：请求体和以前一样"
+                    else "思考深度「${Think.label(level)}」，下一句话生效"
+                )
+                dialog.dismiss()
+                if (settingsShowing) showSettings()
+            }
+            card.addView(row, Ui.margin(this, bottom = 8))
+        }
+
+        // 被拒过就说明白：省得用户以为开关坏了，也不知道该换模型还是换档位。
+        if (AgentHost.effortUnsupported()) {
+            card.addView(Ui.text(this,
+                "当前模型拒绝过这个参数，已自动按标准档走（不会再反复重试）。" +
+                    "换个模型或换档位会重新试一次。",
+                11.5f, Ui.WARN).apply {
+                setLineSpacing(dp(3).toFloat(), 1f)
+                setPadding(dp(2), dp(2), dp(2), 0)
+            })
+        }
 
         scrim.addView(card, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -2292,6 +2576,185 @@ class MainActivity : Activity(), AgentHost.Listener {
     }
 
     /**
+     * 长期记忆面板：看清记了什么、删掉记错的、手动补一条。
+     *
+     * 为什么必须有这一页：记忆开始参与每一轮决策之后，「它凭什么这么说」就得有个地方能查。
+     * 之前只能在文件管理器里翻 `memory.md`——看不见条数、改错一行还得自己找行号，
+     * 结果是「答串了」只能靠猜。这里按最新在前排，删掉立刻生效（下一次请求就不带它）。
+     */
+    private fun showMemory() {
+        val entries = AgentHost.memoryEntries().asReversed()   // 最新在上：找「刚记错的那条」最省事
+        val enabled = AgentHost.memoryOn()
+        val dialog = android.app.Dialog(this, android.R.style.Theme_Translucent_NoTitleBar)
+
+        val scrim = Ui.column(this)
+        scrim.setBackgroundColor(0x660B111F)
+        scrim.gravity = android.view.Gravity.BOTTOM
+        scrim.setOnClickListener { dialog.dismiss() }
+
+        val card = Ui.column(this)
+        card.background = Ui.solidRadii(this, Ui.CARD, intArrayOf(dp(22), dp(22), 0, 0))
+        card.setPadding(dp(18), dp(16), dp(18), dp(18))
+        card.isClickable = true
+
+        val head = Ui.row(this)
+        head.addView(Ui.text(this, "长期记忆", 17f, Ui.INK, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        head.addView(Ui.text(this, "关闭", 13f, Ui.INK3).apply {
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener { dialog.dismiss() }
+        })
+        card.addView(head)
+
+        card.addView(Ui.text(this,
+            if (entries.isEmpty()) "还没有记忆。跟它说「记住我不吃香菜」，它就会记下来。"
+            else "每轮会按本轮话题挑最多 ${Memory.INJECT_LINES} 条带上，不是全塞。删掉哪条，下一轮就不再带它。",
+            11.5f, Ui.INK3).apply {
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(0, dp(6), 0, dp(12))
+        })
+
+        // ---- 总开关
+        val master = Ui.row(this)
+        master.setPadding(dp(13), dp(12), dp(13), dp(12))
+        master.background = Ui.solid(this, Ui.SOFT, 14)
+        master.addView(Ui.text(this, "启用长期记忆", 14.5f, Ui.INK),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        master.addView(Ui.text(this, if (enabled) "开" else "关", 13f,
+            if (enabled) Ui.BRAND else Ui.INK3, true))
+        master.setOnClickListener {
+            AgentHost.setMemoryOn(!enabled)
+            toast(if (!enabled) "已开启：新会话会带上记下的偏好和事实" else "已关闭：请求不再带记忆（文件还在）")
+            if (settingsShowing) showSettings()
+            dialog.dismiss()
+            showMemory()
+        }
+        card.addView(master, Ui.margin(this, bottom = 10))
+
+        // ---- 条数
+        if (entries.isNotEmpty()) {
+            card.addView(Ui.text(this, "共 ${entries.size} 条 · 最新在上 · 单条上限 ${Memory.MAX_ENTRY_CHARS} 字",
+                10.5f, Ui.INK3).apply { setPadding(dp(3), 0, 0, dp(8)) })
+        }
+
+        // ---- 清单
+        val list = Ui.column(this)
+        for (line in entries) {
+            val row = Ui.row(this)
+            row.setPadding(dp(13), dp(10), dp(6), dp(10))
+            row.background = Ui.solid(this, Ui.CARD, 14, Ui.LINE, 1)
+
+            val textBox = Ui.column(this)
+            val stamp = line.removePrefix("- ").substringBefore(" · ")
+            val bodyText = line.substringAfter(" · ", line)
+            if (stamp.length in 8..10 && stamp.count { it == '-' } == 2) {
+                textBox.addView(Ui.text(this, stamp, 10f, Ui.INK3).apply {
+                    setPadding(0, 0, 0, dp(3))
+                })
+            }
+            textBox.addView(Ui.text(this, bodyText, 13.5f, Ui.INK).apply {
+                setLineSpacing(dp(3).toFloat(), 1f)
+            })
+            row.addView(textBox, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+            // 删除入口做常驻的：左滑在透明浮层里手感差，而且没人会去试
+            row.addView(Ui.text(this, "删", 12.5f, Ui.WARN, true).apply {
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setOnClickListener {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("让它忘掉这条？")
+                        .setMessage(bodyText)
+                        .setPositiveButton("删掉") { _, _ ->
+                            AgentHost.forgetMemory(line)
+                            toast("已删掉，下一轮请求就不带它了")
+                            if (settingsShowing) showSettings()
+                            dialog.dismiss()
+                            showMemory()
+                        }
+                        .setNegativeButton("留着", null)
+                        .show()
+                }
+            })
+            list.addView(row, Ui.margin(this, bottom = 8))
+        }
+
+        val scroll = ScrollView(this).apply {
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(list)
+        }
+        card.addView(scroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            if (entries.size > 5) height = dp(380)
+        })
+
+        // ---- 底部动作：手动记一条 / 全清
+        val foot = Ui.row(this)
+        foot.setPadding(0, dp(10), 0, 0)
+        foot.addView(Ui.text(this, "＋ 手动记一条", 12.5f, Ui.BRAND, true).apply {
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setOnClickListener { askMemory() }
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        if (entries.isNotEmpty()) {
+            foot.addView(Ui.text(this, "清空全部", 12.5f, Ui.INK3).apply {
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setOnClickListener {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("清空 ${entries.size} 条记忆？")
+                        .setMessage("记下的偏好和事实都会没掉，之后要重新教。这一步不能撤销。")
+                        .setPositiveButton("清空") { _, _ ->
+                            AgentHost.clearMemory()
+                            toast("已清空")
+                            if (settingsShowing) showSettings()
+                            dialog.dismiss()
+                            showMemory()
+                        }
+                        .setNegativeButton("算了", null)
+                        .show()
+                }
+            })
+        }
+        card.addView(foot)
+
+        card.addView(Ui.text(this,
+            "存在 工作台/memory.md，一行一条，也能直接用文件管理器改",
+            10.5f, Ui.INK3).apply { setPadding(dp(2), dp(4), 0, 0) })
+
+        scrim.addView(card)
+        dialog.setContentView(scrim)
+        dialog.show()
+    }
+
+    /** 手动记一条：不想为一句偏好专门开一轮对话时用。 */
+    private fun askMemory() {
+        val input = EditText(this).apply {
+            hint = "比如：回答尽量短，别用列表"
+            textSize = 14f
+            setSingleLine(false)
+            maxLines = 4
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+        val wrap = FrameLayout(this).apply { setPadding(dp(6), dp(2), dp(6), 0) }
+        wrap.addView(input)
+        AlertDialog.Builder(this)
+            .setTitle("记一条")
+            .setView(wrap)
+            .setPositiveButton("记下") { _, _ ->
+                val saved = AgentHost.rememberManually(input.text.toString())
+                toast(
+                    when {
+                        saved != null -> "记下了"
+                        input.text.isBlank() -> "空白没记"
+                        else -> "跟最近记过的重复，没再记一遍"
+                    }
+                )
+                if (settingsShowing) showSettings()
+                showMemory()
+            }
+            .setNegativeButton("算了", null)
+            .show()
+    }
+
+    /**
      * 技能包面板：看清单、单独开关。
      *
      * 这里不做内容编辑——技能就是工作台 `skills/` 里的 Markdown，改内容该在能看清全文的
@@ -2322,7 +2785,8 @@ class MainActivity : Activity(), AgentHost.Listener {
         card.addView(head)
 
         card.addView(Ui.text(this,
-            "模型平时只看到「名字 + 什么时候用」的清单，命中才加载正文——所以技能多也不占平时的额度。",
+            "模型平时只看到「名字 + 什么时候用」的清单，命中才加载正文——所以技能多也不占平时的额度。" +
+                "点一行看正文，右边那个「已启用」才是开关。",
             11.5f, Ui.INK3).apply {
             setLineSpacing(dp(3).toFloat(), 1f)
             setPadding(0, dp(6), 0, dp(12))
@@ -2368,15 +2832,20 @@ class MainActivity : Activity(), AgentHost.Listener {
                 setPadding(0, dp(3), 0, 0)
             })
             row.addView(textBox, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            // 开关做成右侧独立按钮：整行点击留给「看正文」——
+            // 想知道某个技能到底写了什么，比想停用它频繁得多
             row.addView(Ui.text(this, if (on) "已启用" else "已停用", 11.5f,
-                if (on) Ui.BRAND else Ui.INK3, on))
-            row.setOnClickListener {
-                val nowOn = AgentHost.toggleSkill(item.name)
-                toast(if (nowOn) "已启用「${item.title}」" else "已停用「${item.title}」，清单里不再出现")
-                if (settingsShowing) showSettings()
-                dialog.dismiss()
-                showSkills()
-            }
+                if (on) Ui.BRAND else Ui.INK3, on).apply {
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setOnClickListener {
+                    val nowOn = AgentHost.toggleSkill(item.name)
+                    toast(if (nowOn) "已启用「${item.title}」" else "已停用「${item.title}」，清单里不再出现")
+                    if (settingsShowing) showSettings()
+                    dialog.dismiss()
+                    showSkills()
+                }
+            })
+            row.setOnClickListener { showSkillText(item) }
             list.addView(row, Ui.margin(this, bottom = 8))
         }
 
@@ -2399,6 +2868,38 @@ class MainActivity : Activity(), AgentHost.Listener {
         dialog.show()
     }
 
+    /**
+     * 技能正文（只读）。
+     *
+     * 故意显示原始 Markdown 而不是排好版的富文本：这一页的用途是「看看它到底写了什么」，
+     * 模型收到的也正好是这份原文——中间再过一层排版，看到的就是加工过的版本了。
+     */
+    private fun showSkillText(item: Skill.Item) {
+        val body = TextView(this).apply {
+            text = Skill.body(item).ifEmpty { "（这个文件读不出来，或者正文是空的）" }
+            textSize = 11.5f
+            typeface = Typeface.MONOSPACE
+            setTextColor(0xFFC8D0DC.toInt())
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(0xFF12141A.toInt())
+            addView(body)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("${item.title} · ${item.bytes / 1024} KB")
+            .setView(scroll)
+            .setPositiveButton("关闭", null)
+            .setNeutralButton("复制") { _, _ ->
+                val cm = getSystemService(ClipboardManager::class.java)
+                cm?.setPrimaryClip(ClipData.newPlainText(item.name, Skill.body(item)))
+                toast("已复制全文")
+            }
+            .show()
+    }
+
     private fun copyToClipboard(label: String, text: String) {
         val cm = getSystemService(ClipboardManager::class.java)
         cm?.setPrimaryClip(ClipData.newPlainText(label, text))
@@ -2406,11 +2907,15 @@ class MainActivity : Activity(), AgentHost.Listener {
     }
 
     private fun showLog() {
+        // 除了内存里这份，磁盘上还留着上次运行的尾巴（见 AgentHost.restoreLog）：
+        // 崩溃最需要日志，而崩溃正好把内存里的那几百行一起带走。
+        val text = AgentHost.snapshotLog().ifEmpty { "还没有记录" }
         val body = TextView(this).apply {
-            text = AgentHost.snapshotLog().ifEmpty { "还没有记录" }
+            this.text = text
             textSize = 11f
             typeface = Typeface.MONOSPACE
             setTextColor(0xFFC8D0DC.toInt())
+            setTextIsSelectable(true)
             setPadding(dp(12), dp(12), dp(12), dp(12))
         }
         val scroll = ScrollView(this).apply {
@@ -2421,8 +2926,62 @@ class MainActivity : Activity(), AgentHost.Listener {
             .setTitle("运行日志")
             .setView(scroll)
             .setPositiveButton("关闭", null)
+            // 之前这里只有「关闭」：想反馈问题只能截图，一屏二十行，翻十屏也发不全
+            .setNegativeButton("复制全文") { _, _ ->
+                getSystemService(ClipboardManager::class.java)
+                    ?.setPrimaryClip(ClipData.newPlainText("运行日志", text))
+                toast("已复制全文，可以直接粘给我")
+            }
             .show()
     }
+
+    /**
+     * 会话流水账：查「它当时到底做了什么」。
+     *
+     * 模型上下文会被压缩、被截断（省 token 必须如此），但发生过的事一条不落地在这份记录里：
+     * 用户原话、每次工具调用的参数与结果、每轮耗时拆解、压缩和重试。
+     * 答错了、点错了，先看这里，比靠回忆和截图猜要快得多。
+     */
+    private fun showTranscript(id: String, title: String) {
+        val text = AgentHost.transcriptText(id)
+        if (text.isBlank()) {
+            toast("这个会话还没有流水账（跑过任务之后才有）")
+            return
+        }
+        val shown = if (text.length > TRANSCRIPT_PREVIEW) {
+            text.take(TRANSCRIPT_PREVIEW) + "\n\n… 还有 ${text.length - TRANSCRIPT_PREVIEW} 字，导出看全文"
+        } else text
+        val body = TextView(this).apply {
+            this.text = shown
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(0xFFC8D0DC.toInt())
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(0xFF12141A.toInt())
+            addView(body)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("流水账 · $title")
+            .setView(scroll)
+            .setPositiveButton("关闭", null)
+            .setNegativeButton("复制全文") { _, _ ->
+                getSystemService(ClipboardManager::class.java)
+                    ?.setPrimaryClip(ClipData.newPlainText("流水账", text))
+                toast("已复制全文")
+            }
+            .setNeutralButton("导出到工作台") { _, _ ->
+                val name = AgentHost.exportTranscript(id)
+                toast(if (name == null) "导出失败" else "已导出：工作台/$name")
+            }
+            .show()
+    }
+
+    /** 流水账在弹窗里最多显示多少字。再长就靠导出——TextView 塞几十万字会卡到划不动。 */
+    private val TRANSCRIPT_PREVIEW = 60_000
 
     private fun confirmLogout() {
         AlertDialog.Builder(this)
@@ -2463,11 +3022,14 @@ class MainActivity : Activity(), AgentHost.Listener {
         "fs_edit" -> "改文件"
         "fs_search" -> "搜索内容"
         "web_fetch" -> "抓网页"
+        "web_search" -> "联网搜索"
         "pdf_write" -> "生成 PDF"
         "pptx_write" -> "生成 PPT"
         "docx_write" -> "生成 Word"
+        "html_preview" -> "渲染网页"
         "memory_save" -> "记到长期记忆"
         "skill_load" -> "加载技能"
+        "task" -> "派子代理"
         else -> name
     }
 
@@ -2484,11 +3046,13 @@ class MainActivity : Activity(), AgentHost.Listener {
         "fs_edit" -> "正在改文件…"
         "fs_search" -> "正在搜索…"
         "web_fetch" -> "正在抓网页…"
+        "web_search" -> "正在联网查…"
         "pdf_write" -> "正在生成 PDF…"
         "pptx_write" -> "正在生成 PPT…"
         "docx_write" -> "正在生成 Word…"
         "memory_save" -> "正在记下…"
         "skill_load" -> "正在翻技能…"
+        "task" -> "正在派子代理查…"
         else -> "正在执行…"
     }
 

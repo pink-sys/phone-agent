@@ -15,6 +15,27 @@ class AgentSettings(context: Context) {
         get() = sp.getString(KEY_MODEL, Config.MODEL) ?: Config.MODEL
         set(value) = sp.edit().putString(KEY_MODEL, value.trim()).apply()
 
+    /**
+     * 思考深度（[Think.LOW] / [Think.STD] / [Think.HIGH]）。
+     *
+     * 默认标准 = 不往请求体里加参数，和旧版逐字节一致。选低就是真的少想：
+     * 实测每 100 个思考 token 约 1.9 秒，这是回答快慢唯一有效的旋钮。
+     */
+    var thinkLevel: Int
+        get() = Think.clamp(sp.getInt(KEY_THINK_LEVEL, Config.THINK_LEVEL))
+        set(value) = sp.edit().putInt(KEY_THINK_LEVEL, Think.clamp(value)).apply()
+
+    /**
+     * 哪个模型明确拒绝过 `reasoning_effort`。
+     *
+     * 记下来是为了别每一轮都白打一次注定失败的请求（那是整整一次往返的延迟，
+     * 而且要用户等着看报错）。换模型后自动重试——不同上游支持度不一样。
+     * 空串 = 没有已知的拒绝。
+     */
+    var effortRejectedFor: String
+        get() = sp.getString(KEY_EFFORT_REJECTED, "") ?: ""
+        set(value) = sp.edit().putString(KEY_EFFORT_REJECTED, value.trim()).apply()
+
     /** 上次登录的账号昵称，只用于界面显示，不是凭证。 */
     var lastAccountName: String
         get() = sp.getString(KEY_ACCOUNT, "") ?: ""
@@ -98,6 +119,15 @@ class AgentSettings(context: Context) {
         set(value) = sp.edit().putBoolean(KEY_VOICE_ON, value).apply()
 
     /**
+     * 人情味：回答带情绪、先共情再干活（豆包那种语气）。
+     * **默认关**——干活型回答要的是干脆利落，语气段也不该常驻烧 token；
+     * 想聊天的用户自己开，开了也随时能关回去。
+     */
+    var emotionOn: Boolean
+        get() = sp.getBoolean(KEY_EMOTION_ON, false)
+        set(value) = sp.edit().putBoolean(KEY_EMOTION_ON, value).apply()
+
+    /**
      * 上次实测能通过上游渠道校验的请求体档位。
      * 存下来是为了冷启动时直接从这档开始——否则每次开应用都要先吃一发 11128 才知道该用哪档。
      */
@@ -118,6 +148,8 @@ class AgentSettings(context: Context) {
 
     companion object {
         private const val KEY_MODEL = "model"
+        private const val KEY_THINK_LEVEL = "think_level"
+        private const val KEY_EFFORT_REJECTED = "effort_rejected_for"
         private const val KEY_ACCOUNT = "last_account"
         private const val KEY_ONBOARDING = "onboarding_done"
         private const val KEY_AUTO_RETURN = "auto_return"
@@ -130,5 +162,6 @@ class AgentSettings(context: Context) {
         private const val KEY_SKILLS_ON = "skills_on"
         private const val KEY_SKILLS_OFF = "skills_off"
         private const val KEY_VOICE_ON = "voice_on"
+        private const val KEY_EMOTION_ON = "emotion_on"
     }
 }

@@ -27,6 +27,16 @@ interface DeviceApi {
     /** [width, height]，用于 hello 上报与桥侧算坐标。 */
     fun displaySize(): IntArray
     fun deviceLabel(): String
+
+    /**
+     * 用系统 Intent 办一件「一句话的事」：设闹钟、计时器、日历、拨号盘、短信草稿、
+     * 分享、导航、打开链接、跳设置页。
+     *
+     * 为什么不走无障碍点点点：这些全都有系统公开接口，一步就能到；
+     * 走 UI 要进设置页翻半天，还要占屏幕租约、烧十几轮 token。
+     * args 里的字段由调用方（PhoneTools）先校验，这里只管拼 Intent 和起 Activity。
+     */
+    fun startIntent(action: String, args: JSONObject): JSONObject
 }
 
 internal fun ok(vararg pairs: Pair<String, Any?>): JSONObject {

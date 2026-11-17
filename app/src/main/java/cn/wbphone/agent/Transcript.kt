@@ -46,32 +46,6 @@ object Transcript {
         runCatching { file(context, sessionId).delete() }
     }
 
-    // ------------------------------------------------------------ 快捷构造
-
-    fun user(text: String, withImage: Boolean = false): JSONObject =
-        JSONObject()
-            .put("type", "user")
-            .put("text", text.take(2000))
-            .put("withImage", withImage)
-
-    fun assistant(text: String): JSONObject =
-        JSONObject().put("type", "assistant").put("text", text.take(4000))
-
-    fun tool(name: String, args: String, ok: Boolean, resultBrief: String): JSONObject =
-        JSONObject()
-            .put("type", "tool")
-            .put("name", name)
-            .put("args", args.take(600))
-            .put("ok", ok)
-            .put("result", resultBrief.take(300))
-
-    fun compact(removed: Int, kept: Int, goal: String): JSONObject =
-        JSONObject()
-            .put("type", "compact")
-            .put("removed", removed)
-            .put("kept", kept)
-            .put("goal", goal.take(200))
-
-    fun error(message: String): JSONObject =
-        JSONObject().put("type", "error").put("message", message.take(600))
+    // 记录格式的定义与「给人看」的渲染在 TranscriptText：那个文件一行 Android API 都没有，
+    // 纯 JVM 就能测（耗时怎么拆、工具参数显不显示、失败有没有标出来，都要能跑断言）。
 }

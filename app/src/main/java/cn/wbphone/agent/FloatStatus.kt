@@ -138,11 +138,13 @@ object FloatStatus {
         "fs_edit" -> "正在改文件…"
         "fs_search" -> "正在搜索…"
         "web_fetch" -> "正在抓网页…"
+        "web_search" -> "正在联网查…"
         "memory_save" -> "正在记下…"
         "skill_load" -> "正在翻技能…"
         "pdf_write" -> "正在生成 PDF…"
         "pptx_write" -> "正在生成 PPT…"
         "docx_write" -> "正在生成 Word…"
+        "task" -> "正在派子代理查…"
         else -> "正在执行…"
     }
 

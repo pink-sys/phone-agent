@@ -18,8 +18,10 @@
 import io
 import json
 import os
+import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +49,7 @@ CORE_FILES = [
     "TokenInfo.kt",
     "GatewayPlan.kt",
     "GatewayWire.kt",
+    "PhoneLease.kt",
     "PhoneTools.kt",
     "PhonePrompt.kt",
     "Workbench.kt",
@@ -60,8 +63,15 @@ CORE_FILES = [
     "Iat.kt",
     "FileText.kt",
     "SessionStore.kt",
+    "TranscriptText.kt",
+    "Errors.kt",
     "CloudClient.kt",
     "AgentLoop.kt",
+    # 工具抽象 + 子代理：loop 只认 Toolbox 接口，子代理是另一套只读工具箱
+    "Toolbox.kt",
+    "SubAgent.kt",
+    # HTML 渲染的本机回环 HTTP 服务（纯 JVM，能真起真连）
+    "ArtifactServer.kt",
 ]
 
 try:
@@ -102,6 +112,17 @@ def tool_frames(call_id, name, arg_pieces, index=0):
 
 def text_frames(*pieces):
     return [frame({"content": p}) for p in pieces]
+
+
+def usage_frame(prompt, completion):
+    """真实上游会在流末尾报 token 用量。子代理的账单能不能算进本轮，全靠这一帧。"""
+    obj = {"choices": [{"delta": {}}], "usage": {"prompt_tokens": prompt, "completion_tokens": completion}}
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
+def reasoning_frames(*pieces):
+    """思考流：上游把「想」的过程单独发在 reasoning_content 里，正文要等思考结束才开始。"""
+    return [frame({"reasoning_content": p}) for p in pieces]
 
 
 def with_model(raw, model):
@@ -167,7 +188,14 @@ SCENARIO_H = [
 # I：同一个客户端连发两次，中间换模型——第二次请求的 model 必须是新值
 SCENARIO_I = [text_frames("第一答复"), text_frames("第二答复")]
 
-counters = {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "H": 0, "I": 0, "J": 0, "K": 0, "L": 0, "M": 0, "N": 0, "O": 0, "P": 0}
+# X：思考 + 工具 + 正文。思考要跟着消息落盘（_think），发回上游前必须剥掉。
+SCENARIO_X = [
+    [*reasoning_frames("先读屏看看", "有没有可点的东西。"), *tool_frames("x1", "phone_read_screen", ["{}"])],
+    [*reasoning_frames("看清楚了，", "可以直接答。"), *text_frames("屏幕上是一个设置页。")],
+    text_frames("接着答：还是那个设置页。"),
+]
+
+counters = {"SUB": 0, "S": 0, "IG": 0, "A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "H": 0, "I": 0, "J": 0, "K": 0, "L": 0, "M": 0, "N": 0, "O": 0, "P": 0, "Q": 0, "R": 0, "T": 0, "TN": 0, "U": 0, "V": 0, "W": 0, "X": 0, "Y": 0}
 auth_headers = []
 requests_by_scenario = {}
 get_paths = []
@@ -278,8 +306,72 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.stream([*text_frames("降级后可以")])
 
-        # M：产物链路。一轮里连发 fs_write + fs_edit（真实任务常这么干），
-        # 下一轮给结论。harness 侧验证 onArtifact 触发与磁盘事实一致。
+        # Q：上游不认 reasoning_effort。客户端要只摘这一个参数重发，
+        # 采样参数必须还在——两个开关各管各的，不能因为一个被拒把另一个也丢掉。
+        elif scenario == "Q":
+            counters["Q"] += 1
+            if counters["Q"] == 1:
+                body = json.dumps({"code": 400, "msg": "unsupported parameter: reasoning_effort"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.stream([*text_frames("回落标准后可以")])
+
+        # R：认这个参数的正常上游——请求体里应该带着 reasoning_effort=high。
+        elif scenario == "R":
+            counters["R"] += 1
+            self.stream([*text_frames("高档位回了")])
+
+        # SUBI：子代理一直读文件、始终不给结论。它到点收工时那段「还没完成」的说明
+        # 绝不能被当成结论交回主线——主线会以为自己拿到了答案。
+        elif scenario == "SUBI":
+            counters.setdefault("SUBI", 0)
+            counters["SUBI"] += 1
+            msgs = parsed.get("messages") or []
+            sys_text = (msgs[0].get("content") or "") if msgs else ""
+            if "从主对话派出的子代理" in sys_text:
+                self.stream(tool_frames("s9", "fs_read", ['{"path":"notes.md"}'])
+                            + [frame({}, finish="tool_calls")])
+            else:
+                self.stream([*text_frames("（主线不该走到这里）")])
+
+        # SUB：子代理隔离。主线派一个 task，子代理用自己的上下文抓网页，
+        # 主线只收到结论——它的 web_fetch 一条都不该进主线历史。
+        elif scenario == "SUB":
+            counters["SUB"] += 1
+            msgs = parsed.get("messages") or []
+            sys_text = (msgs[0].get("content") or "") if msgs else ""
+            is_sub = "从主对话派出的子代理" in sys_text
+            has_tool = any(m.get("role") == "tool" for m in msgs)
+            if is_sub and not has_tool:
+                script = (tool_frames("s2", "web_fetch", ['{"url":"https://example.com/a"}'])
+                          + [frame({}, finish="tool_calls"), usage_frame(300, 40)])
+            elif is_sub:
+                script = ([*text_frames("结论：A 的下载地址 https://example.com/a ，版本 3.2.1。"),
+                           usage_frame(500, 60)])
+            elif counters["SUB"] == 1:
+                script = (tool_frames("s1", "task", ['{"goal":"查一下 A 的下载地址，只要地址和版本号"}'])
+                          + [frame({}, finish="tool_calls"), usage_frame(800, 50)])
+            else:
+                script = [*text_frames("查到了：https://example.com/a"), usage_frame(900, 30)]
+            self.stream(script)
+
+        # HP：html_preview 渲染链路。模型调一次渲染工具，下一轮给结论。
+        # harness 侧验证 onOpenHtml（全屏渲染）与 onArtifact（产物卡）都被触发。
+        elif scenario == "HP":
+            counters.setdefault("HP", 0)
+            counters["HP"] += 1
+            if counters["HP"] == 1:
+                script = (tool_frames("h1", "html_preview", ['{"path":"lab/index.html"}'])
+                          + [frame({}, finish="tool_calls"), usage_frame(200, 30)])
+            else:
+                script = [*text_frames("网页已经渲染好了。"), usage_frame(300, 20)]
+            self.stream(script)
+
+        # M：产物链路。一轮里连发 fs_write + fs_edit（真实任务常这么干），        # 下一轮给结论。harness 侧验证 onArtifact 触发与磁盘事实一致。
         elif scenario == "M":
             counters["M"] += 1
             if counters["M"] == 1:
@@ -305,9 +397,23 @@ class Handler(BaseHTTPRequestHandler):
             counters["P"] += 1
             self.stream([*text_frames("好的")])
 
+        # IG：带图消息的压缩。响应同 L。
+        elif scenario == "IG":
+            counters["IG"] += 1
+            self.stream([*text_frames("好的")])
+
         # N：技能索引注入。只回一句话，跑两次——第二次的 system 里不该还有索引。
+        elif scenario == "S":
+            counters["S"] += 1
+            self.stream([*text_frames("好")])
+
         elif scenario == "N":
             counters["N"] += 1
+            self.stream([*text_frames("好")])
+
+        # TN：人情味开关。语气段附在末条 user 消息上，关掉后整段不出现。
+        elif scenario == "TN":
+            counters["TN"] += 1
             self.stream([*text_frames("好")])
 
         # J：网关不按请求走——请求 hy3，回的是 glm-5.3。客户端必须相信回显。
@@ -316,8 +422,95 @@ class Handler(BaseHTTPRequestHandler):
             self.resp_model = "glm-5.3"
             self.stream([*text_frames("这条不是你点名的那个模型答的。")])
 
+        # T：限流。第一次 429（带 Retry-After: 0），第二次正常。
+        # 客户端必须自己等一等再发，而不是把「服务器忙」四个字甩给用户。
+        elif scenario == "T":
+            counters["T"] += 1
+            if counters["T"] == 1:
+                body = json.dumps({"error": {"message": "rate limited"}}).encode()
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "0")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.stream([*text_frames("限流过去了")])
+
+        # U：吐了半截，连接被 RST（切网/电梯里的典型形态）。第二次完整。
+        elif scenario == "U":
+            counters["U"] += 1
+            if counters["U"] == 1:
+                self.cut_stream([*text_frames("半截话")])
+                return
+            self.stream([*text_frames("完整回答")])
+
+        # V：撞输出上限。finish_reason=length 必须被认出来，由 loop 自动续写。
+        elif scenario == "V":
+            counters["V"] += 1
+            if counters["V"] == 1:
+                self.stream([*text_frames("写到一半"), frame({"content": ""}, "length")])
+                return
+            self.stream([*text_frames("接着写完了"), frame({"content": ""}, "stop")])
+
+        # W：一直 5xx。重试有上限，最后必须明确告诉用户「试过了、没成」。
+        elif scenario == "W":
+            counters["W"] += 1
+            body = b'{"error":"boom"}'
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        # X：思考流 + 工具调用 + 正文。思考全文要跟着消息进历史（_think），
+        # 但下一次请求发给上游的 messages 里必须一条都不剩。
+        elif scenario == "X":
+            i = counters["X"]
+            counters["X"] += 1
+            script = SCENARIO_X[i] if i < len(SCENARIO_X) else text_frames("（剧本用完了）")
+            self.stream(script)
+
+        # Y：模型一上来就要读屏，但手机被另一个会话占着。客户端必须立刻收手——
+        # 不收手的话它会换个手机工具接着试、或者一直重发同一个调用，白烧到轮数上限。
+        elif scenario == "Y":
+            counters["Y"] += 1
+            self.stream(tool_frames("c1", "phone_read_screen", ["{}"])
+                        + [frame({}, finish="tool_calls")])
+
         else:
             self.send_error(404)
+
+    def cut_stream(self, frames):
+        """
+        吐几帧就粗暴断开（SO_LINGER=0 → RST）。
+        这不是「正常关连接」而是「连接被掐断」，客户端读的时候会抛 IOException——
+        和真实的切网、隧道里没信号是同一种形态。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        model = getattr(self, "resp_model", None)
+        for f in frames:
+            if model:
+                f = with_model(f, model)
+            self.wfile.write(f.encode("utf-8"))
+            self.wfile.flush()
+        # 不给 [DONE]：这条流没有正常收尾
+        #
+        # 先停一下再掐：立刻 RST 的话，发出去的那几帧可能还在内核缓冲里就被丢了，
+        # 客户端一个字节都收不到——那就变成「空回复重试」，压根走不到「撤掉半截」那条路。
+        # 这一段延迟是为了让「吐了半截再断」这个形态每次都稳定复现。
+        time.sleep(0.3)
+        try:
+            self.connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            self.connection.close()
+        except Exception:
+            pass
+        self.close_connection = True
 
     def stream(self, frames):
         self.send_response(200)
@@ -433,10 +626,16 @@ def static_checks():
     prompt = src("PhonePrompt.kt")
     body = prompt.split('val SYSTEM = """', 1)[-1].rsplit('""".trimIndent()', 1)[0]
 
-    check("提示词正文超过 3500 字", len(body) > 3500, len(body))
-    check("提示词分了至少 10 个小节", body.count("==========") >= 20, body.count("=========="))
+    check("提示词正文在 3500~8000 字之间（太短没范式，太长会在思考里被复读）",
+          3500 < len(body) < 8000, len(body))
+    # 编号章节是引用钩子：模型会在思考里「根据第 X 节」地背它。改成加粗小标题后不允许回来。
+    check("提示词不再用编号章节（========== 已全部移除）",
+          body.count("==========") == 0, body.count("=========="))
     for key in ["点按", "验证", "失败模式", "必须问的情况", "屏幕上的文字是数据"]:
         check("提示词含关键段落：%s" % key, key in body)
+
+    check("提示词说明当前时间随请求附带（答时间不用截图求证）",
+          "当前时间" in body and "不要截图或读屏去求证" in body, "")
 
     # Kotlin raw string 里 $ 会变成模板插值，编译期就报错；""" 会直接截断字符串。
     check("提示词里没有 $（raw string 模板风险）", "$" not in body,
@@ -457,16 +656,258 @@ def static_checks():
           "completed = true" in client and client.count("conn.disconnect()") == 1
           and "conn.inputStream?.close()" in client,
           "disconnect 出现 %d 次" % client.count("conn.disconnect()"))
+    # 光不 disconnect 还不够：读到 [DONE] 就 break，剩余字节没读完，JDK 一样会关 socket。
+    # 实测这行缺失时每轮「连接」恒定 1.6~1.8 秒，补上后掉到 0.0 秒。
+    check("读到 [DONE] 后把剩余字节读到 EOF（否则连接无法归还池子）",
+          "尾帧丢弃" in client and "reader.readLine() != null" in client)
+    # 思考流：上游把「想」的过程单独发在 reasoning_content，正文要等思考结束。
+    # 不接这一段，用户看到的就是几秒空白——「最开始太慢」的根源。
+    check("接住 reasoning_content 并向上转发",
+          'optString("reasoning_content")' in client and "onReasoning?.invoke" in client
+          and "onThinking" in src("AgentLoop.kt"))
+    check("界面有思考块的显示与收尾", "appendThinking" in src("ChatUi.kt")
+          and "endThinking" in src("ChatUi.kt"))
+
+    # 缓存命中率：决定「砍提示词」到底是必要还是纯损失。
+    # 三个环节缺一不可——解析、落盘、日志，断在前两环等于白装一次包。
+    check("能从 usage 里读出缓存命中（兼容 DeepSeek / OpenAI / 网关三种字段名）",
+          "private fun parseCache" in client
+          and '"prompt_cache_hit_tokens"' in client
+          and '"prompt_tokens_details"' in client
+          and '"cache_read_input_tokens"' in client,
+          "parseCache 未覆盖主流字段名")
+    check("缓存字段进流水账且区分「没报」和「没命中」",
+          '"cacheHit"' in src("TranscriptText.kt") and '"cacheMiss"' in src("TranscriptText.kt")
+          and "cacheHit = turn.cacheHitTokens" in src("AgentHost.kt")
+          and "cacheMiss = turn.cacheMissTokens" in src("AgentHost.kt"),
+          "cacheHit/cacheMiss 未落盘")
+    check("未知缓存不写成 0%，避免把「上游没说」误读成「一点没命中」",
+          "缓存未知" in src("AgentHost.kt"))
+
+    # 网络自愈。手机网络本来就烂，这几条不是「优化」，是「不做就天天白跑」。
+    al = src("AgentLoop.kt")
+    check("读 finish_reason（length 是唯一「模型没说完但没报错」的信号）",
+          'optString("finish_reason")' in client and "val finishReason" in client,
+          "finish_reason 没读")
+    check("读到一半断线要能认出来（IOException → cut），而不是当成正常结束",
+          "var cut = false" in client and "e is java.io.IOException" in client,
+          "断流没有识别")
+    check("限流/5xx 自动退避重发，并遵守 Retry-After",
+          "code == 429" in client and "Retry-After" in client
+          and "private fun waitBefore" in client and "BACKOFF_MS" in client,
+          "缺退避重试")
+    check("重发前先撤掉已吐出的半截（onRestart 一路传到界面）",
+          "onRestart" in client and "onRestart" in al and "fun restartTurn" in src("ChatUi.kt")
+          and "uiOnRestart" in src("MainActivity.kt") and "streamMark" in src("MainActivity.kt"),
+          "作废重来没有打通")
+    check("撞输出上限自动续写（finish_reason=length → 替用户说「接着写」）",
+          'turn.finishReason == "length"' in al and "LENGTH_NUDGE" in al,
+          "length 没有续写")
+    check("失败后撤掉没人回答的 user 消息（否则重发一次等于同一句话问两遍）",
+          "private fun dropDanglingUser" in al and "dropDanglingUser()" in al,
+          "孤儿 user 消息没清理")
+
+    # 思考深度：回答慢的真凶是「模型在想」（每 100 思考字≈1.9 秒），这是唯一有效旋钮。
+    # 四个环节缺一不可：档位映射、请求体、被拒回落、拒绝过就别再发。
+    cfg_src = src("Config.kt")
+    check("思考深度三档映射到 reasoning_effort",
+          '"low"' in cfg_src and '"high"' in cfg_src and "object Think" in cfg_src,
+          "Think.effort 映射缺失")
+    check("请求体按档位带 reasoning_effort（标准档不带）",
+          'put("reasoning_effort", effort)' in client and "if (effort != null)" in client,
+          "请求体未接思考深度")
+    check("思考深度被拒只摘它一个，采样参数不受牵连",
+          "isEffortRejected" in client and "effortValue = null" in client
+          and "sampling = false" in client,
+          "回落逻辑没有独立开关")
+    check("拒绝记录按模型分开存，避免每轮白打一次失败请求",
+          "effortRejectedFor" in src("AgentSettings.kt") and "effortRejectedFor" in src("AgentHost.kt")
+          and "effortUnsupported" in src("AgentHost.kt"),
+          "拒绝记录未落地，会每轮重试")
+    check("设置页能选思考深度并说明代价", "showThinkPicker" in src("MainActivity.kt")
+          and "思考深度" in src("MainActivity.kt"))
+    check("档位进流水账（才能算出低档省了多少秒）",
+          '"effort"' in src("TranscriptText.kt") and "turn.reasoningEffort" in src("AgentHost.kt"))
+    # 参数被拒这件事必须留痕：它解释「选了低反而更慢」——那一轮其实是标准档 + 一次白跑。
+    check("「参数被拒」单独记一条流水账",
+          "effortReject" in src("TranscriptText.kt") and "TranscriptText.effortReject" in src("AgentHost.kt"))
+    # 文案跟着实测走：低档真能省（约 1/4 思考量），高档没测出增益，就别再暗示「认不认看上游」
+    check("设置页给出实测数字，而不是「认不认看上游」的空话",
+          "1,221" in src("MainActivity.kt") and "4,592" in src("MainActivity.kt"))
+    # AgentHost.inner 是必经的包装层：它逐个转发回调。思考这件事曾经在这里被吞掉——
+    # 接口默认空实现，漏转发不报错，只表现为「界面上永远看不到思考」。
+    host = src("AgentHost.kt")
+    check("包装层转发了思考增量（漏了就会静默吞掉）",
+          "override fun onThinking" in host and "t.onThinking(delta)" in host)
+
+    # 手机独占租约：行为在 JVM 侧测，这里钉住「收尾必须交还」这条——
+    # 漏掉的话一次异常就让手机被永久占住，别的会话只会一直看到「另一个会话在操作手机」。
+    pl = src("PhoneLease.kt")
+    pt = src("PhoneTools.kt")
+    al_src = src("AgentLoop.kt")
+    check("手机独占：租约只认持有者交还（否则别人能撬掉正在跑的会话）",
+          "if (owner == id) owner = null" in pl and "if (owner == null || owner == id)" in pl,
+          "lease invariant missing")
+    check("手机独占：任务收尾一定交还（跑完/出错/被停都要放）",
+          "PhoneLease.release(rt.id)" in host,
+          "lease release missing in AgentHost")
+    check("手机独占：碰屏幕的工具统一先拿租约",
+          "if (!ensureLease(owner))" in pt and "PHONE_BUSY" in pt,
+          "toolbox doesn't take lease")
+    check("手机独占：会话把身份传给循环，撞上别人就收手",
+          "toolbox.execute(call.name, args, owner" in al_src and "if (phoneBusy)" in al_src,
+          "loop doesn't pass owner or doesn't stop")
+
+    # 子代理：隔离是运行时行为（JVM 侧真跑一遍），这里钉住几条静态契约——
+    # 少一条，功能就会以「看起来有、其实没接上」的方式坏掉。
+    sa = src("SubAgent.kt")
+    check("子代理：只读白名单里没有写操作、没有手机工具",
+          'val ALLOWED = setOf("fs_read", "fs_list", "fs_search", "web_fetch", "web_search")' in sa
+          and "SUB_READONLY" in sa,
+          "subagent whitelist wrong")
+    check("子代理：不注入记忆与技能（它只该看得到自己的任务）",
+          'memory = { "" }' in sa and 'skills = { "" }' in sa,
+          "subagent injects memory")
+    check("子代理：目标要能独立看懂，且一个任务最多派 3 次",
+          "goal.length < 4" in pt and "MAX_SUB_TASKS = 3" in pt and "SUB_BUDGET" in pt,
+          "subagent budget missing")
+    check("子代理：用户点停止时子代理跟着停（不然屏幕停了钱还在花）",
+          "externalCancel" in al_src and "parentCancelled = isCancelled" in host,
+          "subagent not cancellable")
+    check("子代理：进度会报给界面，不会一直停在「派子代理…」",
+          "onSubProgress" in al_src and "override fun onSubProgress" in src("MainActivity.kt"),
+          "subagent progress not forwarded")
+    check("子代理：工具只在宿主真接了才出现在工具列表里",
+          "if (delegate != null) base.put(TASK_SCHEMA)" in pt,
+          "task schema always exposed")
+
+    # 流水账曾经是「只写不读」：数据一直在攒，入口一个都没有，注释里说的
+    # 「工作台能拿来看」其实是拿不到（它在 App 私有目录）。这几条钉住入口。
+    check("流水账看得见也带得走（只写不读等于没做）",
+          "fun showTranscript" in src("MainActivity.kt")
+          and "AgentHost.transcriptText" in src("MainActivity.kt")
+          and "AgentHost.exportTranscript" in src("MainActivity.kt")
+          and "看流水账" in src("MainActivity.kt"),
+          "transcript has no entry point")
+    check("流水账渲染不依赖 Android（纯 JVM，可跑断言）",
+          "import android" not in src("TranscriptText.kt")
+          and "fun render(" in src("TranscriptText.kt"),
+          "renderer drags in android")
+
+    # 崩溃最需要日志，而崩溃正好把内存里那几百行一起带走——所以必须落盘。
+    check("日志落盘：崩了/重开也能看到上一次的最后几步",
+          "appendLogFile" in host and "restoreLog()" in host and "MAX_LOG_BYTES" in host,
+          "log not persisted")
+    check("日志能复制（反馈问题不用一屏一屏截图）",
+          "复制全文" in src("MainActivity.kt")
+          and 'ClipData.newPlainText("运行日志"' in src("MainActivity.kt"),
+          "log copy missing")
+    check("单条工具结果进上下文有上限（否则每轮重付一次）",
+          "MAX_TOOL_CHARS = 32_000" in al_src and "clipToolResult(result.text)" in al_src,
+          "tool result not clipped")
+    check("异常翻成人话：该等 / 该换网 / 该重登分开说",
+          "fun humanize" in src("Errors.kt") and "Errors.humanize" in al_src,
+          "errors not humanized")
+
+    # 提示词带偏模型的两种典型方式：把问答当操作任务、凭空编编号。
+    check("提示词开头有「先分诊」：不是每条消息都要动手机",
+          "先分诊" in body and "不是每条消息都是操作任务" in body, "缺分诊段")
+    check("提示词把「用户本轮点名的对象」摆在记忆之上",
+          "用户本轮点名的对象" in body and "不要默默换成记忆里那个" in body)
+    check("提示词要求具体事实先搜再答、查不到别编",
+          "web_search" in body and "不要用一个听起来合理的编号顶上" in body)
+    check("提示词禁止偷换角色（企业问成银行的教训）",
+          "角色同理，不许偷换" in body and "拿另一个角色" in body)
+    check("搜索有预算：换关键词最多三次就收手",
+          "换关键词最多三次" in body and "空转" in body)
+
+    # 实测结论要落在界面上，别让用户按想象的档位效果去调
+    cfg = src("Config.kt")
+    check("低档文案写明实测收益（约 1/4 思考量）", "1/4" in cfg and "快一半" in cfg, "文案没更新")
+    check("高档文案不吹「想得更细」", "想得更细" not in cfg and "几乎没差别" in cfg)
+    gw = src("GatewayPlan.kt")
+    check("本地网关不再吞掉 reasoning_effort",
+          '"reasoning_effort"' in gw, "白名单漏了它，外部客户端设了也没用")
+
+    wb = src("Workbench.kt")
+    check("有联网搜索工具，不只是 web_fetch",
+          '"web_search"' in wb and "SEARCH_FAILED" in wb and "fun parseHits" in wb,
+          "缺少 web_search 实现")
+    check("web_search 声明了 schema（否则模型看不见）", '"name": "web_search"' in wb)
+    check("html_preview 全链路接线（schema + 分发 + 渲染回调 + 浏览器打开）",
+          '"name": "html_preview"' in wb and '"html_preview" -> htmlPreview' in wb
+          and "fun onOpenHtml" in src("AgentLoop.kt")
+          and "override fun onOpenHtml" in src("MainActivity.kt")
+          and "HtmlPreview.build" in src("MainActivity.kt")
+          and "ArtifactServer.start" in src("MainActivity.kt"),
+          "渲染链路有断点：写完网页用户看不到")
+    check("搜索页用桌面 UA（移动版 HTML 解析不稳）",
+          "UA_DESKTOP" in wb and "searchFetcher" in wb)
+    check("百度排第一（必应对国内长尾内容基本给噪声，实测）",
+          "BAIDU" in wb and wb.index("BAIDU(") < wb.index("BING_CN("))
+    check("搜索页按大页额度读（百度结果在 687KB 处，512KB 会全截掉）",
+          "MAX_SEARCH_BYTES" in wb and "MAX_SEARCH_BYTES = 3 * 1024 * 1024" in wb
+          and "searchFetcher(engine.url(q), MAX_SEARCH_BYTES)" in wb,
+          "搜索又退回 MAX_FETCH_BYTES 了")
+    check("httpGet 自己跟重定向（含跨协议）",
+          "instanceFollowRedirects = false" in wb and "getHeaderField(\"Location\")" in wb
+          and "MAX_REDIRECTS" in wb)
+    check("引擎退让原因要带出来（否则只看到噪声不知道谁失败了）",
+          '"fallbacks"' in wb)
+    check("百度注释写明跳转链接交给 web_fetch 跟 302", "/link?url=" in wb)
+    check("搜索全失败时明确叫模型别猜", "不要凭记忆猜答案" in wb)
 
     loop = src("AgentLoop.kt")
+    check("背景资料注入头写明「与本轮冲突以本轮为准」", "一律以本轮消息为准" in loop)
+    check("注入的背景资料会报到宿主并进流水账",
+          "onExtras" in loop and "override fun onExtras" in src("AgentHost.kt")
+          and "TranscriptText.extras" in src("AgentHost.kt"))
     check("AgentLoop 挂了动作核对提示", "withVerifyHint(call.name" in loop)
     check("核对提示只挂给会改界面的动作",
           'val MUTATING = setOf(' in loop and '"phone_screenshot"' not in loop.split("val MUTATING")[1][:400])
     check("核对提示确实进了历史（不是只给界面看）",
-          'put("content", if (ok) withVerifyHint' in loop)
+          "withVerifyHint(call.name, clipToolResult(result.text))" in loop)
 
     tools_src = src("PhoneTools.kt")
     check("PhoneTools 里已无重复的提示词定义", "object PhonePrompt" not in tools_src)
+
+
+def check_speed_analyzer():
+    """耗时分析脚本自测。
+
+    这个脚本是用来判断「低档到底有没有用」的裁判。裁判自己算错，比没有裁判更糟：
+    它会让人凭一组错数字删掉一个本来有效的功能。所以这里喂一份人造流水账，
+    把「分组、配对、判词」三段都压一遍。
+    """
+    work = tempfile.mkdtemp(prefix="wb-speed-")
+    try:
+        rows = []
+        for i in range(9):
+            rows.append({"type": "turn", "first": 1300, "total": 5200, "reasoning": 900,
+                         "out": 220, "in": 9000, "model": "hy3", "cacheHit": 8000,
+                         "cacheMiss": 1000, "effort": ""})
+            rows.append({"type": "turn", "first": 1310, "total": 5400, "reasoning": 880,
+                         "out": 230, "in": 9000, "model": "hy3", "cacheHit": 7900,
+                         "cacheMiss": 1100, "effort": "low"})
+        rows.append({"type": "effort_reject", "body": "unsupported parameter: reasoning_effort"})
+        with open(os.path.join(work, "s1.jsonl"), "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        proc = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "analyze_speed.py"), "--dir", work],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        out = proc.stdout or ""
+        check("耗时分析脚本能跑通", proc.returncode == 0, (proc.stderr or "")[-200:])
+        check("分析脚本按档位分组并能配对比较",
+              "低档 vs 标准" in out and "首字：标准" in out, out[-300:])
+        check("分析脚本会指出「参数没被认」这种情况",
+              "没认这个参数" in out, out[-300:])
+        check("分析脚本会翻译「参数被拒」这条流水账",
+              "拒绝过这个参数" in out, out[-300:])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
@@ -477,6 +918,7 @@ def main():
     work = tempfile.mkdtemp(prefix="wbagent-")
     print("== 静态检查 ==")
     static_checks()
+    check_speed_analyzer()
     print("工作目录：%s" % work)
     cp = build(work)
     print("JVM 编译完成")
@@ -550,6 +992,16 @@ def main():
           "if (blockish && buf.isNotEmpty()) break" in ar, "missing progress guard")
     check("代码/数据扩展名直接进代码井（.py/.json/.log 不猜 Markdown）",
           "isCodeFile" in ar and "CODE_EXT" in ar, "missing code ext")
+    # 表格列宽：长内容列按权重瓜分屏宽时，短内容列会被压成一条竖缝（github-trending 翻过车）
+    check("表格列宽有下限（窄列不再被压成竖缝，差价从宽列按比例扣）",
+          "MIN_COL_DP = 72f" in ar and "deficit" in ar and "capacity" in ar,
+          "missing column min-width floor")
+    check("表格放不下时整卡进横向滚动（不压扁列，左右滑着看）",
+          "HorizontalScrollView" in ar and "widthsDp.sum()" in ar,
+          "missing horizontal fallback")
+    check("表格列宽用定值像素（不再用 weight 按比例瓜分屏宽）",
+          "px(widthsDp[c])" in ar and "WRAP_CONTENT, weights" not in ar,
+          "still using weight-based column widths")
     check("阅读页整页盖在对话上，返回键先收",
           "artifactShowing" in ma and "closeArtifact" in ma
           and "if (artifactShowing) closeArtifact()" in ma, "missing page wiring")
@@ -608,7 +1060,7 @@ def main():
           and "docx_write" in src("AgentLoop.kt") and "docx_write" in src("FloatStatus.kt")
           and "生成 Word" in ma, "docx_write not wired")
     check("Word 生成：提示词让模型知道「要给人改的文档用 docx_write」",
-          "docx_write" in src("PhonePrompt.kt") and "可编辑的 .docx" in src("PhonePrompt.kt"),
+          "docx_write" in src("PhonePrompt.kt") and "可编辑 .docx" in src("PhonePrompt.kt"),
           "prompt missing docx_write")
 
     # ---- 附件：＋ 展开拍照/相册，选图后压成 data URL 发给模型 ----
@@ -725,12 +1177,28 @@ def main():
     check("整轮工具收成一行（过程折叠）",
           "fun finishProcess" in cu and "正在干活" in cu and "ProcessGroup" in cu,
           "missing fold")
+    check("整轮收工把工具行和中途说明收进一个折叠行（collapseTurn）",
+          "fun collapseTurn" in cu and "turnPieces" in cu
+          and "chat?.collapseTurn()" in ma
+          and ma.count("view.collapseTurn()") >= 3,
+          "过程行没收拢：用户要在一堆「已完成」里找答案")
     check("完成态照 dsh-Go 写成「✓ 已完成 · N 次工具调用」",
           "✓ 已完成" in cu and "次工具调用" in cu,
           "missing done wording")
+    check("思考小结行也折进折叠行（· K 次思考）",
+          "次思考" in cu and "p.tag !is ThinkRef" in cu
+          and cu.count("turnPieces.add(v)") >= 2,
+          "thinking not folded")
     check("折叠只在跑的时候展开、结束收起",
           "expanded = false" in cu and "body.visibility = View.GONE" in cu,
           "missing collapse")
+    # 真机闪退过一次：过程组的 chip 还挂在旧父容器上就 addView，ViewGroup 直接抛
+    # IllegalStateException("The specified child already has a parent")。
+    check("收拢时先把 chip 从旧过程组摘下来再挂新组（否则闪退）",
+          "(e.parent as? ViewGroup)?.removeView(e)" in cu
+          and "g.body.addView(e)" in cu
+          and cu.index("(e.parent as? ViewGroup)?.removeView(e)") < cu.index("g.body.addView(e)"),
+          "missing detach before reparent")
     check("空状态给出四条起点建议（点一下填进输入框）",
           "buildEmpty" in cu and "今天想让手机替你做什么" in cu and "fun fill(" in cu,
           "missing empty state")
@@ -847,6 +1315,13 @@ def main():
           "setTextIsSelectable" in cu and "renderMarked(body, raw)" in cu
           and "长按文字拖出选区" in cu,
           "missing selectable text sheet")
+    # 自己的提问之前一行字都碰不得：想复用那句提示词只能手打第二遍
+    bubble = cu.split("fun addUser", 1)[-1].split("\n    }", 1)[0]
+    check("我的消息：长按用户气泡也能复制/拖选/引用（和回答同一套面板）",
+          "fun showUserMenu" in cu and "fun showActionSheet" in cu
+          and "showUserMenu(text)" in bubble and "setOnLongClickListener" in bubble
+          and "我的消息" in cu and "填回输入框" in cu,
+          "user bubble has no long-press actions")
     check("引用：原文压成 > 引用块填进输入框，超长截断不撑爆输入框",
           '"> $it"' in cu and "take(1200)" in cu and 'fill("$quoted' in cu,
           "missing quote into input")
@@ -870,14 +1345,20 @@ def main():
     st_mem = src("AgentSettings.kt")
     ph_mem = src("PhonePrompt.kt")
     check("长期记忆：附在最后一条 user 消息上（不进 system，保前缀稳定）",
-          "private val memory: () -> String" in al_mem
+          "private val memory: (String) -> String" in al_mem
           and "extras.joinToString(\"\\n\\n\")" in al_mem
           and "private fun injectExtras" in al_mem
           and "EXTRAS_HEADER" in al_mem,
           "missing memory injection")
     check("长期记忆：每次请求现取（这一轮记下的下一轮就生效）+ 开关可关",
-          "Memory.digest(workDir())" in ah_mem and "settings?.memoryOn == true" in ah_mem,
+          "Memory.digest(workDir(), topic)" in ah_mem and "settings?.memoryOn == true" in ah_mem,
           "memory not refreshed per request")
+    check("长期记忆：按本轮话题检索（不是无脑取最近 20 条）",
+          "fun digest(dir: File, query: String = \"\"" in src("Memory.kt")
+          and "private fun pick(all: List<String>, query: String, limit: Int)" in src("Memory.kt")
+          and "fun relevance(entry: String, query: String)" in src("Memory.kt")
+          and "memQuery = topicQuery()" in al_mem,
+          "memory retrieval still recency-only")
     check("长期记忆：memory_save 工具走工作台，重复/空白拒绝",
           "memory_save" in wb_mem and "Memory.append(root" in wb_mem and "NOT_SAVED" in wb_mem
           and 'name == "memory_save"' in src("PhoneTools.kt"),
@@ -891,6 +1372,17 @@ def main():
           and "不要记：一次性的任务细节" in ph_mem
           and "以这一轮为准" in ph_mem,
           "missing memory rules")
+    check("长期记忆：管理页能看清单、单条删、手动记、清空",
+          "private fun showMemory()" in ma and "AgentHost.memoryEntries()" in ma
+          and "AgentHost.forgetMemory(line)" in ma and "private fun askMemory()" in ma
+          and "AgentHost.clearMemory()" in ma,
+          "missing memory management page")
+    check("长期记忆：单条删除只认整行（不做子串误伤）",
+          "fun remove(dir: File, entry: String)" in src("Memory.kt")
+          and "filterNot { it == entry }" in src("Memory.kt"),
+          "remove must match whole line")
+    check("设置页「长期记忆」点进去是管理页，不是直接翻转开关",
+          "}) { showMemory() }" in ma, "memory row still a bare toggle")
 
     # ---- 技能包（工作台 skills/*.md 按需加载）----
     sk = src("Skill.kt")
@@ -903,10 +1395,23 @@ def main():
           "fun index(" in sk and "skill_load(name)" in sk and "MAX_INDEX_DESC" in sk
           and "没命中就别加载" in sk,
           "missing progressive disclosure")
-    check("技能包：5 个内置技能，首次种下、只种一次（删了不长回来）",
-          "BUILTIN_COUNT = 5" in sk and '".seeded"' in sk
-          and "if (marker.isFile) return 0" in sk and "fun install(" in sk,
-          "missing seeder")
+    check("技能包：9 个内置技能，首次全种、升级只补新增（删了不长回来）",
+          "BUILTIN_COUNT = 9" in sk and '".seeded"' in sk and "SEED_VERSION" in sk
+          and "NEW_SEEDS" in sk and "fun install(" in sk,
+          "missing seeder / seed version")
+    check("技能包：版本化播种（老用户升级也能拿到新技能，但删掉的不复活）",
+          "seeded >= SEED_VERSION" in sk and "name !in NEW_SEEDS" in sk,
+          "seeding is not versioned")
+    # 搬来的 4 个技能：内容 adequacy 靠人读，格式与长度靠断言兜住
+    for sname in ["doc-format", "slides", "doc-coauthor", "skill-craft"]:
+        check("内置技能 %s 存在且带触发条件" % sname,
+              ('"%s" to """' % sname) in sk and "when:" in sk,
+              "missing builtin %s" % sname)
+    check("搬来的技能都写了 desc（索引里只有这一句）",
+          sk.count("desc:") >= 9, "desc count %d" % sk.count("desc:"))
+    check("技能正文里没有 $（Kotlin raw string 模板风险）",
+          "$" not in sk.split('val BUILTIN: List<Pair')[1] if 'val BUILTIN: List<Pair' in sk else False,
+          "")
     check("技能包：正文有长度上限并明说已截断",
           "MAX_BODY_CHARS" in sk and "已截断到" in sk,
           "missing body cap")
@@ -914,6 +1419,10 @@ def main():
           'name == "skill_load"' in src("PhoneTools.kt")
           and '"skill_load" -> skillLoad' in wb_mem,
           "missing skill routing")
+    check("技能包：点一行看正文，「已启用」才是开关（两个动作别挤在一起）",
+          "private fun showSkillText(" in ma and "row.setOnClickListener { showSkillText(item) }" in ma
+          and "AgentHost.toggleSkill(item.name)" in ma and "Skill.body(item)" in ma,
+          "skill row still toggles on tap, no body viewer")
 
     # ---- 审批悬浮卡：Agent 在别的应用里干活时，确认框浮在那个应用上 ----
     ao = src("ApprovalOverlay.kt")
@@ -978,6 +1487,23 @@ def main():
           and "用户优先" in ph_mem,
           "missing skill prompt rules")
 
+    # ---- 人情味开关（语气段走 extras 通道，不进 system）----
+    check("人情味：语气段常量独立于 system 正文（开关切换不动前缀缓存）",
+          "const val WARM_TONE" in ph_mem and "先接住情绪" in ph_mem
+          and "共情不表演" in ph_mem,
+          "missing warm tone text")
+    check("人情味：loop 有 tone 注入源、有专属分隔头（行为指令≠背景资料）",
+          "private val tone: () -> String" in al_mem and "TONE_HEADER" in al_mem
+          and "toneText.isNotBlank()" in al_mem,
+          "missing tone channel")
+    check("人情味：宿主按开关注入，关掉整段不出现",
+          "settings?.emotionOn == true" in ah_sk and "PhonePrompt.WARM_TONE" in ah_sk,
+          "missing host gating")
+    check("人情味：设置项默认关、设置页有开关行",
+          "var emotionOn" in st_mem and "KEY_EMOTION_ON = \"emotion_on\"" in st_mem
+          and '"人情味"' in ma and "settings.emotionOn = !settings.emotionOn" in ma,
+          "missing emotion settings")
+
     # ---- 聊天气泡 Markdown 渲染 ----
     cu = src("ChatUi.kt")
     check("气泡渲染：流式期间整段重渲染，星号一对上就变粗体",
@@ -1000,6 +1526,23 @@ def main():
           "package cn.wbphone.agent" in src("Marked.kt")
           and "import android" not in src("Marked.kt"),
           "Marked must stay android-free")
+    # 思考块展开：收起只是折叠不是销毁，用户要能回看「它当时在想什么」
+    check("思考块：收起时全文留在 ThinkRef 里（点击可展开回看）",
+          "class ThinkRef" in cu and "toggleThinking" in cu
+          and "expandThinking" in cu and "collapseThinking" in cu,
+          "missing thinking expand/collapse")
+    check("思考块：收起行带展开提示箭头，展开后左对齐铺全文",
+          "▸ " in cu and "▾ " in cu and "Gravity.START" in cu,
+          "missing expand affordance")
+    # 展开一次就是几十行。如果顺手 scrollDown()，用户会被从自己点的那一行甩到页面末尾
+    toggler = cu.split("private fun toggleThinking", 1)[-1].split("\n    }", 1)[0]
+    check("思考块：展开/收起锚定原位置，不跳到页面最底",
+          "addOnLayoutChangeListener" in toggler and "scrollDown()" not in toggler
+          and "v.top - scroll.scrollY" in toggler,
+          "toggle must keep scroll anchor")
+    check("思考块：clear() 重置思考块引用（切会话后不往脱离的 view 里写字）",
+          cu.count("thinkView = null") >= 2,
+          "thinkView reset count %d" % cu.count("thinkView = null"))
 
     # ---- 语音（输入走讯飞听写 API、朗读走系统 TTS，都不经过 chat 网关）----
     vi = src("VoiceIn.kt")
@@ -1208,6 +1751,26 @@ def main():
               all(key not in k_reqs[1] for key in ("temperature", "top_p", "max_tokens")),
               sorted(k_reqs[1].keys()))
 
+    # 思考深度：请求体带 reasoning_effort，被拒只摘它一个，采样参数要留着
+    q_reqs = requests_by_scenario.get("Q", [])
+    check("思考深度被拒后自动回落重试（共 2 次请求）", len(q_reqs) == 2, len(q_reqs))
+    if len(q_reqs) == 2:
+        check("首次请求确实带了 reasoning_effort=low",
+              q_reqs[0].get("reasoning_effort") == "low", q_reqs[0].get("reasoning_effort"))
+        check("回落请求不再带 reasoning_effort",
+              "reasoning_effort" not in q_reqs[1], sorted(q_reqs[1].keys()))
+        check("回落时采样参数仍在（两个开关互不牵连）",
+              q_reqs[1].get("temperature") == 0.2, q_reqs[1].get("temperature"))
+    r_reqs = requests_by_scenario.get("R", [])
+    check("高档位发出 reasoning_effort=high",
+          bool(r_reqs) and r_reqs[0].get("reasoning_effort") == "high",
+          r_reqs[0].get("reasoning_effort") if r_reqs else "没有请求")
+    # 标准档必须和旧版逐字节一致：多一个字段就等于把老用户的缓存前缀作废。
+    if a_reqs:
+        check("标准档请求体里没有 reasoning_effort（与旧版一致）",
+              all("reasoning_effort" not in r for r in a_reqs),
+              [sorted(r.keys()) for r in a_reqs[:1]])
+
     # 模型切换：两轮请求的 model 字段必须不同，且第二轮仍带着同一段历史
     i_reqs = requests_by_scenario.get("I", [])
     check("I 场景共 2 次请求", len(i_reqs) == 2, len(i_reqs))
@@ -1268,8 +1831,31 @@ def main():
         # 每轮现取：源清空后，整个请求里（不只 system）都不该再有它
         check("索引每轮现取：源清空后第二次请求里不再有它",
               "weekly-report" not in json.dumps(n1, ensure_ascii=False), s1[-150:])
+        # 时间注入：模型没有时钟，不喂就只会截图翻状态栏
+        m_time = re.search(r"【当前时间（取自手机系统时钟）】(\d{4}-\d{2}-\d{2} 周. \d{2}:\d{2})", tail0)
+        check("N 请求尾部附带当前时间（模型没有时钟，必须喂）",
+              bool(m_time), tail0[-140:])
+        if m_time:
+            check("附带的时间取自真实系统时钟（日期与测试机当天一致）",
+                  m_time.group(1).startswith(time.strftime("%Y-%m-%d")), m_time.group(1))
+        check("时间不进 system（前缀缓存不受影响）",
+              "手机系统时钟）】" not in s0, "")
         # 前缀稳定的核心证据：两轮请求的 system 逐字节相同
         check("两轮请求的 system 逐字节一致（上下文缓存可命中）", s0 == s1, "")
+
+    # TN：人情味开关。语气段走 extras 通道，关掉整段消失。
+    if requests_by_scenario.get("TN"):
+        tn0, tn1 = requests_by_scenario["TN"][0], requests_by_scenario["TN"][1]
+        s_tn0 = sys_text(tn0)
+        tail_tn0 = last_user_text(tn0)
+        check("语气段附在末条 user 消息上（不进 system 正文）",
+              "先接住情绪" in tail_tn0 and "先接住情绪" not in s_tn0, tail_tn0[-160:])
+        check("语气段有明确分隔头（行为指令，不是可参考可不参考的资料）",
+              "语气指令" in tail_tn0 and "不是背景资料" in tail_tn0, tail_tn0[-140:])
+        check("语气段排在背景资料之后（离回答最近，注意力最足）",
+              tail_tn0.find("语气指令") > tail_tn0.find("当前时间"), "")
+        check("开关关掉后语气段整段消失（不是留占位）",
+              "先接住情绪" not in json.dumps(tn1.get("messages", []), ensure_ascii=False), "")
 
     # A：无记忆无技能的普通任务——除历史追加外前缀必须纹丝不动
     if a_reqs:
@@ -1278,6 +1864,28 @@ def main():
         check("A 场景所有轮次的 system 逐字节一致", len(sys_set) == 1, len(sys_set))
         check("A 场景没有任何背景资料注入（extras 为空就什么都不附）",
               all("不是本轮指令" not in json.dumps(r.get("messages", []), ensure_ascii=False) for r in a_reqs), "")
+        check("A 场景（无记忆无技能）也附带当前时间",
+              all("当前时间" in json.dumps(r.get("messages", []), ensure_ascii=False) for r in a_reqs), "")
+
+    # X：思考落盘的边界——留在历史里给用户看，但绝不发给上游
+    x_reqs = requests_by_scenario.get("X", [])
+    if x_reqs:
+        all_msgs = [m for r in x_reqs for m in (r.get("messages") or [])]
+        check("思考全文只留给用户：任何一次请求的 messages 里都没有 _think",
+              all("_think" not in m for m in all_msgs),
+              [sorted(m.keys()) for m in all_msgs][:3])
+        # 剥字段不能顺手把工具调用/结果弄丢：第二轮还带着那条 assistant+tool 配对
+        second = x_reqs[1].get("messages") or [] if len(x_reqs) > 1 else []
+        check("剥掉 _think 后工具调用与结果仍然配对完整",
+              any(m.get("role") == "assistant" and m.get("tool_calls") for m in second)
+              and any(m.get("role") == "tool" for m in second),
+              [m.get("role") for m in second])
+        # 重启后那轮请求：历史整段还带着（说明 _think 不影响落盘/恢复）
+        check("恢复历史后的请求里历史仍然完整（还带着之前的对话）",
+              len(x_reqs) >= 3 and any(
+                  m.get("role") == "assistant" and (m.get("content") or "") == "屏幕上是一个设置页。"
+                  for m in (x_reqs[2].get("messages") or [])),
+              "%d 次请求" % len(x_reqs))
 
     expected = [
         "loop_no_error", "loop_tool_sequence", "loop_tap_center_1", "loop_tap_center_2",
@@ -1325,9 +1933,74 @@ def main():
         "reconnect_grace_quiet", "reconnect_nag_after_grace", "reconnect_throttled",
         "reconnect_after_interval", "reconnect_nag_again_after_recover",
         # 模型
-        "model_default_free", "model_ids_unique", "model_labels_present",
-        "model_unknown_falls_back", "model_index_falls_back", "model_summary_free",
+        "model_default_ok", "model_ids_unique", "model_labels_present", "model_no_dead_ids",
+        "model_unknown_falls_back", "model_index_falls_back", "model_summary_default",
+        "model_credit_format", "model_summary_shape", "model_top4_generic",
         "model_turn1_reply", "model_turn2_reply",
+        # 思考深度
+        "think_map_low", "think_map_std", "think_map_high", "think_clamp_unknown",
+        "think_high_no_error", "think_high_text", "think_high_recorded",
+        "think_fallback_no_error", "think_fallback_text", "think_fallback_reported",
+        "think_fallback_cleared",
+        # 联网搜索
+        "search_parse_baidu_m_count", "search_parse_baidu_m_url", "search_parse_baidu_m_title",
+        "search_parse_baidu_m_snippet_json_dropped",
+        "search_parse_baidu_count", "search_parse_baidu_title", "search_parse_baidu_snippet",
+        "search_parse_baidu_noise_dropped", "search_parse_baidu_keeps_jump_link",
+        "search_parse_bing_count", "search_parse_bing_title", "search_parse_bing_snippet",
+        "search_unwrap_ddg", "search_fallback_ok", "search_fallback_engine",
+        "search_fallback_tried_all_engines", "search_query_encoded", "search_ddg_snippet",
+        "search_all_fail_code", "search_all_fail_tells_model_not_to_guess", "search_blank_query",
+        "search_reads_large_page", "search_byte_budget_ge_2mb", "search_parses_hits_after_700kb",
+        "search_fallback_reason", "html_escaped_tags_stripped", "html_truncated_tag_dropped", "align_tag_end", "align_tag_end_noop", "search_retry_after_verify", "search_verify_labeled",
+        # 跨协议重定向（http→https，JVM 不自动跟）
+        "redirect_cross_protocol", "redirect_relative_path", "redirect_relative_segment",
+        "redirect_other_host",
+        # 背景资料注入可观测
+        "extras_reported", "extras_reported_empty", "extras_no_repeat",
+        # 带图消息的压缩摘要不再漏 base64
+        "compact_image_no_error", "compact_image_happened", "compact_image_goal_text",
+        "compact_image_no_base64", "compact_image_placeholder",
+        "goal_image_junk_stripped", "goal_no_base64_leftover",
+        # 记忆管理页：单条删除只认整行
+        "mem_remove_ok", "mem_remove_exact_only", "mem_remove_keeps_header",
+        "mem_remove_missing", "mem_remove_gone_from_digest", "mem_remove_then_append",
+        # 思考落盘：跟着消息走、重启后还在、发请求前剥掉
+        "think_no_error", "think_streamed", "think_saved_per_turn", "think_text_complete",
+        "think_content_intact", "think_restore_runs", "think_restore_keeps_history",
+        "think_survives_disk",
+        # 手机独占：同一块屏幕同一时刻只能一个会话操作
+        "lease_idle", "lease_empty_owner_skips", "lease_first_wins", "lease_second_refused",
+        "lease_owner_reentry", "lease_foreign_release_ignored", "lease_released",
+        "lease_tool_a_ok", "lease_tool_b_busy", "lease_busy_says_no_retry",
+        "lease_begin_task_keeps_outline", "lease_handover",
+        # 撞上别人占着手机：立刻收手，不空转、不抢锁
+        "busy_stops_after_first_turn", "busy_explains_why", "busy_no_action_taken",
+        "busy_reason_kept_in_history", "busy_lease_not_stolen",
+        # 流水账渲染：人读得懂才能用来查「它当时做了什么」
+        "tr_empty_ok", "tr_keeps_user_words", "tr_turn_timing_split", "tr_turn_tokens",
+        "tr_tool_shows_args", "tr_tool_marks_failure", "tr_retry_and_compact",
+        "tr_no_raw_json", "tr_groups_by_day",
+        # 异常翻译：该等 / 该换网 / 该重登，别把人支到错路上
+        "err_429", "err_500", "err_401", "err_timeout", "err_dns",
+        "err_keeps_chinese", "err_empty", "err_unknown_en",
+        # docx 块级样式：真造文件、解包 XML 核对——论文格式逐段排版是硬需求
+        "dx_style_ok", "dx_title_no_rule", "dx_size_cn", "dx_size_pt", "dx_font",
+        "dx_align", "dx_center_no_indent", "dx_line", "dx_indent_kept", "dx_bad_style_safe",
+        # 压缩不许丢用户要求与成果：丢了模型就「忘了」要给下载地址，用户被迫一步步催
+        "ck_compacted", "ck_goal_kept", "ck_asks_kept", "ck_url_kept", "ck_path_kept",
+        # 系统意图：闹钟/计时器/拨号这些一步到位，不走 UI、不占屏幕租约
+        "int_alarm_ok", "int_alarm_args", "int_missing_arg", "int_action_whitelist",
+        "int_screen_after", "int_no_lease_needed", "int_lease_still_guards_screen",
+        # 子代理隔离：只读白名单、主线只看到结论、进度有报、账单算得清
+        "sub_schema_readonly", "sub_write_blocked", "sub_parent_only_task",
+        "sub_result_has_url", "sub_progress_reported", "sub_isolated",
+        "sub_tokens_counted", "sub_incomplete_reported",
+        # HTML 渲染：工具校验 + 本机回环服务真 GET + onOpenHtml 链路
+        "html_preview_ok", "html_preview_reject_type", "html_preview_missing",
+        "html_preview_in_schema", "srv_start", "srv_index_ok", "srv_html_mime",
+        "srv_css_mime", "srv_404", "srv_escape_blocked",
+        "html_open_fired", "html_card_fired", "html_final_text",
     ]
     for name in expected:
         ok, detail = results.get(name, (False, "断言没有执行"))

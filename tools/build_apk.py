@@ -235,6 +235,9 @@ def main():
         "--version-code", VERSION_CODE,
         "--version-name", VERSION_NAME,
         "--auto-add-overlay",
+        # debug 构建开 debuggable：adb 能 run-as 进私有目录（拉流水账、看日志），
+        # 这是诊断手段；release 构建绝不带这个标志。
+        *(["--debug-mode"] if not release else []),
         res_zip,
     ])
 

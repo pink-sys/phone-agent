@@ -34,8 +34,8 @@ import android.widget.TextView
  * 版式照 dsh-Go 真机截图逐处对的：
  *
  * ```
- *  新会话： (☰) (新对话 ·●本机)        (✦ hy3 · 免费 ⌄)
- *  会话中： (☰) (学习通 ·●本机)        (✦ hy3 · 免费 ⌄) (✎)
+ *  新会话： (☰) (新对话 ·●本机)        (✦ Hy4 flash · 免费 ⌄)
+ *  会话中： (☰) (学习通 ·●本机)        (✦ Hy4 flash · 免费 ⌄) (✎)
  *
  *   ✓ 已完成 · 6 次工具调用                 ›      ← 过程收成一行素排
  *   答案正文直接排在页面上，不套卡片
@@ -53,8 +53,11 @@ import android.widget.TextView
  *    底色透出来，整屏是一块玻璃而不是一堆贴片。实心白只留给弹层（会话面板）。
  * 2. **大弧度**。输入条是整根胶囊（28dp 半径），顶栏按钮是 14dp 圆角方块，
  *    没有直角矩形。
- * 3. **素排的过程行**。完成的轮次不装卡，一行灰字「✓ 已完成 · N 次工具调用」，
- *    点开才出现工具 chip——过程是附属信息，不配占视觉重量。
+ * 3. **素排的过程行，整轮只留一行**。跑的过程一切展开（工具 chip、旁白、思考都看得见），
+ *    整轮跑完 collapseTurn 把工具行、中途说明和思考小结收进**一个**折叠行——
+ *    「✓ 已完成 · N 次工具调用 · M 段说明 · K 次思考」，点开才出现。收完眼前只剩
+ *    用户的问题、这一行、最终回答和产物卡（2026-11-17 反馈：中途穿插
+ *    各种工具调用看着不舒服，照 dsh-Go / WorkBuddy 收起来）。
  */
 class ChatUi(
     private val act: Activity,
@@ -141,6 +144,16 @@ class ChatUi(
 
     /** 本轮的工具折叠组。跑的时候展开，结束时收起成一行素排。 */
     private var process: ProcessGroup? = null
+
+    /**
+     * 本轮出现在界面上的「过程件」：过程组（工具 chips 的容器）+ 回答气泡，按创建顺序。
+     *
+     * 整轮结束时 [collapseTurn] 按这份清单把除最终回答外的全部东西——工具 chips、
+     * 中途的说明段——收进一个折叠行。中途的说明文字也要收：它们是干活的旁白，
+     * 留在外面用户还是得在工具行和旁白之间来回扫（2026-11-17 反馈：「回答中间
+     * 穿插各种工具调用，看着不舒服」）。最终回答和产物卡永远留在折叠外面。
+     */
+    private val turnPieces = ArrayList<Any>()
 
     private val toolStack = ArrayList<ToolCard>()
 
@@ -643,8 +656,14 @@ class ChatUi(
         emptyView = null
         modelHint = null
         process = null
+        turnPieces.clear()
         toolStack.clear()
         artifactCards.clear()
+        // 思考块也要跟着断引用：残留的 thinkView 指向已脱离 feed 的 view，
+        // 下轮思考会往一个不在页面上的 view 里写字，看起来就是「思考不见了」。
+        thinkView = null
+        thinkText.setLength(0)
+        collapsedThink = null
     }
 
     fun isEmpty(): Boolean = emptyView != null || feed.childCount == 0
@@ -661,6 +680,8 @@ class ChatUi(
     fun addUser(text: String) {
         dropEmpty()
         finishProcess()
+        // 新的一轮：上一轮的过程件已经收过了（或轮到收），清掉再记本轮的
+        turnPieces.clear()
         openBubble = null
         // 进入会话态：顶栏右侧出现 ✎ 新会话（dsh-Go 的放法）
         newChatChip.visibility = View.VISIBLE
@@ -697,6 +718,9 @@ class ChatUi(
             // 右下角收一个角，指向「我」这一侧
             background = Ui.solidRadii(act, Ui.BUBBLE, intArrayOf(dp(18), dp(18), dp(5), dp(18)))
             maxWidth = (act.resources.displayMetrics.widthPixels * 0.78f).toInt()
+            // 自己发的话也能复制 / 拖选 / 引用回来改：之前只有回答能选，用户想复用自己的
+            // 那句提示词只能重新手打一遍。长按走和回答同一套弹层，手感一致。
+            setOnLongClickListener { showUserMenu(text); true }
         }
         wrap.addView(bubble, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -715,6 +739,7 @@ class ChatUi(
     fun addNote(text: String) {
         dropEmpty()
         finishProcess()
+        endThinking()
         openBubble = null
         val note = Ui.text(act, text, 12f, Ui.INK3).apply {
             gravity = Gravity.CENTER
@@ -737,6 +762,171 @@ class ChatUi(
      */
     private var openRaw: StringBuilder? = null
 
+    // ------------------------------------------------------------ 思考过程
+
+    /** 正在显示的思考块；正文一开始就收掉，避免和回答抢视线。 */
+    private var thinkView: android.widget.TextView? = null
+    private val thinkText = StringBuilder()
+    private var thinkStartAt = 0L
+
+    /**
+     * 收起后的思考行挂在 view 上的完整内容。收起不等于销毁——用户想回看
+     * 「它当时到底在想什么」时就靠这份底稿。
+     */
+    private class ThinkRef(val full: String, val summary: String) {
+        var expanded = false
+    }
+
+    /**
+     * 模型「想」的增量。
+     *
+     * 上游把思考单独发在 reasoning_content 里，正文要等思考结束才开始。之前这段完全被
+     * 丢掉，用户面对的是 2~5 秒的纯空白——「感觉最开始特别慢」就是这么来的，其实模型
+     * 一直在干活。压暗、缩小、只留最近一段：它是过程不是结论，不能抢正文的位置。
+     */
+    fun appendThinking(delta: String) {
+        val v = thinkView ?: run {
+            dropEmpty()
+            finishProcess()
+            openBubble = null
+            thinkText.setLength(0)
+            // 新一段思考开始 = 上一轮彻底翻篇，它的小结不再属于「当前这一轮」
+            collapsedThink = null
+            thinkStartAt = System.currentTimeMillis()
+            val t = Ui.text(act, "", 12.5f, Ui.INK3).apply {
+                setLineSpacing(dp(3).toFloat(), 1f)
+                setPadding(dp(2), dp(4), dp(2), dp(4))
+                maxWidth = (act.resources.displayMetrics.widthPixels * 0.84f).toInt()
+            }
+            feed.addView(t, Ui.margin(act, top = 6, bottom = 2))
+            thinkView = t
+            t
+        }
+        thinkText.append(delta)
+        val shown = thinkText.toString()
+        v.text = if (shown.length > 400) "…" + shown.takeLast(400) else shown
+        scrollDown()
+    }
+
+    /**
+     * 正文要开始了（或者这一轮结束了）：思考块收成一行「已思考」，点击可展开回看全文。
+     *
+     * 不直接删掉是有原因的：有的轮思考只有一两句话、一闪而过，用户根本注意不到，
+     * 然后「怎么没见思考流」。留一行灰色小结，既不占地方，又能确认它真的发生过。
+     * 全文留在 ThinkRef 里，默认收起——排查「它为什么答成这样」时展开看过程，
+     * 平时不动它，不抢正文的位置。没有思考增量的轮（模型这轮没发 reasoning）什么都不留。
+     */
+    fun endThinking() {
+        val v = thinkView ?: return
+        val n = thinkText.length
+        val ms = System.currentTimeMillis() - thinkStartAt
+        if (n > 0) {
+            v.tag = ThinkRef(
+                thinkText.toString(),
+                "已思考 %d 字 · %.1fs".format(n, ms / 1000.0),
+            )
+            collapseThinking(v)
+            v.setOnClickListener { toggleThinking(v) }
+            // 记入本轮过程件：整轮收工时和工具 chips 一起折进「已完成」那一行
+            turnPieces.add(v)
+        } else {
+            feed.removeView(v)
+        }
+        thinkView = null
+        thinkText.setLength(0)
+        // 收起后的那一行也算「这一轮的痕迹」：网络断了要重来时得一起撤，
+        // 否则屏幕上会留着一条「▸ 已思考 2579 字」，而那份思考已经被重试覆盖了。
+        collapsedThink = if (n > 0) v else null
+    }
+
+    /**
+     * 从历史里还原一段思考：和实时收起的那行长得一模一样，点一下照样能展开。
+     *
+     * 为什么要把思考存下来：不存的话「已思考 2579 字」只活到关掉 App 为止——
+     * 回看一段旧对话时，最想知道的恰恰是「它当时怎么想的」，而那部分偏偏没了。
+     * 只有字数、没有全文的展开按钮是假的，所以存的是全文（截断上限见 AgentLoop.THINK_KEEP）。
+     */
+    fun addThinkingHistory(full: String) {
+        if (full.isBlank()) return
+        dropEmpty()
+        finishProcess()
+        val v = Ui.text(act, "", 12.5f, Ui.INK3).apply {
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(dp(2), dp(4), dp(2), dp(4))
+            maxWidth = (act.resources.displayMetrics.widthPixels * 0.84f).toInt()
+        }
+        // 历史里没有耗时（当时没存），就只报字数——不编一个假的时间出来
+        v.tag = ThinkRef(full, "已思考 %d 字".format(full.length))
+        collapseThinking(v)
+        v.setOnClickListener { toggleThinking(v) }
+        feed.addView(v, Ui.margin(act, top = 6, bottom = 2))
+        // 同实时路径：历史里的思考行也归入本轮过程件，收拢时一起折
+        turnPieces.add(v)
+    }
+
+    /** 上一次「收起成一行」的思考小结。只在当前这一轮内有效，重来或下一轮都会换。 */
+    private var collapsedThink: android.widget.TextView? = null
+
+    /**
+     * 这一轮作废重来（网络断了，客户端要重发同一条请求）。
+     *
+     * 已经流出来的半截回答、思考块（连同收起后的那一行小结）一起撤掉。
+     * 撤的时候把 view 也从 feed 里摘掉，不留空壳——留着空壳，重试的内容会落在它下面，
+     * 看起来就像两条回答。只撤「正在流」的那条，前面几轮答完的气泡一律不动。
+     */
+    fun restartTurn() {
+        collapsedThink?.let { feed.removeView(it) }
+        collapsedThink = null
+        thinkView?.let { feed.removeView(it) }
+        thinkView = null
+        thinkText.setLength(0)
+        thinkStartAt = 0L
+        openBubble?.let { feed.removeView(it) }
+        openBubble = null
+        openRaw = null
+        openRef = null
+    }
+
+    /** 收起：一行小结居中，带 ▸ 提示可展开。 */
+    private fun collapseThinking(v: android.widget.TextView) {
+        val ref = v.tag as? ThinkRef ?: return
+        ref.expanded = false
+        v.text = "▸ " + ref.summary
+        v.gravity = Gravity.CENTER
+    }
+
+    /** 展开：小结挪到第一行（保持时间信息），全文左对齐铺在下面。 */
+    private fun expandThinking(v: android.widget.TextView) {
+        val ref = v.tag as? ThinkRef ?: return
+        ref.expanded = true
+        v.text = "▾ " + ref.summary + "\n\n" + ref.full
+        v.gravity = Gravity.START
+    }
+
+    /**
+     * 展开 / 收起思考块。
+     *
+     * **不能跟着滚到底**：这块一展开就是几十行，滚到底等于把用户从他自己点的那一行
+     * 直接甩到页面末尾，还得手动翻回去找——实测反馈原话是「点展开后直接滑到最底，不方便」。
+     * 做法是记下这一行在视口里的位置，布局完成后按同一位置还原：眼睛停在原地，
+     * 展开的全文从那行往下长，收起时同理（总高度变短，scrollTo 会自己夹到合法范围）。
+     */
+    private fun toggleThinking(v: android.widget.TextView) {
+        val ref = v.tag as? ThinkRef ?: return
+        val anchor = v.top - scroll.scrollY
+        if (ref.expanded) collapseThinking(v) else expandThinking(v)
+        v.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                view: View,
+                left: Int, top: Int, right: Int, bottom: Int,
+                oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int,
+            ) {
+                view.removeOnLayoutChangeListener(this)
+                scroll.scrollTo(0, (view.top - anchor).coerceAtLeast(0))
+            }
+        })
+    }
+
     /**
      * 一条回答在界面上的身份：原文（复制/分享/引用用）+ 它在会话历史里的下标（分叉用）。
      * 下标 -1 表示还不知道（正在流式的那一轮），跑完由 bindAnswerIndex 补上。
@@ -747,6 +937,8 @@ class ChatUi(
 
     fun addAssistant(text: String = "", historyIndex: Int = -1) {
         dropEmpty()
+        // 正文来了，思考过程让位
+        endThinking()
         finishProcess()
         val body = Ui.text(act, "", 14.5f, Ui.INK).apply {
             setLineSpacing(dp(5).toFloat(), 1f)
@@ -759,6 +951,7 @@ class ChatUi(
         body.tag = ref
         body.setOnLongClickListener { showAnswerMenu(body); true }
         feed.addView(body, Ui.margin(act, top = 2, bottom = 2))
+        turnPieces.add(body)
         openBubble = body
         scrollDown()
     }
@@ -787,6 +980,10 @@ class ChatUi(
     }
 
     fun closeAssistant() {
+        endThinking()
+        // 这一轮已经收尾了，思考小结属于「已完成」的痕迹——之后哪怕网络断了要重来，
+        // 也只该撤正在流的那一轮，不能把这条已完成的记录一起带走。
+        collapsedThink = null
         openRaw?.toString()?.takeIf { it.isNotBlank() }?.let { lastAnswer = it }
         openBubble = null
         openRaw = null
@@ -809,6 +1006,41 @@ class ChatUi(
         val ref = tv.tag as? AnswerRef ?: return
         val raw = ref.raw.toString()
         if (raw.isBlank()) return
+        showActionSheet("回答操作", "长按这段回答弹出的操作，只对这一轮生效。", listOf(
+            Triple("复制", "整段回答进剪贴板") { copyAnswer(raw) },
+            Triple("选择文字", "长按拖选一段，只复制那一段") { showSelectableText(raw) },
+            Triple("引用", "填进输入框，接着问这段的事") { quoteAnswer(raw) },
+            Triple("分享", "交给微信、备忘录这些应用") { shareAnswer(raw) },
+            Triple("从这里分叉", "以这条回答为界，复制进一个新对话") { onFork(ref.index, raw) },
+        ))
+    }
+
+    /**
+     * 我的消息：自己提的问题同样能复制、拖选、引用。
+     *
+     * 少了「分享」和「分叉」——那两件事只对回答有意义（分享出去的是一份结论，
+     * 分叉是拿回答当新对话的起点），自己的问题分享给别人没有意义。
+     */
+    private fun showUserMenu(text: String) {
+        if (text.isBlank()) return
+        showActionSheet("我的消息", "长按自己说的话弹出的操作，只对这一条生效。", listOf(
+            Triple("复制", "整条消息进剪贴板") { copyAnswer(text) },
+            Triple("选择文字", "长按拖选一段，只复制那一段") { showSelectableText(text) },
+            Triple("引用", "填回输入框，改几个字再发一遍") { quoteAnswer(text) },
+        ))
+    }
+
+    /**
+     * 底部操作面板：一列圆弧气泡，回答和自己的消息共用这一套。
+     *
+     * 抽出来是因为两边都要一模一样的手感；之前只有回答有面板，用户想复用自己的
+     * 那句话没有任何入口。
+     */
+    private fun showActionSheet(
+        title: String,
+        hint: String,
+        items: List<Triple<String, String, () -> Unit>>,
+    ) {
         val dialog = Dialog(act, android.R.style.Theme_Translucent_NoTitleBar)
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
 
@@ -822,7 +1054,7 @@ class ChatUi(
 
         // ---- 标题行：操作 + 关闭
         val head = Ui.row(act)
-        head.addView(Ui.text(act, "回答操作", 16f, Ui.INK, true),
+        head.addView(Ui.text(act, title, 16f, Ui.INK, true),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         head.addView(Ui.text(act, "关闭", 13f, Ui.INK3).apply {
             setPadding(dp(10), dp(6), dp(2), dp(6))
@@ -830,17 +1062,10 @@ class ChatUi(
             setOnClickListener { dialog.dismiss() }
         })
         card.addView(head)
-        card.addView(Ui.text(act, "长按这段回答弹出的操作，只对这一轮生效。", 11.5f, Ui.INK3)
+        card.addView(Ui.text(act, hint, 11.5f, Ui.INK3)
             .apply { setPadding(0, dp(4), 0, dp(12)) })
 
-        // ---- 五枚圆弧气泡，竖着排，间距舒展
-        val items = listOf(
-            Triple("复制", "整段回答进剪贴板") { copyAnswer(raw) },
-            Triple("选择文字", "长按拖选一段，只复制那一段") { showSelectableText(raw) },
-            Triple("引用", "填进输入框，接着问这段的事") { quoteAnswer(raw) },
-            Triple("分享", "交给微信、备忘录这些应用") { shareAnswer(raw) },
-            Triple("从这里分叉", "以这条回答为界，复制进一个新对话") { onFork(ref.index, raw) },
-        )
+        // ---- 圆弧气泡，竖着排，间距舒展
         items.forEachIndexed { i, (label, sub, action) ->
             card.addView(menuBubble(label, sub) {
                 dialog.dismiss()
@@ -1050,9 +1275,7 @@ class ChatUi(
         var expanded = true
     }
 
-    private fun ensureProcess(): ProcessGroup {
-        process?.let { return it }
-
+    private fun buildProcessGroup(): ProcessGroup {
         val card = Ui.column(act)
 
         val head = Ui.row(act)
@@ -1081,8 +1304,14 @@ class ChatUi(
             body.visibility = if (group.expanded) View.VISIBLE else View.GONE
             chevron.text = if (group.expanded) "⌄" else "›"
         }
+        return group
+    }
 
-        feed.addView(card, Ui.margin(act, top = 2, bottom = 2))
+    private fun ensureProcess(): ProcessGroup {
+        process?.let { return it }
+        val group = buildProcessGroup()
+        feed.addView(group.view, Ui.margin(act, top = 2, bottom = 2))
+        turnPieces.add(group)
         process = group
         return group
     }
@@ -1092,6 +1321,7 @@ class ChatUi(
         val g = process ?: return
         if (g.steps == 0) {
             feed.removeView(g.view)
+            turnPieces.remove(g)
             process = null
             return
         }
@@ -1102,6 +1332,103 @@ class ChatUi(
         g.label.text = "✓ 已完成"
         g.meta.text = "· ${g.steps} 次工具调用"
         process = null
+    }
+
+    /**
+     * 整轮收工：把这一轮的所有过程——工具 chips、中途的说明气泡、思考小结行——
+     * 收进**一个**折叠行，折叠行插在本轮内容的开头位置。
+     *
+     * 跑的过程中一切照常展开（看得见它在干什么），只有真跑完了才收：
+     * 收完用户眼前只剩「他的问题 → ✓ 已完成一行 → 最终回答 → 产物卡」，
+     * 想查它当时点了哪儿就点开那一行（chips 原样都在里面，点单个 chip 还能看详情，
+     * 思考行点开还是原来的全文展开）。
+     *
+     * 最后一枚回答气泡是最终回答，永远留在折叠外面；思考行靠 tag 里的 ThinkRef
+     * 认出来，全部收进去——它是过程，不配留在结果旁边。会话恢复（restoreTranscript）
+     * 也走这一个入口，历史会话打开就是收好的形态。
+     */
+    fun collapseTurn() {
+        finishProcess()
+        if (turnPieces.isEmpty()) return
+        // 最后一枚**回答**气泡 = 最终回答（思考行也是 TextView，靠 tag 区分，不能算进去）；
+        // 一枚都没有（纯工具轮 + 报错）就不留
+        var lastBubble = -1
+        for (i in turnPieces.indices) {
+            val p = turnPieces[i]
+            if (p is TextView && p.tag !is ThinkRef) lastBubble = i
+        }
+
+        var steps = 0
+        var notes = 0
+        var thinks = 0
+        val removed = ArrayList<View>()
+        val entries = ArrayList<View>()   // 收进折叠体的内容，按时间顺序
+        for ((i, piece) in turnPieces.withIndex()) {
+            when (piece) {
+                is ProcessGroup -> {
+                    steps += piece.steps
+                    removed.add(piece.view)
+                    for (j in 0 until piece.body.childCount) entries.add(piece.body.getChildAt(j))
+                }
+                is TextView -> {
+                    if (piece.tag is ThinkRef) {
+                        // 思考小结行：全文还在 ThinkRef 里，折进去点开照样能展开
+                        thinks++
+                        removed.add(piece)
+                        entries.add(piece)
+                    } else if (i != lastBubble) {
+                        notes++
+                        removed.add(piece)
+                        entries.add(piece)
+                    }
+                }
+            }
+        }
+        turnPieces.clear()
+        if (entries.isEmpty()) return
+
+        // 插入点 = 被收内容末尾的下一个兄弟（产物卡 / 思考行 / 最终回答），保持它们在折叠行下面
+        var anchor: View? = null
+        for (v in removed.asReversed()) {
+            val idx = feed.indexOfChild(v)
+            if (idx >= 0) {
+                anchor = if (idx + 1 < feed.childCount) feed.getChildAt(idx + 1) else null
+                break
+            }
+        }
+        for (v in removed) feed.removeView(v)
+
+        val g = buildProcessGroup()
+        for (e in entries) {
+            // 这些 chip 原来挂在旧的过程组里，父容器还是它；直接 addView 会抛
+            // IllegalStateException("The specified child already has a parent")——
+            // 折叠一上线就闪退（恢复历史必崩）就是漏了这一步。先摘再挂。
+            (e.parent as? ViewGroup)?.removeView(e)
+            g.body.addView(e)
+        }
+        g.steps = steps
+        g.expanded = false
+        g.body.visibility = View.GONE
+        g.chevron.text = "›"
+        g.dot.background = Ui.circle(act, Ui.OK, 6)
+        g.label.text = "✓ 已完成"
+        g.meta.text = "· $steps 次工具调用" +
+            (if (notes > 0) " · $notes 段说明" else "") +
+            (if (thinks > 0) " · $thinks 次思考" else "")
+        val at = anchor?.let { feed.indexOfChild(it) } ?: feed.childCount
+        feed.addView(g.view, if (at >= 0) at else feed.childCount,
+            Ui.margin(act, top = 2, bottom = 2))
+
+        // 收完这条线就断了：下一轮流式必须自己起新气泡。openBubble 若还指着
+        // 刚被折进折叠体的旧气泡，deltas 会往一个已经换了父容器的 view 里写字。
+        openBubble = null
+        openRaw = null
+        openRef = null
+        // 思考小结行也折进去了，这个引用不能再留给 restartTurn 用（它只管本轮）
+        collapsedThink = null
+        // 上面那批 chip 已经挪进折叠体，toolStack 里的引用也失效了；
+        // 不清掉，下一轮 finishTool 会把「完成态」刷到一个看不见的旧卡片上。
+        toolStack.clear()
     }
 
     // ------------------------------------------------------------ 工具卡
@@ -1275,7 +1602,7 @@ class ChatUi(
      * 顶栏胶囊上的模型名。切换后由 [MainActivity] 回填，别再让界面显示一个
      * 写死的常量——那是用户「看不到模型」的直接原因。
      *
-     * 文字统一由 [ModelRegistry.Option.summary] 生成（"Hy3 · 免费"），
+     * 文字统一由 [ModelRegistry.Option.summary] 生成（"Hy4 flash · 免费"），
      * 界面上不会再出现第二种拼法。
      */
     fun setModel(option: ModelRegistry.Option = ModelRegistry.resolve(AgentHost.modelId())) {

@@ -6,7 +6,7 @@ package cn.wbphone.agent
 object Config {
     const val BASE_URL = "https://www.workbuddy.cn"
     const val REQUEST_PATH = "/v2/chat/completions"
-    const val MODEL = "hy3"
+    const val MODEL = "hy4flash-free"
     // 48 而不是 24：用户反馈「动不动就停」。动作一轮、读屏一轮，复杂任务 24 轮仍会截断；
     // 真正防烧钱的是下面的卡死检测，不是压轮数。
     const val MAX_TURNS = 48
@@ -41,6 +41,9 @@ object Config {
     const val TOP_P = 0.9
     const val MAX_TOKENS = 8192
 
+    /** 默认思考深度：标准（不额外指定，走服务端默认）。见 [Think]。 */
+    const val THINK_LEVEL = Think.STD
+
     /**
      * 讯飞「语音听写（流式版）」凭据（https://console.xfyun.cn → 语音听写）。
      * 语音输入不再依赖设备的 RecognitionService——这台 vivo 什么识别服务都没有，
@@ -53,4 +56,61 @@ object Config {
     const val IAT_APP_ID = Secrets.IAT_APP_ID
     const val IAT_API_KEY = Secrets.IAT_API_KEY
     const val IAT_API_SECRET = Secrets.IAT_API_SECRET
+}
+
+/**
+ * 思考深度档位。三档对应用户在设置里能选的三件事：想得少 / 不想指定 / 想得细。
+ *
+ * 为什么值得做成开关：实测首字延迟 ≈ 1.35s + 0.0191 × 思考 token（R²=0.990），
+ * 也就是每 100 个思考 token 约 1.9 秒。输入 9k token 的预填充只值 0.27 秒——
+ * 真正让回答慢的是模型在「想」，不是提示词太长。「回答慢」这件事唯一有效的旋钮就在这里。
+ *
+ * 实现走 OpenAI 形态的 `reasoning_effort`（low / high）。不保证每家上游都认，
+ * 所以客户端带着它发、被明确拒了就自动摘掉重试（见 CloudClient.stream），
+ * 并把服务端原话记下来——下次换模型要不要再试，看那句话就知道。
+ */
+object Think {
+    /** 想得少：最快。适合「打开设置」这类步骤明确的任务。 */
+    const val LOW = 0
+
+    /** 标准：不传参数，走服务端默认。不改变任何既有行为。 */
+    const val STD = 1
+
+    /** 想得细：更慢但更稳。留给需要规划的长任务。 */
+    const val HIGH = 2
+
+    val LEVELS = intArrayOf(LOW, STD, HIGH)
+
+    fun label(level: Int): String = when (level) {
+        LOW -> "低"
+        HIGH -> "高"
+        else -> "标准"
+    }
+
+    fun note(level: Int): String = when (level) {
+        LOW -> "省：实测同一道难题，思考量约为标准的 1/4，整轮快一半以上"
+        HIGH -> "实测和标准几乎没差别（5 次对照），想更细的效果没出现"
+        else -> "不额外指定，用服务端默认——不确定就选这个"
+    }
+
+    /**
+     * 请求体里 `reasoning_effort` 该填什么。null = 这一档不传参数。
+     *
+     * 只给低/高两档传值，是因为「标准」必须保持和旧版本逐字节一致的请求体——
+     * 否则升级后所有老用户的请求都会变，缓存前缀跟着作废，反而更慢。
+     */
+    fun effort(level: Int): String? = when (level) {
+        LOW -> "low"
+        HIGH -> "high"
+        else -> null
+    }
+
+    /** 把回传的 effort 值翻回中文，日志和流水账里用。 */
+    fun labelOfEffort(effort: String?): String = when (effort) {
+        "low" -> "低"
+        "high" -> "高"
+        else -> "标准"
+    }
+
+    fun clamp(level: Int): Int = if (level in LEVELS) level else STD
 }

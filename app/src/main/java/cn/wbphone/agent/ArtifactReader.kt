@@ -351,13 +351,45 @@ object ArtifactReader {
     /**
      * 真表格：外层圆角卡 + 表头浅底，列宽按每列最长内容分权重，
      * 格与格之间发丝竖线，行与行之间发丝横线。
+     *
+     * 列宽两条硬规则（github-trending 那张表翻过车：「简介」列内容长、权重巨大，
+     * 星数列被挤成一条竖缝，字竖着排，还没有横向滚动可救）：
+     *  - 任何列不得低于 [MIN_COL_DP]；窄列抬到下限的差价，从宽列按比例扣；
+     *  - 宽列扣无可扣（列多到下限都放不下）时，整卡进横向滚动，列按内容估宽，绝不压扁。
      */
     private fun tableBlock(act: Context, rows: List<List<String>>): View {
         val cols = rows.maxOf { it.size }.coerceAtLeast(1)
-        // 每列权重 = 该列最长一格的长度（有下限），这样「排名」窄、「简介」宽
-        val weights = FloatArray(cols) { c ->
-            rows.maxOf { r -> (r.getOrNull(c) ?: "").length }.coerceAtLeast(3).toFloat()
+        val maxLens = IntArray(cols) { c -> rows.maxOf { r -> (r.getOrNull(c) ?: "").length } }
+        val dm = act.resources.displayMetrics
+        val density = dm.density
+        // 正文左右 padding 18dp×2，再留一点圆角描边的余量
+        val availDp = dm.widthPixels / density - 42f
+        val MIN_COL_DP = 72f
+
+        val widthsDp: FloatArray = if (cols * MIN_COL_DP > availDp) {
+            // 列太多，屏宽连下限都摆不下：按内容估宽（10dp/字，上限 240dp），交给横向滚
+            FloatArray(cols) { c ->
+                maxOf(MIN_COL_DP, maxLens[c].coerceIn(4, 22) * 10f + 24f).coerceAtMost(240f)
+            }
+        } else {
+            val w = FloatArray(cols) { c ->
+                availDp * maxLens[c].coerceAtLeast(1) / maxLens.sumOf { it }.coerceAtLeast(1)
+            }
+            val deficit = w.sumOf { if (it < MIN_COL_DP) (MIN_COL_DP - it).toDouble() else 0.0 }.toFloat()
+            // 宽列能捐的宽度上限：自己也不能跌破下限
+            val capacity = w.sumOf { if (it > MIN_COL_DP) (it - MIN_COL_DP).toDouble() else 0.0 }.toFloat()
+            if (deficit <= 0f || capacity <= deficit) {
+                // 捐不够：全员顶到自然宽度，超出的部分交给横向滚动兜底
+                FloatArray(cols) { maxOf(MIN_COL_DP, w[it]) }
+            } else {
+                FloatArray(cols) { c ->
+                    if (w[c] < MIN_COL_DP) MIN_COL_DP
+                    else w[c] - deficit * ((w[c] - MIN_COL_DP) / capacity)
+                }
+            }
         }
+        fun px(dp: Float) = (dp * density + 0.5f).toInt()
+
         val card = Ui.column(act)
         card.background = Ui.solid(act, Ui.CARD, 12, Ui.LINE, 1)
 
@@ -372,7 +404,9 @@ object ArtifactReader {
                     Ui.text(act, inline(cell), 12.5f, if (ri == 0) Ui.INK else Ui.INK2, ri == 0).apply {
                         setPadding(Ui.dp(act, 10), Ui.dp(act, 8), Ui.dp(act, 10), Ui.dp(act, 8))
                     },
-                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weights[c])
+                    // 列宽是算出来的定值，不再用 weight——weight 只会按比例瓜分屏宽，
+                    // 长内容列一多，短内容列就沦为一条缝
+                    LinearLayout.LayoutParams(px(widthsDp[c]), ViewGroup.LayoutParams.WRAP_CONTENT)
                 )
                 if (c < cols - 1) {
                     r.addView(
@@ -389,7 +423,12 @@ object ArtifactReader {
                 )
             }
         }
-        return card
+        // 算出的总宽超出屏宽（列太多 / 下限抬不动）：整卡横向滚，左右滑着看
+        if (widthsDp.sum() <= availDp + 0.5f) return card
+        return android.widget.HorizontalScrollView(act).apply {
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(card, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
     }
 
     // ══ 行内 span ═════════════════════════════════════════
