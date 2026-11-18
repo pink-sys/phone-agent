@@ -146,6 +146,16 @@ class AgentSettings(context: Context) {
         get() = sp.getBoolean(KEY_SHELL_ON, false)
         set(value) = sp.edit().putBoolean(KEY_SHELL_ON, value).apply()
 
+    /**
+     * Python 环境（proot + Alpine rootfs）。
+     *
+     * **默认关**。开启后模型可以跑 .py 脚本，但首次使用会后台下载约 16MB 的运行环境，
+     * 这个流量和存储开销得让用户自己点头；不用 Python 的用户一分钱都不用花。
+     */
+    var pyOn: Boolean
+        get() = sp.getBoolean(KEY_PY_ON, false)
+        set(value) = sp.edit().putBoolean(KEY_PY_ON, value).apply()
+
     companion object {
         private const val KEY_MODEL = "model"
         private const val KEY_THINK_LEVEL = "think_level"
@@ -159,6 +169,7 @@ class AgentSettings(context: Context) {
         private const val KEY_GATEWAY_LEVEL = "gateway_level"
         private const val KEY_FLOAT_ON = "float_on"
         private const val KEY_SHELL_ON = "shell_on"
+        private const val KEY_PY_ON = "py_on"
         private const val KEY_SKILLS_ON = "skills_on"
         private const val KEY_SKILLS_OFF = "skills_off"
         private const val KEY_VOICE_ON = "voice_on"

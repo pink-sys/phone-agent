@@ -468,7 +468,7 @@ class AgentLoop(
                         history.put(JSONObject().put("role", "user").put("content", STALL_NUDGE))
                     } else {
                         listener.onFinished(
-                            "连续多轮重复完全相同的操作、屏幕没有变化，我停在这里，免得继续空转。\n" +
+                            "连续多轮重复完全相同的操作但没有进展，我停在这里，免得继续空转。\n" +
                                 "已做的步骤都在，你可以说「继续」并提示我换个方法。",
                             turns, toolCount,
                         )
@@ -1066,7 +1066,7 @@ class AgentLoop(
         val NO_VERIFY = setOf("phone_input", "phone_long_press")
 
         /** 成功后会产生「可以点开看」的产物的工具。 */
-        val ARTIFACT_TOOLS = setOf("fs_write", "fs_edit", "pdf_write", "pptx_write", "docx_write", "html_preview")
+        val ARTIFACT_TOOLS = setOf("fs_write", "fs_edit", "pdf_write", "pptx_write", "docx_write", "xlsx_write", "chart_write", "html_preview", "text_shot")
 
         /** 挂在动作结果里的核对提示。短是刻意的——它每一轮都会随历史重发。 */
         const val VERIFY_HINT = "screen_after 是动作后的屏幕。先核对它是否符合预期再决定下一步；不符合就换条路，别原样重试。"
@@ -1083,11 +1083,11 @@ class AgentLoop(
          */
         const val MAX_TOOL_CHARS = 32_000
 
-        /** 打转提醒：给模型一个台阶（连续滚动是合法操作），但也把话说死——再犯就停。 */
+        /** 打转提醒：不预设工具种类——屏幕动作核读屏，工作台工具核产物。 */
         const val STALL_NUDGE =
-            "你已经连续几轮执行完全相同的操作，而屏幕看起来没有变化。" +
-                "停下来重新读一次屏，判断上一步是否真的生效；" +
-                "如果这是有意的连续滚动，继续但确认在推进；否则换一种方法。"
+            "你已经连续几轮调用完全相同的工具，但没有新进展。" +
+                "先核实上一步是否真的生效：屏幕动作用读一次屏确认，工作台操作用 fs_read/fs_list 看产物。" +
+                "如果这步本来就该重复（如连续滚动），说明在推进即可；否则换一种方法，或直接问用户。"
 
         /**
          * 撞到输出上限（finish_reason=length）时替用户说的那句话。

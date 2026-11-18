@@ -11,11 +11,11 @@
 
 用法：
     python tools/build_apk.py            # 日常构建，产出 build/app-debug.apk
-    python tools/build_apk.py --release  # 发布构建，产出 build/yueshu-<版本>.apk
+    python tools/build_apk.py --release  # 发布构建，产出 build/yuesu-<版本>.apk
     JAVA_HOME=... WB_ANDROID_TOOLS=... python tools/build_apk.py
 
 两种构建共用同一套工具链和同一份 keystore，区别有两点：发布构建额外做两件事——
-**不编入任何凭证**（语音听写关闭），以及产物命名为 `build/yueshu-<版本>.apk` 并多打一行
+**不编入任何凭证**（语音听写关闭），以及产物命名为 `build/yuesu-<版本>.apk` 并多打一行
 SHA-256，方便贴进 Release 说明。
 """
 import glob
@@ -94,8 +94,8 @@ def write_secrets(dest=SECRETS_KT, enabled=True):
 PKG = "cn.wbphone.agent"
 MIN_SDK = "26"
 TARGET_SDK = "34"
-VERSION_CODE = "2"
-VERSION_NAME = "1.1.0"
+VERSION_CODE = "3"
+VERSION_NAME = "1.2.0"
 
 
 def die(msg):
@@ -144,7 +144,7 @@ def need(path, what):
 
 def main():
     release = "--release" in sys.argv[1:]
-    out_name = "yueshu-%s.apk" % VERSION_NAME if release else "app-debug.apk"
+    out_name = "yuesu-%s.apk" % VERSION_NAME if release else "app-debug.apk"
 
     # 凭证文件先就位：Secrets.kt 是生成的（gitignored）。
     # 发布包一律按空值生成——APK 里的字符串可以被原样抠出来，编进去就等于公开。
@@ -295,6 +295,26 @@ def main():
             zout.writestr(item.filename, data, compress_type=compress)
         with open(dex_file, "rb") as f:
             zout.writestr("classes.dex", f.read(), compress_type=zipfile.ZIP_DEFLATED)
+
+        # proot 全家（改名 lib*.so）进 lib/arm64-v8a/，必须 STORED（不压缩）：
+        # extractNativeLibs=true 时安装器按「未压缩存储」约定把它们解到
+        # nativeLibraryDir，那是 Android 10 W^X 限制下唯一可执行的自带二进制位置。
+        jni = os.path.join(work_root, "app", "src", "main", "jniLibs")
+        if os.path.isdir(jni):
+            n_so = 0
+            for arch in sorted(os.listdir(jni)):
+                arch_dir = os.path.join(jni, arch)
+                if not os.path.isdir(arch_dir):
+                    continue
+                for so in sorted(os.listdir(arch_dir)):
+                    if not so.endswith(".so"):
+                        continue
+                    with open(os.path.join(arch_dir, so), "rb") as f:
+                        zout.writestr("lib/%s/%s" % (arch, so), f.read(),
+                                      compress_type=zipfile.ZIP_STORED)
+                    n_so += 1
+            if n_so:
+                print("  已打包 %d 个 native 库（lib/arm64-v8a/…）" % n_so)
 
     print("\n== 7/7 签名 ==")
     # keystore 必须跨构建稳定：签名一变，用户就得卸载重装、数据全丢。

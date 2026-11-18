@@ -58,11 +58,61 @@ class Workbench(
      * 模型不会看到一个必然失败的工具。
      */
     private val docEngine: DocEngine? = null,
+    /**
+     * 文本截图引擎：把一段文字渲染成 PNG（终端风格的「运行截图」）。
+     * 位图和字体要 android.graphics，纯 JVM 桌面测试给 null；真机由 AgentHost 注入。
+     * null 时 text_shot 从 schema 里摘掉，同 pdf_write 的口径。
+     */
+    private val shotEngine: ShotEngine? = null,
+    /**
+     * 图表引擎：把 [ChartText] 的绘制计划画成 PNG。布局是纯 JVM（可测），
+     * 像素要 android.graphics——注入模式同 [shotEngine]，null 时 chart_write 摘除。
+     */
+    private val chartEngine: ChartEngine? = null,
+    /**
+     * Python 引擎（[PyRuntime]：proot + Alpine rootfs）。真机注入；桌面测试 null，
+     * python_run 自动摘除。ready/下载/失败三种状态都由引擎内部管理。
+     */
+    private val pyEngine: PyEngine? = null,
+    /**
+     * Python 是否启用。默认关——第一次使用要下载约 16MB 的 rootfs，这是用户
+     * 该自己点头的开销。做成 lambda：设置里开关一拨立刻生效。
+     */
+    private val pyEnabled: () -> Boolean = { false },
 ) {
 
     /** PDF 引擎的接口。实现要 Android，声明留在这层是为了让 Workbench 保持纯 JVM。 */
     interface DocEngine {
         fun writePdf(out: File, title: String, blocks: JSONArray): String
+    }
+
+    /** 文本截图引擎接口。布局（换行、列宽）在 ShotText（纯 JVM）；这里只管画像素。 */
+    interface ShotEngine {
+        fun write(out: File, text: String, title: String, cols: Int): String
+    }
+
+    /** 图表引擎接口。布局计划在 ChartText（纯 JVM）；这里只管照单画像素。 */
+    interface ChartEngine {
+        fun write(out: File, plan: String, width: Int, height: Int): String
+    }
+
+    /**
+     * Python 引擎接口。实现（[PyRuntime]）管 rootfs 的下载/校验/解压和 proot 进程；
+     * Workbench 只做参数校验和路径沙箱，两边的测试口径和 shell 一样：桌面测 Workbench，
+     * 真机测 PyRuntime。
+     */
+    interface PyEngine {
+        /** ready | downloading | not_ready */
+        fun status(): String
+
+        /** 触发后台准备（下载+解压）。非阻塞，返回当前状态。 */
+        fun prepare(): String
+
+        /**
+         * 跑一个 .py 脚本（已通过路径沙箱校验），返回 JSON 结果字符串。
+         * 脚本和产物都在工作台目录里，引擎负责映射进 rootfs。
+         */
+        fun run(script: File, args: List<String>, timeoutSec: Int): String
     }
 
     val root: File = root.canonicalFile
@@ -93,6 +143,10 @@ class Workbench(
             "pdf_write" -> pdfWrite(args)
             "pptx_write" -> pptxWrite(args)
             "docx_write" -> docxWrite(args)
+            "xlsx_write" -> xlsxWrite(args)
+            "chart_write" -> chartWrite(args)
+            "text_shot" -> textShot(args)
+            "python_run" -> pythonRun(args)
             "html_preview" -> htmlPreview(args.optString("path", ""))
             "memory_save" -> memorySave(args.optString("text", ""))
             "skill_load" -> skillLoad(args.optString("name", ""))
@@ -120,6 +174,10 @@ class Workbench(
         val skip = HashSet<String>()
         if (!shellEnabled()) skip.add("shell")
         if (docEngine == null) skip.add("pdf_write")
+        if (shotEngine == null) skip.add("text_shot")
+        if (chartEngine == null) skip.add("chart_write")
+        // python_run 双重门：引擎没注入（桌面测试）或用户没开开关，都摘掉
+        if (pyEngine == null || !pyEnabled()) skip.add("python_run")
         if (skip.isEmpty()) return all
         val out = JSONArray()
         for (i in 0 until all.length()) {
@@ -683,8 +741,184 @@ class Workbench(
         }
         val f = resolve(path)
         val result = DocxWriter.write(f, args.optString("title", ""), blocks,
-            args.optJSONObject("title_style"))
+            args.optJSONObject("title_style"), root)
         return runCatching { JSONObject(result).put("path", rel(f)).toString() }.getOrDefault(result)
+    }
+
+    /**
+     * XLSX：纯 JVM 实现（[XlsxWriter]）。Excel 能直接编辑的表格：
+     * 首行加粗冻结、列宽自适应、数字存成数值格（能求和排序）。
+     * 上千行的宽表别走这里（JSON 描述浪费 token），让用户给 CSV。
+     */
+    private fun xlsxWrite(args: JSONObject): String {
+        val path = args.optString("path", "").trim()
+        if (path.isBlank()) return err("BAD_ARGS", "必须给 path，以 .xlsx 结尾")
+        if (!path.endsWith(".xlsx", ignoreCase = true)) {
+            return err("BAD_EXT", "文件名要以 .xlsx 结尾（收到：$path）")
+        }
+        val sheets = args.optJSONArray("sheets")
+        if (sheets == null || sheets.length() == 0) {
+            return err("BAD_ARGS", "sheets 不能为空。给一组 {name:\"...\", rows:[[...],[...]]}，" +
+                "每行是单元格数组（字符串或数字）")
+        }
+        val f = resolve(path)
+        val result = XlsxWriter.write(f, sheets, args.optBoolean("header", true))
+        return runCatching { JSONObject(result).put("path", rel(f)).toString() }.getOrDefault(result)
+    }
+
+    /**
+     * 图表：bar/line/pie 三种，出 PNG。布局在 [ChartText]（纯 JVM，坐标可测），
+     * 画像素在 [ChartEngine]（Android）。y 轴从 0 起、nice 刻度——图表工具替用户
+     * 防两类最常见的「图不对数据」：轴截断撒谎、刻度取不整。
+     */
+    private fun chartWrite(args: JSONObject): String {
+        val engine = chartEngine ?: return err("NO_ENGINE", "图表引擎未就绪")
+        val type = args.optString("type", "").trim().lowercase()
+        val labels = args.optJSONArray("labels")
+        if (type != "bar" && type != "line" && type != "pie") {
+            return err("BAD_TYPE", "type 要是 bar（柱状）、line（折线）或 pie（饼图）")
+        }
+        if (labels == null) return err("BAD_ARGS", "labels 不能少：类目名（bar/line 的 x 轴、pie 的扇区名）")
+
+        val labelList = ArrayList<String>(labels.length())
+        for (i in 0 until labels.length()) labelList.add(labels.optString(i, ""))
+
+        val seriesList = ArrayList<ChartText.Series>()
+        if (type == "bar" || type == "line") {
+            val series = args.optJSONArray("series")
+            if (series == null || series.length() == 0) {
+                return err("BAD_ARGS", "series 不能为空：给 [{name:\"...\", values:[数字...]}]")
+            }
+            for (si in 0 until series.length()) {
+                val s = series.optJSONObject(si)
+                    ?: return err("BAD_ARGS", "series[$si] 不是对象。要 {name:\"...\", values:[...]}")
+                val vs = s.optJSONArray("values")
+                if (vs == null || vs.length() == 0) {
+                    return err("BAD_ARGS", "series[$si].values 不能为空")
+                }
+                val vals = ArrayList<Double>(vs.length())
+                for (i in 0 until vs.length()) {
+                    val v = vs.optDouble(i, Double.NaN)
+                    if (v.isNaN()) {
+                        return err("BAD_ARGS", "series[$si].values[$i] 不是数字（收到：${vs.opt(i)}）")
+                    }
+                    vals.add(v)
+                }
+                seriesList.add(ChartText.Series(s.optString("name", "系列${si + 1}"), vals))
+            }
+        }
+        val pieValues: List<Double>? = if (type == "pie") {
+            val vs = args.optJSONArray("values")
+                ?: return err("BAD_ARGS", "pie 要给 values（每个扇区的值，数字数组）")
+            val vals = ArrayList<Double>(vs.length())
+            for (i in 0 until vs.length()) {
+                val v = vs.optDouble(i, Double.NaN)
+                if (v.isNaN()) return err("BAD_ARGS", "values[$i] 不是数字（收到：${vs.opt(i)}）")
+                vals.add(v)
+            }
+            vals
+        } else null
+
+        val plan = try {
+            ChartText.plan(type, args.optString("title", ""), labelList, seriesList, pieValues)
+        } catch (e: ChartText.Bad) {
+            return err("BAD_DATA", e.message ?: "数据画不成图")
+        }
+
+        val outName = args.optString("out", "").trim()
+        val out = if (outName.isNotEmpty()) {
+            if (!outName.endsWith(".png", ignoreCase = true)) {
+                return err("BAD_EXT", "out 要以 .png 结尾（收到：$outName）")
+            }
+            resolve(outName)
+        } else {
+            val stamp = java.time.LocalTime.now().toString().substring(0, 8).replace(":", "")
+            resolve("chart-$stamp.png")
+        }
+        val result = engine.write(out, plan.toString(), ChartText.W, ChartText.H)
+        return runCatching { JSONObject(result).put("path", rel(out)).toString() }.getOrDefault(result)
+    }
+
+    /**
+     * 文本截图：把一段文字渲染成终端风格的 PNG——「运行结果截图」就是这么来的。
+     *
+     * 模型跑完一条命令、抓到一段日志，把原文丢进来，得到一张黑底等宽字的图，
+     * 可以直接塞进 docx_write 的 image 块当「运行截图」。画像素在 [ShotEngine]
+     * （Android），换行/列宽在 [ShotText]（纯 JVM 可测）。
+     *
+     * 文本来源二选一：text（原文）或 path（工作台里的文件）。不放大段正文，
+     * 上限 [MAX_SHOT_CHARS]——截图是给人看的证据，不是文件的另一种存法。
+     */
+    private fun textShot(args: JSONObject): String {
+        val engine = shotEngine ?: return err("NO_ENGINE", "截图引擎未就绪")
+        var text = args.optString("text", "")
+        val srcPath = args.optString("path", "").trim()
+        if (text.isEmpty() && srcPath.isNotEmpty()) {
+            val f = resolve(srcPath)
+            if (!f.isFile) return err("BAD_PATH", "文件不存在：$srcPath")
+            text = runCatching { f.readText() }.getOrElse {
+                return err("READ_FAILED", "文件读不出来：$srcPath")
+            }
+        }
+        text = text.trim()
+        if (text.isEmpty()) return err("BAD_ARGS", "要给 text（要截图的文字）或 path（工作台里的文件）")
+        if (text.length > MAX_SHOT_CHARS) {
+            return err("TOO_LONG", "文本超过 $MAX_SHOT_CHARS 字。截图是证据不是档案，给关键输出就行")
+        }
+        val title = args.optString("title", "").trim().take(60)
+        val cols = args.optInt("cols", 0).coerceIn(0, 120)
+        val outName = args.optString("out", "").trim()
+        val out = if (outName.isNotEmpty()) {
+            if (!outName.endsWith(".png", ignoreCase = true)) {
+                return err("BAD_EXT", "out 要以 .png 结尾（收到：$outName）")
+            }
+            resolve(outName)
+        } else {
+            val stamp = java.time.LocalTime.now().toString().substring(0, 8).replace(":", "")
+            resolve("shot-$stamp.png")
+        }
+        val result = engine.write(out, text, title, cols)
+        return runCatching { JSONObject(result).put("path", rel(out)).toString() }.getOrDefault(result)
+    }
+
+    // ---------------------------------------------------------------- 跑 Python
+
+    /**
+     * python_run：在 proot 的 Alpine rootfs 里跑一个 .py 脚本。
+     *
+     * 和 shell 的边界刻意分开：shell 跑 Android 自带的 sh（处理文本、文件），
+     * python_run 跑 rootfs 里的 python（数据处理、画图、爬虫、作业脚本）。
+     * 脚本先用 fs_write 写进工作台，产物也留在工作台——模型不用学第二套路径。
+     */
+    private fun pythonRun(args: JSONObject): String {
+        if (!pyEnabled()) {
+            return err("PYTHON_OFF", "Python 没有开启。让用户在设置里打开「Python 环境」再用（首次会自动下载约 16MB 的运行环境）")
+        }
+        val engine = pyEngine ?: return err("NO_ENGINE", "这个环境没有 Python 引擎")
+        val path = args.optString("script", "").trim()
+        if (path.isBlank()) return err("BAD_ARGS", "必须给 script，工作台里的 .py 文件（先用 fs_write 写好）")
+        if (!path.endsWith(".py", ignoreCase = true)) {
+            return err("BAD_EXT", "script 要以 .py 结尾（收到：$path）")
+        }
+        val f = resolve(path)
+        if (!f.isFile) return err("NOT_FOUND", "脚本不存在：$path。先用 fs_write 写进去")
+
+        val argList = ArrayList<String>()
+        val arr = args.optJSONArray("args")
+        if (arr != null) {
+            if (arr.length() > 20) return err("TOO_MANY", "args 上限 20 个")
+            for (i in 0 until arr.length()) {
+                val a = arr.opt(i)?.toString() ?: continue
+                if (a.length > 200) return err("TOO_LONG", "args[$i] 超过 200 字符")
+                argList.add(a)
+            }
+        }
+        val timeout = args.optInt("timeout_sec", DEFAULT_PY_TIMEOUT)
+        val result = engine.run(f, argList, timeout)
+        // 带上引擎的状态（首次调用会触发下载，模型要能转告用户进度）
+        return runCatching {
+            JSONObject(result).put("status", engine.status()).toString()
+        }.getOrDefault(result)
     }
 
     // ---------------------------------------------------------------- 长期记忆
@@ -977,8 +1211,15 @@ class Workbench(
 
         /** 文档生成的块数上限。一个任务生成几千块的 PDF 多半是跑偏了。 */
         const val MAX_DOC_BLOCKS = 400
+
+        /** 一张文本截图的文字上限。再长就该摘关键输出，不是把终端整个搬进来。 */
+        const val MAX_SHOT_CHARS = 6_000
         const val DEFAULT_TIMEOUT_SEC = 20
         const val MAX_TIMEOUT_SEC = 60
+
+        /** Python 脚本的默认与上限。正经作业要几分钟，别拿 shell 的 60 秒框它。 */
+        const val DEFAULT_PY_TIMEOUT = 120
+        const val MAX_PY_TIMEOUT = 600
 
         /** Android 自带的 shell。不叫 bash——这里没有 bash。 */
         const val DEFAULT_SHELL = "/system/bin/sh"
@@ -1189,8 +1430,10 @@ class Workbench(
                     "items": {
                       "type": "object",
                       "properties": {
-                        "type": {"type": "string", "description": "h1|h2|h3|p|bullet|quote|pagebreak|spacer"},
-                        "text": {"type": "string", "description": "这一块的内容（pagebreak/spacer 可省略）"},
+                        "type": {"type": "string", "description": "h1|h2|h3|p|bullet|quote|pagebreak|spacer|image"},
+                        "text": {"type": "string", "description": "这一块的内容（pagebreak/spacer 可省略；image 块里当图注）"},
+                        "path": {"type": "string", "description": "image 块专用：工作台里图片的相对路径（text_shot 的产出）"},
+                        "width": {"type": "string", "description": "image 块显示宽度：百分比（如 80 = 正文宽的 80%）或 8cm；不给按图片原生大小放"},
                         "font": {"type": "string", "description": "中文字体：宋体/黑体/楷体/仿宋/微软雅黑（缺省等线）"},
                         "ascii": {"type": "string", "description": "西文字体，缺省跟 font 相同；论文常用 Times New Roman"},
                         "size": {"type": "string", "description": "字号：中文字号（三号/小三/四号/小四/五号）或磅值（如 12）"},
@@ -1203,6 +1446,108 @@ class Workbench(
                   }
                 },
                 "required": ["path", "blocks"]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "xlsx_write",
+              "description": "生成可编辑的 .xlsx Excel 表格：首行加粗冻结、列宽自适应、数字存成数值格（Excel 里能直接求和排序）。适合成绩单、清单、数据汇总这类要交给别人用的表。几百行以内的数据用这个；上千行或几十列的宽表让用户给 CSV，别用 JSON 硬描述。",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {"type": "string", "description": "文件相对路径，以 .xlsx 结尾"},
+                  "header": {"type": "boolean", "description": "首行是不是表头（缺省 true：加粗并冻结首行）"},
+                  "sheets": {
+                    "type": "array",
+                    "description": "工作表数组，最多 8 个",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {"type": "string", "description": "工作表名（缺省 Sheet1）"},
+                        "rows": {
+                          "type": "array",
+                          "description": "行数组；每行是单元格数组。单元格可以是字符串或数字——数字给数值，别写成 \"123\" 那样的字符串（写了也会被转成数值）",
+                          "items": {"type": "array", "description": "一行单元格"}
+                        }
+                      },
+                      "required": ["rows"]
+                    }
+                  }
+                },
+                "required": ["path", "sheets"]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "text_shot",
+              "description": "把一段文字渲染成终端风格的 PNG（黑底等宽字，带标题栏）——「运行结果截图」。跑完命令、抓到日志、算出结果后，把关键输出原文给它，得到一张可以插进 docx_write image 块的图。不要拿它存文件（fs_write 干这个），只做给人看的证据图。",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "text": {"type": "string", "description": "要截图的文字（运行输出/日志/结果），二选一"},
+                  "path": {"type": "string", "description": "或给工作台里文本文件的相对路径，二选一"},
+                  "title": {"type": "string", "description": "标题栏文字，如「python train.py 的输出」"},
+                  "cols": {"type": "integer", "description": "每行最大字符数（20-120，缺省按内容自适应，最长 90）"},
+                  "out": {"type": "string", "description": "输出 PNG 文件名（缺省 shot-HHMMSS.png）"}
+                }
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "chart_write",
+              "description": "把数据画成图表 PNG：bar（柱状，比多少）、line（折线，看趋势）、pie（饼图，看占比）。y 轴从 0 起、刻度自动取整，柱/线最多 6 个系列、饼图最多 12 个扇区。产物是图，可以插进 docx_write 的 image 块，也可以直接给用户看。数据超过 40 个点或要更复杂的图（散点、双轴）就别硬塞。",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "type": {"type": "string", "description": "bar | line | pie"},
+                  "title": {"type": "string", "description": "图表标题（画在图内左上角，可省略）"},
+                  "labels": {
+                    "type": "array",
+                    "description": "类目名数组：bar/line 是 x 轴每项的名字，pie 是每个扇区的名字",
+                    "items": {"type": "string"}
+                  },
+                  "series": {
+                    "type": "array",
+                    "description": "bar/line 专用：数据系列，每条的 values 数量必须和 labels 一致",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {"type": "string", "description": "系列名（进图例）"},
+                        "values": {"type": "array", "description": "数值数组", "items": {"type": "number"}}
+                      },
+                      "required": ["values"]
+                    }
+                  },
+                  "values": {
+                    "type": "array",
+                    "description": "pie 专用：每个扇区的值（自动算百分比），数量和 labels 一致",
+                    "items": {"type": "number"}
+                  },
+                  "out": {"type": "string", "description": "输出 PNG 文件名（缺省 chart-HHMMSS.png）"}
+                },
+                "required": ["type", "labels"]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "python_run",
+              "description": "在 Linux 环境（Alpine + Python 3 + pip，proot）里运行工作台里的 .py 脚本。适合数据处理、科学计算、画图、爬虫、跑现成的 Python 代码。先用 fs_write 把脚本写进工作台；脚本的工作目录就是工作台，产物（PNG/CSV/xlsx/docx 等）直接写当前目录，再用对应工具接住。要装第三方包：单独写一个脚本调 subprocess.run([\"pip\", \"install\", \"包名\"]) 先装。首次使用会自动联网下载约 16MB 运行环境（几分钟），完成后秒级启动。",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "script": {"type": "string", "description": "脚本相对路径，以 .py 结尾（先用 fs_write 写好）"},
+                  "args": {"type": "array", "items": {"type": "string"}, "description": "命令行参数，最多 20 个"},
+                  "timeout_sec": {"type": "integer", "description": "超时秒数，默认 120，上限 600"}
+                },
+                "required": ["script"]
               }
             }
           },

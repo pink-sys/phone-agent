@@ -35,6 +35,11 @@ import cn.wbphone.agent.Marked
 import cn.wbphone.agent.VoiceText
 import cn.wbphone.agent.FileText
 import cn.wbphone.agent.DocxWriter
+import cn.wbphone.agent.ShotText
+import cn.wbphone.agent.ChartText
+import cn.wbphone.agent.XlsxWriter
+import cn.wbphone.agent.TarGz
+import kotlin.math.abs
 import cn.wbphone.agent.Skill
 import cn.wbphone.agent.TokenInfo
 import cn.wbphone.agent.TokenSource
@@ -1630,7 +1635,7 @@ private fun scenarioWorkbench(base: String) {
     val noBench = PhoneToolbox({ FakeDevice() }, { null })
     result("bench_schema_without", noBench.schemas().length() == 11, noBench.schemas().length().toString())
     val withBench = PhoneToolbox({ FakeDevice() }, { null }, null, bench)
-    result("bench_schema_with", withBench.schemas().length() == 23, withBench.schemas().length().toString())
+    result("bench_schema_with", withBench.schemas().length() == 24, withBench.schemas().length().toString())
 
     val viaToolbox = withBench.execute("fs_write", JSONObject().put("path", "via.txt").put("content", "ok"))
     result("bench_via_toolbox", viaToolbox.text.contains("\"ok\":true"), viaToolbox.text.take(60))
@@ -1649,14 +1654,6 @@ private fun scenarioWorkbench(base: String) {
 
     val pptxFile = File(dir, "报告.pptx")
     result("doc_pptx_exists", pptxFile.exists() && pptxFile.length() > 100, pptxFile.path)
-
-    fun zipText(f: File, entry: String): String =
-        java.util.zip.ZipFile(f).use { z ->
-            z.getInputStream(z.getEntry(entry)).readBytes().toString(Charsets.UTF_8)
-        }
-
-    fun zipNames(f: File): List<String> =
-        java.util.zip.ZipFile(f).use { z -> z.entries().asSequence().map { it.name }.toList() }
 
     val names = zipNames(pptxFile)
     result("doc_pptx_zip_complete",
@@ -1791,7 +1788,7 @@ private fun scenarioWorkbench(base: String) {
         (o != null && o.optString("code") == "UNKNOWN_TOOL") ||
             t.contains("UNSUPPORTED") || t.contains("手机端没有")
     }
-    result("bench_schema_all_routable", declared.size == 23 && unroutable.isEmpty(),
+    result("bench_schema_all_routable", declared.size == 24 && unroutable.isEmpty(),
         "declared=${declared.size} bad=${unroutable.joinToString(",")}")
 
     dir.deleteRecursively()
@@ -3068,8 +3065,9 @@ private fun scenarioFileText() {
     result("ft_route_pdf", FileText.route("报告.pdf") == "pdf", FileText.route("报告.pdf"))
     result("ft_route_docx", FileText.route("合同.docx") == "docx", FileText.route("合同.docx"))
     result("ft_route_pptx", FileText.route("答辩.pptx") == "pptx", FileText.route("答辩.pptx"))
-    result("ft_route_unsupported", FileText.route("报表.xlsx") == "unsupported"
-        && FileText.route("README") == "unsupported", FileText.route("报表.xlsx"))
+    result("ft_route_unsupported", FileText.route("照片.heic") == "unsupported"
+        && FileText.route("README") == "unsupported", FileText.route("照片.heic"))
+    result("ft_route_xlsx", FileText.route("报表.XLSX") == "xlsx", FileText.route("报表.XLSX"))
 
     val dir = createTempDir("ftx")
     // 文本直读 + 截断注明
@@ -3100,9 +3098,9 @@ private fun scenarioFileText() {
     val r4 = FileText.extract(emptyDocx, "empty.docx")
     result("ft_docx_empty_hint", r4.text.contains("抽不出文字"), r4.text.take(50))
 
-    // 不支持的格式：明说支持范围
-    val xls = java.io.File(dir, "报表.xlsx").apply { writeText("fake") }
-    val r5 = FileText.extract(xls, "报表.xlsx")
+    // 不支持的格式：明说支持范围（xlsx 现在能读了，换 heic 当反例）
+    val bin = java.io.File(dir, "数据.bin").apply { writeText("fake") }
+    val r5 = FileText.extract(bin, "数据.bin")
     result("ft_unsupported_msg", r5.kind == "unsupported" && r5.text.contains("暂时读不了")
         && r5.text.contains("pdf"), r5.text.take(50))
 
@@ -3425,6 +3423,477 @@ private fun scenarioHtmlPreview(base: String) {
     dir.deleteRecursively()
 }
 
+/**
+ * text_shot + docx image 块：把「命令输出 → 终端风 PNG → 插进 Word」整条链路跑一遍。
+ *
+ * 像素层在 Android（TextShot），这里注入假引擎（真 PNG 字节，ImageIO 造），
+ * 走的是真 Workbench 分发、真 DocxWriter 装配——错在逻辑层的断言一个都躲不掉。
+ */
+private fun scenarioTextShot() {
+    val dir = File(System.getProperty("java.io.tmpdir") ?: ".", "wb-shot-" + System.nanoTime())
+    dir.mkdirs()
+
+    // ---- ShotText 纯逻辑：宽度、折行、清理
+    result("shot_cjk_width", ShotText.strWidth("中a") == 3 && ShotText.charWidth('中') == 2, "")
+    result("shot_ascii_width", ShotText.strWidth("ab") == 2, "")
+    val wrapped = ShotText.wrap("abcdefghij", 4)
+    result("shot_wrap_hard_break", wrapped.size == 3 && wrapped.all { ShotText.strWidth(it) <= 4 },
+        wrapped.joinToString("|"))
+    val cjk = ShotText.wrap("中文中文中文中文", 5)
+    result("shot_wrap_cjk_not_split", cjk.first() == "中文" && cjk.all { ShotText.strWidth(it) <= 5 },
+        cjk.joinToString("|"))
+    result("shot_sanitize_tab", ShotText.sanitize("a\tb") == "a    b" && ShotText.sanitize("a\u0001b") == "a b",
+        "")
+    result("shot_pick_cols_cap", ShotText.pickCols("x".repeat(200)) == ShotText.MAX_COLS, "")
+
+    // ---- 无引擎：报错 + schema 摘除（和 pdf_write 同一口径）
+    val bare = Workbench(dir)
+    val noEngine = JSONObject(bare.execute("text_shot", JSONObject().put("text", "hi")))
+    result("shot_no_engine_rejected", !noEngine.optBoolean("ok") && noEngine.optString("code") == "NO_ENGINE",
+        noEngine.toString())
+    result("shot_hidden_without_engine",
+        (0 until bare.schemas().length()).none { bare.schemas().getJSONObject(it).getJSONObject("function").optString("name") == "text_shot" },
+        "")
+
+    // ---- 有引擎（假引擎：真 PNG 字节）+ docx image 全链路
+    val bench = Workbench(dir, shotEngine = object : Workbench.ShotEngine {
+        override fun write(out: File, text: String, title: String, cols: Int): String {
+            val img = java.awt.image.BufferedImage(64, 40, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val bos = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(img, "png", bos)
+            out.parentFile?.mkdirs()
+            out.writeBytes(bos.toByteArray())
+            return JSONObject().put("ok", true).put("out", out.name)
+                .put("lines", text.split('\n').size).toString()
+        }
+    })
+    val benchNames = (0 until bench.schemas().length())
+        .map { bench.schemas().getJSONObject(it).getJSONObject("function").optString("name") }
+    result("shot_in_schema_with_engine", "text_shot" in benchNames, "")
+
+    val shot = JSONObject(bench.execute("text_shot", JSONObject()
+        .put("text", "epoch 10 acc=0.93\n中文输出也折得齐")
+        .put("title", "python train.py 的输出")
+        .put("out", "run.png")))
+    result("shot_ok", shot.optBoolean("ok") && File(dir, "run.png").isFile, shot.toString())
+    result("shot_path_relative", shot.optString("path") == "run.png", shot.toString())
+
+    // 直接调 DocxWriter 的尺寸解析（纯函数）：PNG 头 / 认不出
+    val pngBytes = File(dir, "run.png").readBytes()
+    result("shot_png_size_read", pngBytes[0] == 0x89.toByte() && pngBytes.size > 24, "")
+
+    // docx image 块：插刚才的截图，带图注
+    val blocks = org.json.JSONArray()
+        .put(JSONObject().put("type", "p").put("text", "模型训练过程如下"))
+        .put(JSONObject().put("type", "image").put("path", "run.png")
+            .put("width", "80").put("text", "图 1 训练输出"))
+    val doc = JSONObject(bench.execute("docx_write", JSONObject()
+        .put("path", "作业.docx").put("title", "股票涨跌预测").put("blocks", blocks)))
+    result("shot_docx_image_ok", doc.optBoolean("ok"), doc.toString())
+
+    val f = File(dir, "作业.docx")
+    val zip = java.util.zip.ZipFile(f)
+    val media = zip.entries().asSequence().map { it.name }.toList()
+    result("shot_docx_has_media", media.contains("word/media/image1.png"), media.joinToString(","))
+    val docXml = zip.getInputStream(zip.getEntry("word/document.xml")).readBytes().decodeToString()
+    val relsXml = zip.getInputStream(zip.getEntry("word/_rels/document.xml.rels")).readBytes().decodeToString()
+    val ctXml = zip.getInputStream(zip.getEntry("[Content_Types].xml")).readBytes().decodeToString()
+    zip.close()
+    result("shot_docx_drawing", docXml.contains("<wp:extent") && docXml.contains("r:embed=\"rIdImg1\""), "")
+    result("shot_docx_caption", docXml.contains("图 1 训练输出") && docXml.contains("w:jc w:val=\"center\""), "")
+    result("shot_docx_rels", relsXml.contains("Id=\"rIdImg1\"") && relsXml.contains("Target=\"media/image1.png\""), "")
+    result("shot_docx_ct", ctXml.contains("Extension=\"png\""), "")
+
+    // 错误分支：缺图 / 越界 / 认不出格式
+    val missing = JSONObject(bench.execute("docx_write", JSONObject().put("path", "a.docx")
+        .put("blocks", JSONArray().put(JSONObject().put("type", "image").put("path", "nope.png")))))
+    result("shot_docx_img_missing", !missing.optBoolean("ok") && missing.optString("code") == "IMG_MISSING",
+        missing.toString())
+    val outside = JSONObject(bench.execute("docx_write", JSONObject().put("path", "b.docx")
+        .put("blocks", JSONArray().put(JSONObject().put("type", "image").put("path", "../x.png")))))
+    result("shot_docx_img_outside", !outside.optBoolean("ok") && outside.optString("code") == "IMG_OUTSIDE",
+        outside.toString())
+    bench.execute("fs_write", JSONObject().put("path", "fake.png").put("content", "这不是图片"))
+    val badFmt = JSONObject(bench.execute("docx_write", JSONObject().put("path", "c.docx")
+        .put("blocks", JSONArray().put(JSONObject().put("type", "image").put("path", "fake.png")))))
+    result("shot_docx_img_format", !badFmt.optBoolean("ok") && badFmt.optString("code") == "IMG_FORMAT",
+        badFmt.toString())
+
+    // text_shot 的 path 来源与上限
+    bench.execute("fs_write", JSONObject().put("path", "log.txt").put("content", "step 1 ok\nstep 2 ok"))
+    val fromFile = JSONObject(bench.execute("text_shot", JSONObject()
+        .put("path", "log.txt").put("out", "log.png")))
+    result("shot_from_file", fromFile.optBoolean("ok") && File(dir, "log.png").isFile, fromFile.toString())
+    val tooLong = JSONObject(bench.execute("text_shot", JSONObject()
+        .put("text", "x".repeat(Workbench.MAX_SHOT_CHARS + 1))))
+    result("shot_too_long", !tooLong.optBoolean("ok") && tooLong.optString("code") == "TOO_LONG", "")
+
+    dir.deleteRecursively()
+}
+
+/**
+ * xlsx_write + chart_write：表格与图表这两块热路径的闭环。
+ *
+ * xlsx 是纯 JVM 真产物：写出真 .xlsx 再解包断言 XML，并用 OfficeText 读回来——
+ * 写和读走同一个人写的解析器容易「错得对称」，所以读回的断言特意换角度
+ * （数字格、inlineStr、CJK 列宽）验证。
+ * chart 的布局是纯 JVM（坐标可精确断言），像素层注入假引擎只记计划。
+ */
+/** 解包一个 zip 条目的文本（xlsx/docx/pptx 断言共用）。 */
+private fun zipText(f: File, entry: String): String =
+    java.util.zip.ZipFile(f).use { z ->
+        z.getInputStream(z.getEntry(entry)).readBytes().toString(Charsets.UTF_8)
+    }
+
+/** 列出 zip 条目名。 */
+private fun zipNames(f: File): List<String> =
+    java.util.zip.ZipFile(f).use { z -> z.entries().asSequence().map { it.name }.toList() }
+
+private fun scenarioXlsxChart() {
+    val dir = File(System.getProperty("java.io.tmpdir") ?: ".", "wb-xlsx-" + System.nanoTime())
+    dir.mkdirs()
+    val bench = Workbench(dir)
+
+    // ═══════════ xlsx：真写出、真解包、真读回 ═══════════
+
+    val r = JSONObject(bench.execute("xlsx_write", JSONObject()
+        .put("path", "成绩单.xlsx")
+        .put("sheets", JSONArray()
+            .put(JSONObject().put("name", "一班").put("rows", JSONArray()
+                .put(JSONArray().put("姓名").put("分数").put("及格"))
+                .put(JSONArray().put("罗唯珍").put(92.5).put(true))
+                .put(JSONArray().put("李四").put("88").put(false))
+            ))
+            .put(JSONObject().put("name", "统计").put("rows", JSONArray()
+                .put(JSONArray().put("平均分").put(90.25))
+            ))
+        )))
+    result("xlsx_ok", r.optBoolean("ok") && r.optString("path") == "成绩单.xlsx", r.toString().take(160))
+    result("xlsx_counts", r.optInt("sheets") == 2 && r.optInt("rows") == 4 && r.optInt("cells") == 11,
+        r.toString().take(120))
+
+    val xf = File(dir, "成绩单.xlsx")
+    result("xlsx_exists", xf.isFile && xf.length() > 600, if (xf.isFile) xf.length().toString() else "missing")
+    val parts = zipNames(xf)
+    result("xlsx_zip_complete", parts.containsAll(listOf(
+        "[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels", "xl/worksheets/sheet1.xml",
+        "xl/worksheets/sheet2.xml", "xl/styles.xml")), parts.joinToString(","))
+
+    val sheet1 = zipText(xf, "xl/worksheets/sheet1.xml")
+    result("xlsx_inline_str", sheet1.contains("t=\"inlineStr\"") && sheet1.contains("罗唯珍"), sheet1.take(120))
+    // 模型把数字写成字符串 "88" 也要落成数值格（用户才能求和）
+    result("xlsx_number_cell", sheet1.contains("<v>88.0</v>") || sheet1.contains("<v>88</v>"), sheet1.take(160))
+    result("xlsx_number_cell2", sheet1.contains("<v>92.5</v>"), "")
+    result("xlsx_bool_cell", sheet1.contains("t=\"b\"") && sheet1.contains("<v>1</v>") && sheet1.contains("<v>0</v>"), "")
+    result("xlsx_header_bold", sheet1.contains("s=\"1\"") && zipText(xf, "xl/styles.xml").contains("<b/>"), "")
+    result("xlsx_freeze_pane", sheet1.contains("state=\"frozen\"") && sheet1.contains("ySplit=\"1\""), "")
+    result("xlsx_col_width", sheet1.contains("customWidth=\"1\"") && sheet1.contains("width=\""), "")
+    result("xlsx_sheet_ref", zipText(xf, "xl/workbook.xml").contains("name=\"一班\"") &&
+        zipText(xf, "xl/workbook.xml.rels".let { "xl/_rels/workbook.xml.rels" }).contains("sheet1.xml"), "")
+    result("xlsx_ct_types", zipText(xf, "[Content_Types].xml").contains("spreadsheetml.sheet.main+xml"), "")
+
+    // 错误分支：空 sheets、重名、坏扩展名
+    result("xlsx_empty_rejected", bench.execute("xlsx_write", JSONObject()
+        .put("path", "a.xlsx").put("sheets", JSONArray())).contains("BAD_ARGS"), "")
+    result("xlsx_dup_sheet", bench.execute("xlsx_write", JSONObject()
+        .put("path", "b.xlsx")
+        .put("sheets", JSONArray()
+            .put(JSONObject().put("name", "表").put("rows", JSONArray().put(JSONArray().put(1))))
+            .put(JSONObject().put("name", "表").put("rows", JSONArray().put(JSONArray().put(1))))
+        )).contains("BAD_NAME"), "")
+    result("xlsx_bad_ext", bench.execute("xlsx_write", JSONObject()
+        .put("path", "c.xls")
+        .put("sheets", JSONArray().put(JSONObject().put("rows", JSONArray().put(JSONArray().put(1))))
+        )).contains("BAD_EXT"), "")
+
+    // 读回：写的人也是读的人，断言换角度——Markdown 表、行数、截断说明
+    val md = OfficeText.xlsxToMarkdown(xf)
+    result("xlsx_read_back", md != null && md!!.contains("姓名") && md.contains("罗唯珍") &&
+        md.contains("92.5") && md.contains("## 一班") && md.contains("## 统计"),
+        md?.take(120) ?: "null")
+    result("xlsx_read_header_sep", md != null && md!!.contains("| --- |"), "")
+    // TRUE/FALSE 是布尔格的读回；数字 88 被存成数值后读回也是 "88.0" 或 "88"——都可接受
+    result("xlsx_read_bool", md != null && md!!.contains("TRUE") && md.contains("FALSE"), "")
+
+    // 附件通道：FileText 路由到 xlsx 并带出表格
+    val ex = FileText.extract(xf, "成绩单.xlsx")
+    result("xlsx_filetext_route", ex.kind == "xlsx" && ex.text.contains("平均分"), ex.text.take(100))
+
+    // ═══════════ chart：布局纯 JVM，坐标精确断言 ═══════════
+
+    // nice 刻度：整除、2.5 档、以及 max 落在步长中间的关键回归
+    result("chart_ticks_even", ChartText.niceTicks(0.0, 100.0, 5) == listOf(0.0, 25.0, 50.0, 75.0, 100.0),
+        ChartText.niceTicks(0.0, 100.0, 5).toString())
+    val ticks36 = ChartText.niceTicks(0.0, 36.0, 5)
+    result("chart_ticks_cover_max", ticks36.last() >= 36.0 && ticks36.last() % 10.0 == 0.0, ticks36.toString())
+    result("chart_fmt_int", ChartText.fmt(92.0) == "92" && ChartText.fmt(92.5) == "92.5", "")
+
+    val bar = ChartText.plan("bar", "期中成绩", listOf("语文", "数学", "英语"),
+        listOf(ChartText.Series("一班", listOf(92.0, 88.0, 95.0)),
+            ChartText.Series("二班", listOf(85.0, 90.0, 93.0))), null)
+    val barItems = bar.getJSONArray("items")
+    val rects = (0 until barItems.length()).count { barItems.getJSONObject(it).optString("op") == "rect" }
+    result("chart_bar_rects", rects == 6 + 2, "rects=$rects")   // 3 类目×2 系列 + 2 图例色块
+    result("chart_bar_two_series_colors", barItems.toString().contains("#378ADD") &&
+        barItems.toString().contains("#E24B4A"), "")
+    // 刻度必须罩住最大值（92×1.08=99.36 → 顶刻度 ≥100）
+    val texts = (0 until barItems.length()).map { barItems.getJSONObject(it) }
+        .filter { it.optString("op") == "text" && it.optString("color") == "#888780" }
+        .mapNotNull { it.optString("s").toDoubleOrNull() }
+    result("chart_bar_tick_covers_max", texts.isNotEmpty() && texts.max() >= 99.36, texts.toString())
+    result("chart_bar_y_labels", texts.contains(0.0), "")
+
+    val line = ChartText.plan("line", "体温", listOf("周一", "周二", "周三"),
+        listOf(ChartText.Series("体温", listOf(36.5, 37.8, 36.9))), null)
+    val lineItems = line.getJSONArray("items")
+    result("chart_line_poly", (0 until lineItems.length()).any { it.let { i -> lineItems.getJSONObject(i).optString("op") == "poly" } }, "")
+    result("chart_line_dots", (0 until lineItems.length()).count { lineItems.getJSONObject(it).optString("op") == "circle" } == 3, "")
+
+    val pie = ChartText.plan("pie", "支出", listOf("房租", "吃饭", "其他"), emptyList(),
+        listOf(1800.0, 1200.0, 600.0))
+    val pieItems = pie.getJSONArray("items")
+    val sweeps = (0 until pieItems.length()).map { pieItems.getJSONObject(it) }
+        .filter { it.optString("op") == "arc" }.map { it.optDouble("sweep") }
+    result("chart_pie_arcs", sweeps.size == 3 && abs(sweeps.sum() - 360.0) < 0.01, sweeps.toString())
+    result("chart_pie_pct", pieItems.toString().contains("50.0%") && pieItems.toString().contains("33.3%"),
+        pieItems.toString().take(200))
+
+    // 数据错误要有可读的人话，别让模型对堆栈猜
+    val bad1 = runCatching { ChartText.plan("bar", "", listOf("甲", "乙"),
+        listOf(ChartText.Series("s", listOf(1.0))), null) }
+    result("chart_len_mismatch", bad1.exceptionOrNull()?.message?.contains("数量要一致") == true,
+        bad1.exceptionOrNull()?.message ?: "none")
+    val bad2 = runCatching { ChartText.plan("pie", "", listOf("甲", "乙"), emptyList(),
+        listOf(0.0, 0.0)) }
+    result("chart_pie_zero", bad2.exceptionOrNull()?.message?.contains("0") == true,
+        bad2.exceptionOrNull()?.message ?: "none")
+
+    // Workbench 分发：假引擎记计划、真写 PNG；无引擎摘除；BAD_DATA 人话透传
+    val bare = Workbench(dir)
+    result("chart_no_engine", bare.execute("chart_write", JSONObject()
+        .put("type", "bar").put("labels", JSONArray().put("a"))).contains("NO_ENGINE"), "")
+    result("chart_hidden_without_engine",
+        (0 until bare.schemas().length()).none {
+            bare.schemas().getJSONObject(it).getJSONObject("function").optString("name") == "chart_write" }, "")
+
+    val plans = ArrayList<String>()
+    val cbench = Workbench(dir, chartEngine = object : Workbench.ChartEngine {
+        override fun write(out: File, plan: String, width: Int, height: Int): String {
+            plans.add(plan)
+            out.parentFile?.mkdirs()
+            val img = java.awt.image.BufferedImage(width / 8, height / 8, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val bos = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(img, "png", bos)
+            out.writeBytes(bos.toByteArray())
+            return JSONObject().put("ok", true).put("out", out.name).put("width", width).put("height", height).toString()
+        }
+    })
+    val c1 = JSONObject(cbench.execute("chart_write", JSONObject()
+        .put("type", "bar").put("title", "销量").put("out", "销量.png")
+        .put("labels", JSONArray().put("一月").put("二月"))
+        .put("series", JSONArray().put(JSONObject().put("name", "华东")
+            .put("values", JSONArray().put(12).put(34))))))
+    result("chart_dispatch_ok", c1.optBoolean("ok") && c1.optString("path") == "销量.png" &&
+        File(dir, "销量.png").isFile, c1.toString().take(140))
+    result("chart_plan_passed", plans.size == 1 && plans[0].contains("\"op\":\"rect\""), "")
+    result("chart_bad_data_human", cbench.execute("chart_write", JSONObject()
+        .put("type", "bar")
+        .put("labels", JSONArray().put("甲").put("乙"))
+        .put("series", JSONArray().put(JSONObject().put("values", JSONArray().put(1))))
+    ).contains("数量要一致"), "")
+    result("chart_bad_type", cbench.execute("chart_write", JSONObject()
+        .put("type", "scatter").put("labels", JSONArray().put("a"))).contains("BAD_TYPE"), "")
+    val cb = JSONObject(cbench.execute("chart_write", JSONObject()
+        .put("type", "pie").put("labels", JSONArray().put("甲").put("乙"))
+        .put("values", JSONArray().put(1).put(3))))
+    result("chart_pie_via_tool", cb.optBoolean("ok"), cb.toString().take(100))
+
+    // 两个新工具必须在 schema 里（有引擎的 bench）；xlsx 永远在
+    val names = (0 until cbench.schemas().length())
+        .map { cbench.schemas().getJSONObject(it).getJSONObject("function").optString("name") }
+    result("xlsx_in_schema", "xlsx_write" in names, "")
+    result("chart_in_schema_with_engine", "chart_write" in names, "")
+
+    dir.deleteRecursively()
+}
+
+/**
+ * python_run：参数校验 + 引擎分发 + 开关摘除。引擎是假的（记录调用、返回固定 JSON），
+ * 真正的 proot 执行只有真机能测——但模型会踩的每条错误路径都在这层。
+ */
+private fun scenarioPython() {
+    val dir = java.nio.file.Files.createTempDirectory("harness-py").toFile()
+    dir.resolve("job.py").writeText("print('hi')")
+
+    val calls = ArrayList<String>()
+    val fake = object : Workbench.PyEngine {
+        override fun status(): String = "ready"
+        override fun prepare(): String = "ready"
+        override fun run(script: java.io.File, args: List<String>, timeoutSec: Int): String {
+            calls.add(script.name + "|" + args.joinToString(",") + "|" + timeoutSec)
+            return """{"ok":true,"exit":0,"output":"done"}"""
+        }
+    }
+
+    // 1) 开关关着（默认）：schema 里没有它。Workbench 层 17 个工具定义，
+    //    没引擎时摘掉 pdf_write/text_shot/chart_write，py 关着再摘 python_run = 13
+    val off = Workbench(dir)
+    val offNames = (0 until off.schemas().length())
+        .map { off.schemas().getJSONObject(it).getJSONObject("function").optString("name") }
+    result("py_schema_without", "python_run" !in offNames && offNames.size == 13,
+        "size=${offNames.size}")
+    result("py_off_message", off.execute("python_run", JSONObject().put("script", "job.py"))
+        .contains("PYTHON_OFF"), "")
+
+    // 2) 开关开着 + 引擎注入：14 个且含 python_run；正常调用透传 args/timeout
+    val on = Workbench(dir, pyEngine = fake, pyEnabled = { true })
+    val onNames = (0 until on.schemas().length())
+        .map { on.schemas().getJSONObject(it).getJSONObject("function").optString("name") }
+    result("py_schema_with", "python_run" in onNames && onNames.size == 14, "size=${onNames.size}")
+
+    val okRun = JSONObject(on.execute("python_run", JSONObject()
+        .put("script", "job.py")
+        .put("args", JSONArray().put("-u").put("--fast"))
+        .put("timeout_sec", 300)))
+    result("py_run_ok", okRun.optBoolean("ok") && okRun.optString("status") == "ready",
+        okRun.toString().take(120))
+    result("py_run_args_passed", calls.singleOrNull()?.split("|") == listOf("job.py", "-u,--fast", "300"),
+        calls.joinToString(";"))
+
+    // 3) 错误路径
+    result("py_no_script", on.execute("python_run", JSONObject()).contains("BAD_ARGS"), "")
+    result("py_bad_ext", on.execute("python_run", JSONObject().put("script", "job.txt"))
+        .contains("BAD_EXT"), "")
+    result("py_missing", on.execute("python_run", JSONObject().put("script", "nope.py"))
+        .contains("NOT_FOUND"), "")
+
+    // 4) 声明与分发一致：14 个 schema 每一个都有对应实现
+    val declared = (0 until on.schemas().length())
+        .map { on.schemas().getJSONObject(it).getJSONObject("function").optString("name") }
+    val unroutable = declared.filter { n ->
+        on.execute(n, JSONObject()).contains("UNKNOWN_TOOL")
+    }
+    result("py_schema_all_routable", declared.size == 14 && unroutable.isEmpty(),
+        unroutable.joinToString(","))
+
+    dir.deleteRecursively()
+}
+
+/**
+ * TarGz：零依赖解包器。rootfs 就靠它落盘，解析错了 Python 环境就永远装不上，
+ * 所以这里用手工构造的 tar 逐条测：普通文件、目录、符号链接、PAX 长名、硬链接、
+ * 越界路径拒绝、断流报错。
+ */
+private fun scenarioTarGz() {
+    // ---- 手工造 tar：512 头 + 数据 + 结尾零块，gzip 一层
+    fun header(name: String, size: Long, type: Char, link: String = ""): ByteArray {
+        val h = ByteArray(512)
+        name.toByteArray(Charsets.ISO_8859_1).copyInto(h)
+        "0000644\u0000".toByteArray(Charsets.ISO_8859_1).copyInto(h, 100)
+        "0000000\u0000".toByteArray(Charsets.ISO_8859_1).copyInto(h, 108)
+        "0000000\u0000".toByteArray(Charsets.ISO_8859_1).copyInto(h, 116)
+        "%011o\u0000".format(size).toByteArray(Charsets.ISO_8859_1).copyInto(h, 124)
+        "%011o\u0000".format(1731900000L).toByteArray(Charsets.ISO_8859_1).copyInto(h, 136)
+        for (i in 148..155) h[i] = ' '.code.toByte()   // 校验和字段先按空格算
+        h[156] = type.code.toByte()
+        link.toByteArray(Charsets.ISO_8859_1).copyInto(h, 157)
+        "ustar\u000000".toByteArray(Charsets.ISO_8859_1).copyInto(h, 257)
+        var sum = 0L
+        for (b in h) sum += b.toInt() and 0xFF
+        "%06o\u0000 ".format(sum).toByteArray(Charsets.ISO_8859_1).copyInto(h, 148)
+        return h
+    }
+    fun entry(name: String, type: Char, data: ByteArray, link: String = ""): ByteArray {
+        val pad = ByteArray(((512 - data.size % 512) % 512).toInt())
+        return header(name, data.size.toLong(), type, link) + data + pad
+    }
+    fun tarOf(vararg entries: ByteArray): ByteArray {
+        val raw = ByteArray(entries.sumOf { it.size } + 1024)
+        var off = 0
+        for (e in entries) { e.copyInto(raw, off); off += e.size }
+        return raw   // 尾部 1024 字节零块 = 结束符
+    }
+
+    // ---- 1) 基本：文件 + 目录 + 符号链接 + "./" 前缀
+    val basic = tarOf(
+        entry("./lib", '5', ByteArray(0)),
+        entry("./lib/so.conf", '0', "server 1.2".toByteArray()),
+        entry("./bin", '5', ByteArray(0)),
+        entry("./bin/py", '2', ByteArray(0), link = "/lib/python"),
+    )
+    val d1 = java.nio.file.Files.createTempDirectory("harness-tar1").toFile()
+    val n1 = TarGz.extract(java.io.ByteArrayInputStream(gzip(basic)), d1)
+    result("targz_count", n1 == 4, "n=$n1")
+    result("targz_file_content", d1.resolve("lib/so.conf").readText() == "server 1.2", "")
+    result("targz_dir_made", d1.resolve("lib").isDirectory && d1.resolve("bin").isDirectory, "")
+    // symlink：支持链接的环境断言目标；不支持的（桌面无特权）接受空文件兜底
+    val py = d1.resolve("bin/py")
+    val linkOk = try {
+        java.nio.file.Files.readSymbolicLink(py.toPath()).toString() == "/lib/python"
+    } catch (e: Exception) {
+        py.exists() && py.length() == 0L
+    }
+    result("targz_symlink", linkOk, "")
+
+    // ---- 2) PAX 长名（>100 字符的路径走 'x' 扩展头）
+    val longName = "deep/" + "p".repeat(120) + "/final.txt"
+    // PAX 记录格式："{len} path=值\n"，len 是整条记录的字节数（含 len 自身的位数），
+    // 所以位数参与计算，得迭代到收敛
+    var digits = 1
+    var total = 0
+    while (true) {
+        val t = digits + 1 + "path=".length + longName.length + 1
+        if ("$t".length == digits) { total = t; break }
+        digits++
+    }
+    val record = "$total path=$longName\n".toByteArray()
+    val pax = tarOf(
+        entry("", 'x', record),
+        entry("placeholder", '0', "overwritten".toByteArray()),
+    )
+    val d2 = java.nio.file.Files.createTempDirectory("harness-tar2").toFile()
+    val n2 = TarGz.extract(java.io.ByteArrayInputStream(gzip(pax)), d2)
+    result("targz_pax_longname",
+        d2.resolve(longName).isFile && d2.resolve(longName).readText() == "overwritten" &&
+            !d2.resolve("placeholder").exists(), "n=$n2")
+
+    // ---- 3) 硬链接：真身在前，后者复制内容
+    val hard = tarOf(
+        entry("real.txt", '0', "twin".toByteArray()),
+        entry("copy.txt", '1', ByteArray(0), link = "real.txt"),
+    )
+    val d3 = java.nio.file.Files.createTempDirectory("harness-tar3").toFile()
+    TarGz.extract(java.io.ByteArrayInputStream(gzip(hard)), d3)
+    result("targz_hardlink", d3.resolve("copy.txt").readText() == "twin", "")
+
+    // ---- 4) 越界路径拒绝、断流报错
+    val evil = tarOf(entry("../evil.txt", '0', "x".toByteArray()))
+    val escaped = try {
+        val d4 = java.nio.file.Files.createTempDirectory("harness-tar4").toFile()
+        TarGz.extract(java.io.ByteArrayInputStream(gzip(evil)), d4); false
+    } catch (e: TarGz.Bad) { true }
+    result("targz_reject_dotdot", escaped, "")
+
+    val truncated = basic.copyOfRange(0, basic.size - 700)  // 掐掉结尾零块之外还掐进数据
+    val broke = try {
+        val d5 = java.nio.file.Files.createTempDirectory("harness-tar5").toFile()
+        TarGz.extract(java.io.ByteArrayInputStream(gzip(truncated)), d5); false
+    } catch (e: TarGz.Bad) { true }
+    result("targz_truncated_error", broke, "")
+
+    // ---- 5) sanitize 直接单测
+    result("targz_sanitize_strip", TarGz.sanitize("./a//b/") == "a/b", "")
+    result("targz_sanitize_reject", runCatching { TarGz.sanitize("a/../b") }.isFailure, "")
+}
+
+/** gzip 一段字节（测试助手）。 */
+private fun gzip(raw: ByteArray): ByteArray {
+    val out = java.io.ByteArrayOutputStream()
+    java.util.zip.GZIPOutputStream(out).use { it.write(raw) }
+    return out.toByteArray()
+}
+
 fun main(args: Array<String>) {
     val base = args.firstOrNull() ?: "http://127.0.0.1:8799"
     // 第二个参数是可用的 shell 路径，由 test_agent.py 探测后传入
@@ -3436,6 +3905,10 @@ fun main(args: Array<String>) {
         scenarioIntent()
         scenarioSubAgent(base)
         scenarioHtmlPreview(base)
+        scenarioTextShot()
+        scenarioXlsxChart()
+        scenarioPython()
+        scenarioTarGz()
         scenarioPhoneBusy(base)
         scenarioTranscriptRender()
         scenarioErrors()

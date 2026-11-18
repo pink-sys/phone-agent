@@ -63,7 +63,13 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        android:extractNativeLibs="true">
+        <!--
+            extractNativeLibs：把 lib/*.so（包括改名的 proot 全家）在安装时解压到
+            nativeLibraryDir。那个目录应用不可写但可执行，是 Android 10 W^X 限制下
+            唯一合法的自带二进制执行位——Python 环境靠它，见 PyRuntime。
+        -->
 
         <activity
             android:name=".MainActivity"

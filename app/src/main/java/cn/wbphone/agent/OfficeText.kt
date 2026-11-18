@@ -84,6 +84,130 @@ object OfficeText {
         null
     }
 
+    // ══ XLSX ═══════════════════════════════════════════════
+
+    /** 每个 sheet 预览的行数上限——给模型看的数据，不是全量导出。 */
+    private const val XLSX_MAX_ROWS = 200
+
+    /** 预览的列数上限；列名超宽的表撑爆 Markdown 行，先截再给。 */
+    private const val XLSX_MAX_COLS = 20
+
+    /**
+     * xlsx 各 sheet → Markdown 表格。失败返回 null。
+     *
+     * 单元格三种来源都要接：`t="inlineStr"`（我们自己写的产物）、`t="s"`（共享字符串
+     * 索引，Excel/WPS 存的常态）、无 t 的数值/公式缓存 `<v>`。正则解析和上面两个
+     * 函数同一个理由：JVM 测试环境没有 Android 的 pull 解析器。
+     */
+    fun xlsxToMarkdown(f: File): String? = try {
+        ZipFile(f).use { z ->
+            val shared = sharedStrings(z)
+            val wbEntry = z.getEntry("xl/workbook.xml") ?: return null
+            val wb = z.getInputStream(wbEntry).readBytes().toString(Charsets.UTF_8)
+            val rels = sheetTargets(z)
+
+            // workbook 里 sheet 的出现顺序就是用户看到的标签页顺序，别用文件名排序。
+            // sheet 标签是自闭合的（<sheet .../>），正则两种形态都要接。
+            val sheetRe = Regex("<sheet\\s[^>]*?/?>", RegexOption.DOT_MATCHES_ALL)
+            val sheets = sheetRe.findAll(wb).map { m ->
+                Pair(attr(m.value, "name"), attr(m.value, "r:id"))
+            }.toList()
+            if (sheets.isEmpty()) return null
+
+            val sb = StringBuilder("# ${f.name}\n\n")
+            for ((name, rid) in sheets) {
+                val target = rels[rid] ?: continue
+                val path = if (target.startsWith("/")) target.removePrefix("/")
+                else "xl/" + target.removePrefix("xl/")
+                val entry = z.getEntry(path) ?: continue
+                val xml = z.getInputStream(entry).readBytes().toString(Charsets.UTF_8)
+                val table = sheetTable(xml, shared)
+                if (table.isEmpty()) continue
+                sb.append("## ${name.ifBlank { "表格" }}\n\n")
+                for (line in table) sb.append(line).append("\n")
+                sb.append("\n")
+            }
+            val out = sb.toString().trimEnd()
+            if (out.length <= f.name.length + 2) return null
+            out + "\n"
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 共享字符串表 → 按索引取。没有这个部件（全 inlineStr 的文件）返回空表。 */
+    private fun sharedStrings(z: ZipFile): List<String> {
+        val e = z.getEntry("xl/sharedStrings.xml") ?: return emptyList()
+        val xml = z.getInputStream(e).readBytes().toString(Charsets.UTF_8)
+        return Regex("<si[ >].*?</si>", RegexOption.DOT_MATCHES_ALL).findAll(xml).map { m ->
+            // 一个 si 里可能有多个 t（富文本拆 run），全拼起来
+            Regex("<t[ >].*?</t>", RegexOption.DOT_MATCHES_ALL).findAll(m.value)
+                .map { it.value.substringAfter('>').substringBeforeLast('<') }
+                .joinToString("")
+        }.toList()
+    }
+
+    /** workbook 的 rId → sheet 文件路径。 */
+    private fun sheetTargets(z: ZipFile): Map<String, String> {
+        val e = z.getEntry("xl/_rels/workbook.xml.rels") ?: return emptyMap()
+        val xml = z.getInputStream(e).readBytes().toString(Charsets.UTF_8)
+        val out = HashMap<String, String>()
+        // rels 里的 Relationship 是自闭合标签，和 sheet 同一个坑
+        for (m in Regex("<Relationship\\s[^>]*?/?>", RegexOption.DOT_MATCHES_ALL).findAll(xml)) {
+            val id = attr(m.value, "Id")
+            val target = attr(m.value, "Target")
+            if (id.isNotEmpty() && target.isNotEmpty()) out[id] = target
+        }
+        return out
+    }
+
+    /** 一个 sheet 的 XML → Markdown 表行（| a | b | 形式，带截断说明）。 */
+    private fun sheetTable(xml: String, shared: List<String>): List<String> {
+        val rows = ArrayList<List<String>>()
+        val rowRe = Regex("<row[ >].*?</row>", RegexOption.DOT_MATCHES_ALL)
+        val cellRe = Regex("<c[ >].*?</c>|<c[^>]*/>", RegexOption.DOT_MATCHES_ALL)
+        for (rm in rowRe.findAll(xml)) {
+            if (rows.size >= XLSX_MAX_ROWS) break
+            val cells = ArrayList<String>()
+            for (cm in cellRe.findAll(rm.value)) {
+                if (cells.size >= XLSX_MAX_COLS) break
+                val tag = cm.value
+                val type = attr(tag, "t")
+                val text = when (type) {
+                    "inlineStr" -> Regex("<t[ >].*?</t>", RegexOption.DOT_MATCHES_ALL)
+                        .findAll(tag).map { it.value.substringAfter('>').substringBeforeLast('<') }
+                        .joinToString("")
+                    "s" -> tag.substringAfter("<v>").substringBefore("</v>")
+                        .trim().toIntOrNull()?.let { shared.getOrNull(it) } ?: ""
+                    "b" -> if (tag.substringAfter("<v>").substringBefore("</v>").trim() == "1") "TRUE" else "FALSE"
+                    else -> tag.substringAfter("<v>").substringBefore("</v>").trim()
+                }
+                cells.add(xmlUnescape(text).replace("|", "\\|").replace("\n", " ").take(60))
+            }
+            if (cells.isNotEmpty()) rows.add(cells)
+        }
+        if (rows.isEmpty()) return emptyList()
+        val width = rows.maxOf { it.size }
+        val pad = { r: List<String> -> List(width) { r.getOrNull(it) ?: "" } }
+        val out = ArrayList<String>()
+        // Markdown 表头行 + 分隔行 + 数据行；截断要说明，模型拿着半张表不能当全量
+        out.add("| " + pad(rows[0]).joinToString(" | ") + " |")
+        out.add("|" + List(width) { " --- " }.joinToString("|") + "|")
+        for (r in rows.drop(1)) out.add("| " + pad(r).joinToString(" | ") + " |")
+        val rowTotal = Regex("<row[ >]").findAll(xml).count()
+        if (rowTotal > XLSX_MAX_ROWS) {
+            out.add("")
+            out.add("（表格共 $rowTotal 行，只读了前 $XLSX_MAX_ROWS 行；要全量数据让用户导出 CSV）")
+        }
+        return out
+    }
+
+    /** 从一个开标签 XML 里抠属性值（name="..."），带实体不还原——先原样，调用方 unescape。 */
+    private fun attr(tag: String, name: String): String {
+        val m = Regex("$name=\"([^\"]*)\"").find(tag) ?: return ""
+        return m.groupValues[1]
+    }
+
     // ══ ZIP ════════════════════════════════════════════════
 
     /** 压缩包里有什么 → Markdown 清单。 */

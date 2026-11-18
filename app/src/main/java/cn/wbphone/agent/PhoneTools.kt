@@ -159,7 +159,9 @@ class PhoneToolbox(
             // 写坏东西的范围有边界，不需要每次都让人点头。放在闸门之前分发。
             if (name.startsWith("fs_") || name == "web_fetch" || name == "web_search" ||
                 name == "pdf_write" ||
-                name == "pptx_write" || name == "docx_write" || name == "html_preview" ||
+                name == "pptx_write" || name == "docx_write" || name == "xlsx_write" ||
+                name == "chart_write" || name == "html_preview" ||
+                name == "text_shot" || name == "python_run" ||
                 name == "memory_save" || name == "skill_load"
             ) {
                 val bench = workbench

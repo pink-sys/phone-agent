@@ -34,13 +34,14 @@ object FileText {
         "yml", "yaml", "toml", "ini", "conf", "properties", "gradle", "vue", "dart",
     )
 
-    /** 按文件名路由："text" / "docx" / "pptx" / "pdf" / "unsupported"。 */
+    /** 按文件名路由："text" / "docx" / "pptx" / "xlsx" / "pdf" / "unsupported"。 */
     fun route(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase()
         return when (ext) {
             "pdf" -> "pdf"
             "docx" -> "docx"
             "pptx" -> "pptx"
+            "xlsx" -> "xlsx"
             in TEXT_EXT -> "text"
             else -> "unsupported"
         }
@@ -59,9 +60,10 @@ object FileText {
             "text" -> Extracted(kind, cap("【文件 $name】\n" + file.readText(Charsets.UTF_8).trim()))
             "docx" -> Extracted(kind, cap(office(name, OfficeText.docxToMarkdown(file))))
             "pptx" -> Extracted(kind, cap(office(name, OfficeText.pptxToMarkdown(file))))
+            "xlsx" -> Extracted(kind, cap(spreadsheet(name, OfficeText.xlsxToMarkdown(file))))
             "pdf" -> Extracted(kind, "")   // 正文由 Android 侧渲染，这里不给文字
             else -> Extracted(kind, "这个格式（${name.substringAfterLast('.', "?")}）暂时读不了，" +
-                "支持 md/txt/代码/docx/pptx/pdf")
+                "支持 md/txt/代码/docx/pptx/xlsx/pdf")
         }
     }
 
@@ -70,6 +72,16 @@ object FileText {
         val body = md?.trim().orEmpty()
         if (body.isEmpty()) {
             return "文件 $name 里抽不出文字——它多半是扫描件或整页都是图片，请用户换 PDF 版或直接拍照发图。"
+        }
+        return "【文件 $name】\n$body"
+    }
+
+    /** xlsx 抽取失败的口径和 office 不同：空表是常态（模板文件），直说即可。 */
+    private fun spreadsheet(name: String, md: String?): String {
+        val body = md?.trim().orEmpty()
+        if (body.isEmpty()) {
+            return "文件 $name 里没有可读的表格数据（可能是空表或格式特殊）。" +
+                "请用户另存为 CSV 或截图发来。"
         }
         return "【文件 $name】\n$body"
     }

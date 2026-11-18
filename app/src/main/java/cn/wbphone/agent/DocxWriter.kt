@@ -121,12 +121,30 @@ object DocxWriter {
         return sb.toString()
     }
 
+    /** 单张图片上限。截图/图表远用不到这么大，超了多半是塞错文件。 */
+    const val MAX_IMG_BYTES = 8_000_000
+
+    /** A4 去掉页边距后的正文区（twips）与 EMU（1 twip = 635 EMU，1 cm = 360000 EMU）。 */
+    private const val CONTENT_W_TW = PAGE_W - 1418 * 2   // 9070
+    private const val CONTENT_H_TW = PAGE_H - 1418 * 2   // 14002
+    private const val TWIP_EMU = 635L
+    private const val CM_EMU = 360_000L
+    private const val PX96_EMU = 9_525L                  // 96dpi 下 1px 的 EMU
+
     /**
      * 生成一份 .docx。返回 JSON 文本（和 Workbench 里其它工具一个口径）。
-     * blocks 里每项 {type, text}，type ∈ h1/h2/h3/p/bullet/quote/pagebreak/spacer；
+     * blocks 里每项 {type, text}，type ∈ h1/h2/h3/p/bullet/quote/pagebreak/spacer/image；
      * 可选样式字段 font / ascii / size / bold / align / line（见 [styleOf]）。
+     * image 块 {type:"image", path:"shot.png", width?, text?(图注)}——path 相对 [baseDir]
+     * （工作台根），baseDir 为 null 时给 image 块直接报错。
      */
-    fun write(out: File, title: String, blocks: JSONArray, titleStyle: JSONObject? = null): String {
+    fun write(
+        out: File,
+        title: String,
+        blocks: JSONArray,
+        titleStyle: JSONObject? = null,
+        baseDir: File? = null,
+    ): String {
         if (blocks.length() == 0) {
             return err("EMPTY", "blocks 不能为空。至少给一块 {type:\"h1\", text:\"...\"}")
         }
@@ -142,6 +160,11 @@ object DocxWriter {
         }
 
         val body = StringBuilder()
+        // 图片块收集：文档部件里除了字符串还要塞二进制（word/media/*），
+        // 关系表也不再是固定的两条——都要等块扫完才知道，所以先攒后装。
+        val media = ArrayList<Pair<String, ByteArray>>()      // zipName → bytes
+        val imageRels = ArrayList<Pair<String, String>>()     // rId → target
+        var docPrId = 0
         val t = title.trim()
         if (t.isNotEmpty()) body.append(titlePara(t, titleStyle?.let { styleOf(it) }))
         var headings = 0
@@ -162,6 +185,40 @@ object DocxWriter {
                 "quote" -> if (text.isNotEmpty()) body.append(quotePara(text, st))
                 "pagebreak", "page_break" -> body.append(PAGE_BREAK)
                 "spacer", "blank" -> body.append("<w:p/>")
+                "image", "img", "picture" -> {
+                    if (baseDir == null) {
+                        return err("NO_BASE", "image 块需要工作台（找不到图片解析基准目录）")
+                    }
+                    val imgPath = (b.optString("path", "").ifEmpty { text }).trim()
+                    if (imgPath.isEmpty()) {
+                        return err("BAD_IMG", "image 块要给 path（工作台里图片的相对路径）")
+                    }
+                    val f = runCatching { File(baseDir, imgPath).canonicalFile }.getOrNull()
+                    val rootPath = baseDir.canonicalFile.path
+                    if (f == null || (f.path != rootPath && !f.path.startsWith(rootPath + File.separator))) {
+                        return err("IMG_OUTSIDE", "图片路径越界：$imgPath。只能引用工作台目录内的图片")
+                    }
+                    if (!f.isFile) {
+                        return err("IMG_MISSING", "图片不存在：$imgPath。先有图再插（text_shot / 截图保存到工作台）")
+                    }
+                    val bytes = runCatching { f.readBytes() }.getOrNull()
+                    if (bytes == null || bytes.isEmpty()) {
+                        return err("IMG_MISSING", "图片读不出来：$imgPath")
+                    }
+                    if (bytes.size > MAX_IMG_BYTES) {
+                        return err("IMG_TOO_BIG", "图片超过 ${MAX_IMG_BYTES / 1_000_000}MB：$imgPath。压一压或换小图")
+                    }
+                    val dim = imageSize(bytes)
+                        ?: return err("IMG_FORMAT", "认不出图片格式（只支持 PNG / JPEG）：$imgPath")
+                    val ext = if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) "jpg" else "png"
+                    val idx = media.size + 1
+                    val rid = "rIdImg$idx"
+                    media.add("word/media/image$idx.$ext" to bytes)
+                    imageRels.add(rid to "media/image$idx.$ext")
+                    docPrId++
+                    body.append(imagePara(imgSizeEmu(dim, b.optString("width").trim()), dim,
+                        docPrId, rid, f.name, text, st))
+                }
                 else -> if (text.isNotEmpty()) body.append(bodyPara(text))
             }
         }
@@ -170,21 +227,25 @@ object DocxWriter {
             return err("EMPTY", "所有块都是空的。给 type 和 text，至少一段正文")
         }
 
-        val entries = LinkedHashMap<String, String>()
+        val entries = LinkedHashMap<String, Any>()
         entries["[Content_Types].xml"] = contentTypes()
         entries["_rels/.rels"] = rootRels()
         entries["docProps/core.xml"] = coreProps(t.ifEmpty { out.nameWithoutExtension })
         entries["word/document.xml"] = document(body.toString())
-        entries["word/_rels/document.xml.rels"] = documentRels()
+        entries["word/_rels/document.xml.rels"] = documentRels(imageRels)
         entries["word/styles.xml"] = styles()
         entries["word/numbering.xml"] = numbering()
+        for ((name, bytes) in media) entries[name] = bytes
 
         try {
             out.parentFile?.mkdirs()
             ZipOutputStream(out.outputStream().buffered()).use { zip ->
                 for ((name, content) in entries) {
                     zip.putNextEntry(ZipEntry(name))
-                    zip.write(content.toByteArray(Charsets.UTF_8))
+                    when (content) {
+                        is String -> zip.write(content.toByteArray(Charsets.UTF_8))
+                        is ByteArray -> zip.write(content)
+                    }
                     zip.closeEntry()
                 }
             }
@@ -199,7 +260,8 @@ object DocxWriter {
             .put("blocks", blocks.length())
             .put("bytes", out.length())
             .put("note", "DOCX 已生成（A4、1.5 倍行距、正文首行缩进两字、标题带大纲级别，WPS/Word 可直接编辑；" +
-                "块上可用 font/size/bold/align/line 逐段指定字体字号行距对齐）。" +
+                "块上可用 font/size/bold/align/line 逐段指定字体字号行距对齐；" +
+                "image 块插工作台图片，text 当图注）。" +
                 "共 $words 字。" +
                 "要图表或精确分页改 pdf_write；要演示文稿改 pptx_write")
             .toString()    }
@@ -312,23 +374,137 @@ object DocxWriter {
             "</w:pPr>" + runs(text, color = QUOTE_INK, st = st) + "</w:p>"
     }
 
+    // ------------------------------------------------------------ 图片
+
+    /**
+     * 从字节头读图片像素尺寸，返回 [宽, 高]，认不出返回 null。
+     * 纯手写解析，不引任何库：PNG 读 IHDR（偏移 16/20 的大端 32 位）；
+     * JPEG 扫 SOFn 段（0xC0–0xCF，挖掉 0xC4/0xC8/0xCC 这三个不是 SOF 的）。
+     */
+    private fun imageSize(bytes: ByteArray): IntArray? {
+        if (bytes.size < 24) return null
+        // PNG 签名 89 50 4E 47 0D 0A 1A 0A
+        if (bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() &&
+            bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
+        ) {
+            return intArrayOf(be32(bytes, 16), be32(bytes, 20))
+        }
+        // JPEG：FF D8 开头，逐段走，找到 SOF 里的尺寸为止
+        if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) {
+            var i = 2
+            while (i + 9 < bytes.size) {
+                if (bytes[i] != 0xFF.toByte()) { i++; continue }
+                val m = bytes[i + 1].toInt() and 0xFF
+                if (m == 0xD8 || m == 0x01 || (m in 0xD0..0xD7)) { i += 2; continue }   // 无长度段
+                if (m == 0xD9) break                                                    // EOI
+                val len = be16(bytes, i + 2)
+                if (m in 0xC0..0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                    return intArrayOf(be16(bytes, i + 7), be16(bytes, i + 5))
+                }
+                i += 2 + len
+            }
+        }
+        return null
+    }
+
+    private fun be32(b: ByteArray, off: Int): Int =
+        ((b[off].toInt() and 0xFF) shl 24) or ((b[off + 1].toInt() and 0xFF) shl 16) or
+            ((b[off + 2].toInt() and 0xFF) shl 8) or (b[off + 3].toInt() and 0xFF)
+
+    private fun be16(b: ByteArray, off: Int): Int =
+        ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
+
+    /**
+     * 算显示尺寸（EMU）。规则：
+     * - 没给 width：按 96dpi 的原生大小放；比正文区还宽的（手机截图都这样）缩到正文宽。
+     *   小图不放大——放大只会糊。
+     * - 给了 width：数字按「正文宽的百分比」算，带 cm 按厘米算；都钳在正文区以内。
+     * 高一律按原图比例出，不认 height——强行改比例会把截图拉变形。
+     */
+    private fun imgSizeEmu(dim: IntArray, widthRaw: String): LongArray {
+        val maxW = CONTENT_W_TW * TWIP_EMU
+        val maxH = CONTENT_H_TW * TWIP_EMU
+        val (pw, ph) = dim[0].coerceAtLeast(1) to dim[1].coerceAtLeast(1)
+        var cx = if (widthRaw.isEmpty()) {
+            val native = pw * PX96_EMU
+            if (native > maxW) maxW else native
+        } else {
+            val cm = Regex("([\\d.]+)\\s*cm", RegexOption.IGNORE_CASE).find(widthRaw)?.groupValues?.get(1)
+                ?.toDoubleOrNull()
+            if (cm != null) (cm * CM_EMU).toLong()
+            else {
+                val pct = Regex("(\\d+(?:\\.\\d+)?)").find(widthRaw)!!.groupValues[1].toDouble()
+                    .coerceIn(1.0, 100.0)
+                (maxW * pct / 100.0).toLong()
+            }
+        }
+        var cy = (cx.toDouble() * ph / pw).toLong()
+        if (cy > maxH) { cy = maxH; cx = (maxH.toDouble() * pw / ph).toLong() }
+        return longArrayOf(cx, cy)
+    }
+
+    /**
+     * 图片段：居中的 inline drawing。子元素顺序是 schema 定死的，照 OOXML 规范拼——
+     * 这块写错 Word 会弹「内容有问题」的修复提示。text 非空时底下跟一行居中小字图注。
+     */
+    private fun imagePara(
+        emu: LongArray,
+        dim: IntArray,
+        docPrId: Int,
+        rid: String,
+        name: String,
+        caption: String,
+        @Suppress("UNUSED_PARAMETER") st: BlockStyle?,
+    ): String {
+        val (cx, cy) = emu[0] to emu[1]
+        val drawing = "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:drawing>" +
+            "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">" +
+            "<wp:extent cx=\"$cx\" cy=\"$cy\"/>" +
+            "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>" +
+            "<wp:docPr id=\"$docPrId\" name=\"${esc(name)}\"/>" +
+            "<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect=\"1\"/></wp:cNvGraphicFramePr>" +
+            "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">" +
+            "<pic:pic>" +
+            "<pic:nvPicPr><pic:cNvPr id=\"$docPrId\" name=\"${esc(name)}\"/><pic:cNvPicPr/></pic:nvPicPr>" +
+            "<pic:blipFill><a:blip r:embed=\"$rid\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>" +
+            "<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"$cx\" cy=\"$cy\"/></a:xfrm>" +
+            "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>" +
+            "</pic:pic></a:graphicData></a:graphic></wp:inline>" +
+            "</w:drawing></w:r></w:p>"
+        if (caption.isEmpty()) return drawing
+        // 图注：居中、小五、灰、不缩进（给它自己的 pPr，不走 bodyPara 的首行缩进）
+        return drawing +
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"160\"/><w:jc w:val=\"center\"/></w:pPr>" +
+            runs(caption, size = 18, color = QUOTE_INK, st = BlockStyle(
+                null, null, 18, false, "center", null, true)) + "</w:p>"
+    }
+
     // ------------------------------------------------------------ 部件
 
     private fun document(body: String): String =
         """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>$body<w:sectPr><w:pgSz w:w="$PAGE_W" w:h="$PAGE_H"/><w:pgMar w:top="1418" w:right="1418" w:bottom="1418" w:left="1418" w:header="851" w:footer="992" w:gutter="0"/><w:cols w:space="425"/><w:docGrid w:type="lines" w:linePitch="312"/></w:sectPr></w:body></w:document>"""
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>$body<w:sectPr><w:pgSz w:w="$PAGE_W" w:h="$PAGE_H"/><w:pgMar w:top="1418" w:right="1418" w:bottom="1418" w:left="1418" w:header="851" w:footer="992" w:gutter="0"/><w:cols w:space="425"/><w:docGrid w:type="lines" w:linePitch="312"/></w:sectPr></w:body></w:document>"""
 
     private fun contentTypes(): String =
         """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>"""
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>"""
 
     private fun rootRels(): String =
         """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>"""
 
-    private fun documentRels(): String =
-        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>"""
+    /** 图片关系接在固定的 rId1/rId2 之后（rIdImgN），互不冲突。 */
+    private fun documentRels(images: List<Pair<String, String>> = emptyList()): String {
+        val sb = StringBuilder(
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"""
+        )
+        for ((rid, target) in images) {
+            sb.append("<Relationship Id=\"$rid\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"$target\"/>")
+        }
+        sb.append("</Relationships>")
+        return sb.toString()
+    }
 
     private fun coreProps(title: String): String =
         """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

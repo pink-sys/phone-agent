@@ -1522,8 +1522,9 @@ class MainActivity : Activity(), AgentHost.Listener {
             background = Ui.circle(this@MainActivity, if (accessibilityOn) Ui.OK else Ui.WARN, 7)
         }, LinearLayout.LayoutParams(dp(7), dp(7)).apply { rightMargin = dp(9) })
         status.addView(Ui.text(this,
-            "手机操控 " + (if (accessibilityOn) "已开启" else "未开启") +
-                " · 命令行 " + (if (settings.shellOn) "开" else "关"),
+                "手机操控 " + (if (accessibilityOn) "已开启" else "未开启") +
+                " · 命令行 " + (if (settings.shellOn) "开" else "关") +
+                " · Python " + (if (settings.pyOn) "开" else "关"),
             12f, Ui.INK3))
         account.addView(status)
         body.addView(account, Ui.margin(this, bottom = 18))
@@ -1610,6 +1611,11 @@ class MainActivity : Activity(), AgentHost.Listener {
                 if (settings.shellOn) "已打开" else "已关闭") {
                 toggleShell()
                 if (settingsShowing) showSettings()   // 值变了，整页重画
+            },
+            settingsRow("⌗", Ui.BRAND_BG, Ui.ON_BRAND_BG, "Python 环境",
+                pyStatusText()) {
+                togglePy()
+                if (settingsShowing) showSettings()
             },
         )), Ui.margin(this, bottom = 18))
 
@@ -1898,10 +1904,11 @@ class MainActivity : Activity(), AgentHost.Listener {
                 )
                 return
             }
-            if (ext in setOf("pptx", "docx", "zip")) {
+            if (ext in setOf("pptx", "docx", "xlsx", "zip")) {
                 val md = when (ext) {
                     "pptx" -> OfficeText.pptxToMarkdown(f)
                     "docx" -> OfficeText.docxToMarkdown(f)
+                    "xlsx" -> OfficeText.xlsxToMarkdown(f)
                     else -> OfficeText.zipToMarkdown(f)
                 }
                 if (md != null) {
@@ -2081,6 +2088,45 @@ class MainActivity : Activity(), AgentHost.Listener {
             }
             .setNegativeButton("算了", null)
             .show()
+    }
+
+    /**
+     * Python 环境开关。
+     *
+     * 关闭直接关（不删已下载的 rootfs——重新开不用再下载几十 MB）；
+     * 开启要过一个说人话的确认：首次使用会下载约 16MB 运行环境。
+     */
+    private fun togglePy() {
+        if (settings.pyOn) {
+            settings.pyOn = false
+            toast("已关闭：助手不能跑 Python 了（已下载的环境保留）")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("打开 Python 环境？")
+            .setMessage(
+                "打开后，助手可以在一个完整的 Linux 环境（Alpine + Python 3 + pip）里运行脚本，" +
+                    "数据处理、画图、跑现成的 .py 代码都会更顺手。\n\n" +
+                    "首次使用会自动在 Wi-Fi/流量下下载约 16MB 的运行环境（下载后占用约 60MB 存储）。" +
+                    "全程没有 root 权限，只能在应用自己的目录里活动。"
+            )
+            .setPositiveButton("打开") { _, _ ->
+                settings.pyOn = true
+                toast("已打开。模型下次需要时会自动准备环境")
+            }
+            .setNegativeButton("算了", null)
+            .show()
+    }
+
+    /** 设置行上 Python 的状态小字。 */
+    private fun pyStatusText(): String {
+        if (!settings.pyOn) return "已关闭"
+        val dir = java.io.File(filesDir, "rootfs")
+        return when {
+            java.io.File(dir, "pyver.txt").isFile -> "已就绪"
+            dir.isDirectory -> "准备中"
+            else -> "待下载（约 16MB）"
+        }
     }
 
     /** 删单个文件：确认一次再动手，删完好回列表。 */
@@ -3026,7 +3072,11 @@ class MainActivity : Activity(), AgentHost.Listener {
         "pdf_write" -> "生成 PDF"
         "pptx_write" -> "生成 PPT"
         "docx_write" -> "生成 Word"
+        "xlsx_write" -> "生成表格"
+        "chart_write" -> "画图表"
+        "python_run" -> "跑 Python"
         "html_preview" -> "渲染网页"
+        "text_shot" -> "生成运行截图"
         "memory_save" -> "记到长期记忆"
         "skill_load" -> "加载技能"
         "task" -> "派子代理"
@@ -3050,6 +3100,10 @@ class MainActivity : Activity(), AgentHost.Listener {
         "pdf_write" -> "正在生成 PDF…"
         "pptx_write" -> "正在生成 PPT…"
         "docx_write" -> "正在生成 Word…"
+        "xlsx_write" -> "正在生成表格…"
+        "chart_write" -> "正在画图…"
+        "python_run" -> "正在跑 Python…"
+        "text_shot" -> "正在生成运行截图…"
         "memory_save" -> "正在记下…"
         "skill_load" -> "正在翻技能…"
         "task" -> "正在派子代理查…"

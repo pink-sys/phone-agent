@@ -72,6 +72,14 @@ CORE_FILES = [
     "SubAgent.kt",
     # HTML 渲染的本机回环 HTTP 服务（纯 JVM，能真起真连）
     "ArtifactServer.kt",
+    # 文本截图的排版层（纯 JVM）：折行/列宽在 harness 里跑真断言
+    "ShotText.kt",
+    # xlsx 生成与读取（纯 JVM 真产物，harness 里解包断言）
+    "XlsxWriter.kt",
+    # 图表的布局层（纯 JVM）：刻度/坐标在 harness 里跑真断言；ChartShot 是 Android 像素层
+    "ChartText.kt",
+    # tar.gz 解包器（纯 JVM）：Python rootfs 就靠它落盘，头解析/越界拒绝在 harness 里真断言
+    "TarGz.kt",
 ]
 
 try:
@@ -841,6 +849,42 @@ def static_checks():
           and "HtmlPreview.build" in src("MainActivity.kt")
           and "ArtifactServer.start" in src("MainActivity.kt"),
           "渲染链路有断点：写完网页用户看不到")
+    check("text_shot 全链路接线（schema + 引擎注入 + 白名单 + 产物卡 + 插图链路）",
+          '"name": "text_shot"' in wb and '"text_shot" -> textShot' in wb
+          and "shotEngine = TextShot" in src("AgentHost.kt")
+          and '"text_shot"' in src("PhoneTools.kt")
+          and '"text_shot"' in src("AgentLoop.kt")
+          and '"name": "text_shot"' in wb and '"image", "img", "picture"' in src("DocxWriter.kt")
+          and "ShotText.wrap" in src("TextShot.kt"),
+          "运行截图链路有断点：跑完命令出不了图")
+    check("xlsx_write 全链路接线（schema + 分发 + 附件读取 + 预览 + 白名单）",
+          '"name": "xlsx_write"' in wb and '"xlsx_write" -> xlsxWrite' in wb
+          and "XlsxWriter.write" in wb
+          and '"xlsx"' in src("FileText.kt") and "xlsxToMarkdown" in src("OfficeText.kt")
+          and '"xlsx_write"' in src("PhoneTools.kt") and '"xlsx_write"' in src("AgentLoop.kt")
+          and '"xlsx" -> OfficeText.xlsxToMarkdown' in src("MainActivity.kt"),
+          "表格链路有断点：写出的 xlsx 用户读不到")
+    check("chart_write 全链路接线（schema + 分发 + 引擎注入 + 白名单 + 布局层存在）",
+          '"name": "chart_write"' in wb and '"chart_write" -> chartWrite' in wb
+          and "chartEngine = ChartShot" in src("AgentHost.kt")
+          and '"chart_write"' in src("PhoneTools.kt") and '"chart_write"' in src("AgentLoop.kt")
+          and "ChartText.plan" in wb and "fun niceTicks" in src("ChartText.kt"),
+          "图表链路有断点：数据画不出图")
+    py = src("PyRuntime.kt")
+    check("python_run 的 NOT_READY 分四种情形给准确口径（started/downloading/stalled）",
+          '"started"' in py and '"downloading"' in py and '"stalled"' in py
+          and "已下载" in py and "现在重试没有用" in py,
+          "下载状态口径又含糊了，模型会反复调用陷入长思考")
+    check("下载看门狗在位（进度时间戳 + 卡死掐断连接），否则死连接占锁挡住所有重试",
+          "STALL_MS" in py and "lastProgressAt" in py and "currentConn?.disconnect()" in py
+          and "progressBytes" in py,
+          "下载卡死时用户换网络也没法重试")
+    check("rootfs 直连源在前、镜像兜底（仓库已公开，直连实测可用；ghfast 常整站失联）",
+          py.index('"https://github.com/pink-sys') < py.index("ghfast.top"),
+          "下载源顺序不对：ghfast 不稳，不该排第一")
+    check("注释写明仓库必须公开（私有仓库 release 匿名一律 404，真机踩过）",
+          "私有仓库的 release 匿名一律 404" in py,
+          "私有仓库 404 的教训没写进注释，下次还会踩")
     check("搜索页用桌面 UA（移动版 HTML 解析不稳）",
           "UA_DESKTOP" in wb and "searchFetcher" in wb)
     check("百度排第一（必应对国内长尾内容基本给噪声，实测）",
@@ -2001,6 +2045,36 @@ def main():
         "html_preview_in_schema", "srv_start", "srv_index_ok", "srv_html_mime",
         "srv_css_mime", "srv_404", "srv_escape_blocked",
         "html_open_fired", "html_card_fired", "html_final_text",
+        # 运行结果截图：文本→PNG→docx image 全链路
+        "shot_cjk_width", "shot_ascii_width", "shot_wrap_hard_break",
+        "shot_wrap_cjk_not_split", "shot_sanitize_tab", "shot_pick_cols_cap",
+        "shot_no_engine_rejected", "shot_hidden_without_engine",
+        "shot_in_schema_with_engine", "shot_ok", "shot_path_relative",
+        "shot_png_size_read", "shot_docx_image_ok", "shot_docx_has_media",
+        "shot_docx_drawing", "shot_docx_caption", "shot_docx_rels", "shot_docx_ct",
+        "shot_docx_img_missing", "shot_docx_img_outside", "shot_docx_img_format",
+        "shot_from_file", "shot_too_long",
+        # xlsx：真写出解包断言 + OfficeText 读回 + FileText 路由
+        "xlsx_ok", "xlsx_counts", "xlsx_exists", "xlsx_zip_complete",
+        "xlsx_inline_str", "xlsx_number_cell", "xlsx_number_cell2", "xlsx_bool_cell",
+        "xlsx_header_bold", "xlsx_freeze_pane", "xlsx_col_width", "xlsx_sheet_ref",
+        "xlsx_ct_types", "xlsx_empty_rejected", "xlsx_dup_sheet", "xlsx_bad_ext",
+        "xlsx_read_back", "xlsx_read_header_sep", "xlsx_read_bool", "xlsx_filetext_route",
+        # chart：布局层坐标断言 + Workbench 分发/摘除/人话错误
+        "chart_ticks_even", "chart_ticks_cover_max", "chart_fmt_int",
+        "chart_bar_rects", "chart_bar_two_series_colors", "chart_bar_tick_covers_max",
+        "chart_bar_y_labels", "chart_line_poly", "chart_line_dots",
+        "chart_pie_arcs", "chart_pie_pct", "chart_len_mismatch", "chart_pie_zero",
+        "chart_no_engine", "chart_hidden_without_engine", "chart_dispatch_ok",
+        "chart_plan_passed", "chart_bad_data_human", "chart_bad_type",
+        "chart_pie_via_tool", "xlsx_in_schema", "chart_in_schema_with_engine",
+        # python_run：开关/校验/分发 + TarGz 解包器真断言
+        "py_schema_without", "py_off_message", "py_schema_with", "py_run_ok",
+        "py_run_args_passed", "py_no_script", "py_bad_ext", "py_missing",
+        "py_schema_all_routable",
+        "targz_count", "targz_file_content", "targz_dir_made", "targz_symlink",
+        "targz_pax_longname", "targz_hardlink", "targz_reject_dotdot",
+        "targz_truncated_error", "targz_sanitize_strip", "targz_sanitize_reject",
     ]
     for name in expected:
         ok, detail = results.get(name, (False, "断言没有执行"))

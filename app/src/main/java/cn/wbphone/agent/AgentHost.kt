@@ -103,6 +103,14 @@ object AgentHost {
             shellEnabled = { isShellOn() },
             // PDF 引擎（PdfDocument 是 Android API，只能在真机注入；桌面测试为 null 时 pdf_write 自动摘除）
             docEngine = PdfDoc.Engine,
+            // 文本截图引擎（Bitmap/Canvas 同理只能真机注入；null 时 text_shot 自动摘除）
+            shotEngine = TextShot,
+            // 图表引擎（布局在纯 JVM 的 ChartText，这里只画像素；null 时 chart_write 摘除）
+            chartEngine = ChartShot,
+            // Python 引擎：proot + Alpine rootfs（so 在 jniLibs，rootfs 首次使用时下载）。
+            // 引擎常驻注入（isPyOn 挡住开关），status/下载由引擎自己管。
+            pyEngine = PyRuntime(appContext, workDir()),
+            pyEnabled = { isPyOn() },
         )
 
         toolbox = PhoneToolbox(
@@ -983,6 +991,9 @@ object AgentHost {
      * `settings.shellOn` 会报「smart cast 不可能」——可变属性在 lambda 里无法保证非空。
      */
     private fun isShellOn(): Boolean = settings?.shellOn == true
+
+    /** 同 [isShellOn]：lambda 里拿不到 settings 的 smart cast，包一层。 */
+    private fun isPyOn(): Boolean = settings?.pyOn == true
 
     /**
      * 模型给的是「微信」这种中文名，系统要的是包名。

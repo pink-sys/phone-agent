@@ -32,7 +32,7 @@
 
 ## 下载安装
 
-到 [Releases](https://github.com/pink-sys/phone-agent/releases) 下载 `yueshu-1.0.0.apk`
+到 [Releases](https://github.com/pink-sys/phone-agent/releases) 下载 `yuesu-1.0.0.apk`
 传到手机上安装，打开后**先登录**（见下节），再按 App 内的引导开启三项权限：
 **无障碍服务**（手和眼）、**悬浮窗**（任务跑到别的应用上时显示状态胶囊）、**通知**（审批提醒）。
 
@@ -42,7 +42,7 @@
 - 每个 Release 都附 SHA-256，下载后可以自己核对：
 
   ```bash
-  sha256sum yueshu-1.0.0.apk     # Windows: certutil -hashfile yueshu-1.0.0.apk SHA256
+  sha256sum yuesu-1.0.0.apk     # Windows: certutil -hashfile yuesu-1.0.0.apk SHA256
   ```
 
 ---
@@ -175,16 +175,34 @@ App     GET  /v2/plugin/auth/token?state=…  每 1 秒问一次，拿到 access
 - **额度 3 次/任务**：每个子代理都是真金白银的若干轮请求，用完就让它用现有工具自己做。
 - token 也记账：子代理烧的算进本轮用量，界面上的数字才和账单对得上。
 
-### 工作台（14 个）
+### 工作台（17 个）
 
 `fs_list` `fs_read` `fs_write` `fs_edit` `fs_search` `web_search` `web_fetch`
-`pdf_write` `pptx_write` `docx_write` `html_preview` `memory_save` `skill_load` `shell`（默认关闭）
+`pdf_write` `pptx_write` `docx_write` `xlsx_write` `chart_write` `text_shot` `html_preview` `memory_save` `skill_load` `shell`（默认关闭）
 
 - **HTML 渲染**：写完网页调 `html_preview`，App 内置 WebView 全屏渲染
   （localStorage、相对路径的 css/js/图片都可用）。页面经本机回环 HTTP 服务
   （`ArtifactServer`，只绑 127.0.0.1）加载，产物卡的「↗」对网页文件也是直接
-  拉起系统浏览器打开同一个地址——**不走红 #content:// 分享**，实测手机浏览器
+  拉起系统浏览器打开同一个地址——**不走 content:// 分享**，实测手机浏览器
   拿到 content:// 会把它整段当搜索词发给搜索引擎，根本打不开。
+
+- **运行结果截图**：`text_shot` 把一段文字渲染成终端风格的 PNG（黑底等宽字、
+  mac 风格标题栏）。跑完命令/拿到日志/算出结果后把关键输出原文给它，产出一张
+  可以插进文档的证据图；折行按 CJK 双宽计算（`ShotText`，纯 JVM 可测），
+  像素层 `TextShot`（Bitmap/Canvas，真机注入，桌面测试给假引擎走全链路）。
+  配合 `docx_write` 的 **image 块**（`{type:"image", path, width?, text?(图注)}`）
+  就能生成「代码 + 运行结果截图」这种格式的 Word 作业文档：
+  PNG/JPEG 尺寸手写解析（PNG IHDR / JPEG SOF 扫描），按 96dpi 原生大小放、
+  超过正文区缩到页宽，小图不放大。
+
+- **表格与图表**：`xlsx_write` 生成可编辑的 .xlsx（inlineStr 免共享字符串表，
+  首行加粗冻结、列宽按 CJK 宽度自适应、数字存数值格——模型把数字写成
+  `"123"` 字符串也会转成数值）；`xlsx` 附件同样能读（`OfficeText.xlsxToMarkdown`，
+  inlineStr / sharedStrings / 数值三种单元格都接，每个 sheet 预览 200 行），
+  产物卡点开是 Markdown 表格预览。`chart_write` 把数据画成 bar/line/pie PNG：
+  布局层 `ChartText`（纯 JVM 可测，nice 刻度 1/2/2.5/5×10^k，y 轴从 0 起防轴截断
+  撒谎，CJK 文字估宽），像素层 `ChartShot` 只按绘制计划照单画五种图元
+  （rect/line/poly/circle/arc/text），两层契约越笨越不出「测试过、真机歪」。
 
 - 联网搜索：`web_search` 直接给标题/链接/摘要，`web_fetch` 抓具体页面。没有搜索时，
   模型遇到「某大赛主题四是什么」只能拿训练记忆凑编号——实测凑错了还整段答得很自信。
@@ -423,14 +441,14 @@ python tools/analyze_speed.py --dir X  # 分析已经拉下来的 jsonl
 
 ```bash
 python tools/build_apk.py              # 日常构建 → build/app-debug.apk
-python tools/build_apk.py --release    # 发版构建 → build/yueshu-<版本>.apk
+python tools/build_apk.py --release    # 发版构建 → build/yuesu-<版本>.apk
 ```
 
 两者共用同一套工具链和同一份 keystore。`--release` 额外做两件事：
 
 1. **不编入任何凭证**——`Secrets.kt` 按空值生成，APK 里的字符串能被原样抠出来，
    编进去就等于公开；发布包的语音听写因此是关闭的，用的人填自己的 `secrets.properties` 重构建即可。
-2. 产物命名为 `build/yueshu-<版本>.apk`，并在末尾打印 SHA-256，直接贴进 Release 说明。
+2. 产物命名为 `build/yuesu-<版本>.apk`，并在末尾打印 SHA-256，直接贴进 Release 说明。
 
 版本号写在 `tools/build_apk.py` 顶部的 `VERSION_CODE / VERSION_NAME`，与 `app/build.gradle.kts` 保持一致。
 
