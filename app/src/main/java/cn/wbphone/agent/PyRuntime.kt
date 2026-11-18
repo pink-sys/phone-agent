@@ -25,6 +25,13 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngine {
 
+    init {
+        // 注册共享句柄：设置页开开关时要直接触发下载、显示进度，
+        // 而 PyRuntime 的下载锁是实例级的——绝不能让设置页另造一个实例跟
+        // AgentHost 的实例并发下载。全应用就 AgentHost 建的这一个说了算。
+        shared = this
+    }
+
     private val appContext = context.applicationContext
     private val rootfsDir = File(appContext.filesDir, "rootfs")
     private val tmpDir = File(appContext.filesDir, "pytmp").apply { mkdirs() }
@@ -56,6 +63,15 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         isReady() -> "ready"
         preparing.get() > 0 -> "downloading"
         else -> "not_ready"
+    }
+
+    /** 设置页状态行用的进度小字。没在下载或还没收到数据时返回 null。 */
+    fun progressLabel(): String? {
+        if (preparing.get() <= 0) return null
+        val total = progressTotal
+        val got = progressBytes
+        return if (total > 0 && got >= 0) "已下载 %.1f/%.1f MB".format(got / 1048576.0, total / 1048576.0)
+        else "连接中…"
     }
 
     private fun isReady(): Boolean = File(rootfsDir, PYVER).isFile
@@ -320,6 +336,10 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         JSONObject().put("ok", false).put("code", code).put("error", message).toString()
 
     companion object {
+        /** 当前唯一的实例（AgentHost 构造时注册）。MainActivity 只读不造。 */
+        @Volatile var shared: PyRuntime? = null
+            private set
+
         private const val PYVER = "pyver.txt"
 
         /**

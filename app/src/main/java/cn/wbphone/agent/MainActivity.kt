@@ -2112,7 +2112,12 @@ class MainActivity : Activity(), AgentHost.Listener {
             )
             .setPositiveButton("打开") { _, _ ->
                 settings.pyOn = true
-                toast("已打开。模型下次需要时会自动准备环境")
+                // 开关打开就着手准备，别等会话里第一次调用才动——用户在这里
+                // 看着状态行呢，立刻给出「准备中 + 进度」的反馈才对。
+                // prepare() 幂等：已在下载/已就绪时直接返回，不会重复下。
+                PyRuntime.shared?.prepare()
+                toast("已打开。正在后台准备环境（约 16MB）")
+                if (settingsShowing) showSettings()   // 弹窗回调晚于整页重画，这里补一次
             }
             .setNegativeButton("算了", null)
             .show()
@@ -2121,6 +2126,9 @@ class MainActivity : Activity(), AgentHost.Listener {
     /** 设置行上 Python 的状态小字。 */
     private fun pyStatusText(): String {
         if (!settings.pyOn) return "已关闭"
+        // 下载中的进度优先（rootfs 目录要在解包阶段才出现，光看文件系统
+        // 分不出「没下」和「在下」）
+        PyRuntime.shared?.progressLabel()?.let { return "准备中（$it）" }
         val dir = java.io.File(filesDir, "rootfs")
         return when {
             java.io.File(dir, "pyver.txt").isFile -> "已就绪"
