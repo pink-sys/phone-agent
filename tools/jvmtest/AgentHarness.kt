@@ -370,6 +370,25 @@ private fun scenarioLoop(base: String) {
 }
 
 /**
+ * 空回复兜底：模型偶发交白卷（无文字、无工具调用、finish=stop）。旧逻辑直接
+ * onFinished("")——界面显示「已完成」却一句话没有、状态条回到静止，
+ * 用户以为断了，只能手动发「继续」（真机实录：matplotlib 任务在写文件后中断）。
+ * 现在第一次白卷要被 EMPTY_NUDGE 推回来；正常恢复后计数清零。
+ */
+private fun scenarioEmptyReply(base: String) {
+    val device = FakeDevice()
+    val toolbox = PhoneToolbox({ device }, { null })
+    val loop = AgentLoop(CloudClient("$base/Z", "hy3", FakeTokens("t0", null)), toolbox, 6)
+    val rec = Recorder()
+    loop.run("随便答点什么", rec)
+
+    result("empty_no_error", rec.error.isEmpty(), rec.error)
+    result("empty_recovered", rec.finalText.contains("第二次"), "final=「${rec.finalText.take(60)}」")
+    // 白卷不入历史：历史 = user + nudge(user) + 最终 assistant = 3
+    result("empty_history", loop.historySize() == 3, loop.historySize().toString())
+}
+
+/**
  * 思考落盘：思考全文跟着 assistant 消息进历史（`_think`），重启后仍能展开回看；
  * 但它**不能**被发回上游——那是模型自己想过的内容，再喂一遍白烧 token，
  * 严格的网关还会因为不认识的字段直接 400（请求体里没有它由 Python 侧断言）。
@@ -3727,11 +3746,18 @@ private fun scenarioPython() {
     dir.resolve("job.py").writeText("print('hi')")
 
     val calls = ArrayList<String>()
+    val progress = ArrayList<String>()
     val fake = object : Workbench.PyEngine {
         override fun status(): String = "ready"
         override fun prepare(): String = "ready"
-        override fun run(script: java.io.File, args: List<String>, timeoutSec: Int): String {
+        override fun run(
+            script: java.io.File,
+            args: List<String>,
+            timeoutSec: Int,
+            onProgress: (String) -> Unit,
+        ): String {
             calls.add(script.name + "|" + args.joinToString(",") + "|" + timeoutSec)
+            onProgress("python 运行中 · 已 5s（上限 ${timeoutSec}s）")
             return """{"ok":true,"exit":0,"output":"done"}"""
         }
     }
@@ -3755,11 +3781,14 @@ private fun scenarioPython() {
     val okRun = JSONObject(on.execute("python_run", JSONObject()
         .put("script", "job.py")
         .put("args", JSONArray().put("-u").put("--fast"))
-        .put("timeout_sec", 300)))
+        .put("timeout_sec", 300), progress::add))
     result("py_run_ok", okRun.optBoolean("ok") && okRun.optString("status") == "ready",
         okRun.toString().take(120))
     result("py_run_args_passed", calls.singleOrNull()?.split("|") == listOf("job.py", "-u,--fast", "300"),
         calls.joinToString(";"))
+    // 进度回调一路透传到引擎：长任务（apk 装包、import scipy）期间界面不再静止
+    result("py_run_progress_passed", progress.singleOrNull() == "python 运行中 · 已 5s（上限 300s）",
+        progress.joinToString(";"))
 
     // 3) 错误路径
     result("py_no_script", on.execute("python_run", JSONObject()).contains("BAD_ARGS"), "")
@@ -3900,6 +3929,7 @@ fun main(args: Array<String>) {
     val shPath = args.getOrNull(1)?.takeIf { it.isNotBlank() }
     try {
         scenarioLoop(base)
+        scenarioEmptyReply(base)
         scenarioStaleIndex()
         scenarioPhoneLease()
         scenarioIntent()

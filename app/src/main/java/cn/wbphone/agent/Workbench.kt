@@ -111,8 +111,12 @@ class Workbench(
         /**
          * 跑一个 .py 脚本（已通过路径沙箱校验），返回 JSON 结果字符串。
          * 脚本和产物都在工作台目录里，引擎负责映射进 rootfs。
+         *
+         * [onProgress] 运行中的过程上报（间隔由实现自定）。proot 里 import scipy、
+         * pip/apk 装包都是分钟级操作，界面若全程只挂一行「跑 Python」不动，
+         * 用户会以为断了——真机实录：apk 装 166 个包时 UI 静止近两分钟。
          */
-        fun run(script: File, args: List<String>, timeoutSec: Int): String
+        fun run(script: File, args: List<String>, timeoutSec: Int, onProgress: (String) -> Unit = {}): String
     }
 
     val root: File = root.canonicalFile
@@ -123,7 +127,7 @@ class Workbench(
 
     // ---------------------------------------------------------------- 分发
 
-    fun execute(name: String, args: JSONObject): String = try {
+    fun execute(name: String, args: JSONObject, onProgress: (String) -> Unit = {}): String = try {
         when (name) {
             "fs_list" -> list(args.optString("path", "."), args.optInt("depth", 1))
             "fs_read" -> read(args.optString("path", ""), args.optInt("from", 1), args.optInt("lines", DEFAULT_READ_LINES))
@@ -146,7 +150,7 @@ class Workbench(
             "xlsx_write" -> xlsxWrite(args)
             "chart_write" -> chartWrite(args)
             "text_shot" -> textShot(args)
-            "python_run" -> pythonRun(args)
+            "python_run" -> pythonRun(args, onProgress)
             "html_preview" -> htmlPreview(args.optString("path", ""))
             "memory_save" -> memorySave(args.optString("text", ""))
             "skill_load" -> skillLoad(args.optString("name", ""))
@@ -890,7 +894,7 @@ class Workbench(
      * python_run 跑 rootfs 里的 python（数据处理、画图、爬虫、作业脚本）。
      * 脚本先用 fs_write 写进工作台，产物也留在工作台——模型不用学第二套路径。
      */
-    private fun pythonRun(args: JSONObject): String {
+    private fun pythonRun(args: JSONObject, onProgress: (String) -> Unit): String {
         if (!pyEnabled()) {
             return err("PYTHON_OFF", "Python 没有开启。让用户在设置里打开「Python 环境」再用（首次会自动下载约 16MB 的运行环境）")
         }
@@ -914,7 +918,7 @@ class Workbench(
             }
         }
         val timeout = args.optInt("timeout_sec", DEFAULT_PY_TIMEOUT)
-        val result = engine.run(f, argList, timeout)
+        val result = engine.run(f, argList, timeout, onProgress)
         // 带上引擎的状态（首次调用会触发下载，模型要能转告用户进度）
         return runCatching {
             JSONObject(result).put("status", engine.status()).toString()

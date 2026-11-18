@@ -17,6 +17,13 @@ object Config {
      */
     const val MAX_CONTINUES = 2
 
+    /**
+     * 空回复兜底的重试上限。模型偶尔会交白卷（无文字、无工具调用），直接收尾的表象
+     * 是「已完成」却一句话都没有、也没有运行指示——用户只能手动发「继续」。
+     * 交给循环自动推一把，最多这个次数；连续正常轮次后计数清零。
+     */
+    const val MAX_EMPTY_RETRIES = 2
+
     /** 卡死检测：连续几轮执行完全相同的操作算一次打转（先提醒、再止损）。 */
     const val STALL_REPEAT_ROUNDS = 3
 

@@ -256,6 +256,8 @@ class AgentLoop(
         var nudged = false
         var failedRounds = 0
         var ineffectiveRounds = 0
+        // 连续空回复计数。出现一次正常轮次就清零——长任务里偶发的白卷不该累计成死刑。
+        var emptyRetries = 0
 
         // 自动续跑：到段上限还没收敛就替用户说一句「继续」，最多 Config.MAX_CONTINUES 次
         var budget = maxTurns
@@ -324,13 +326,31 @@ class AgentLoop(
                         history.put(JSONObject().put("role", "user").put("content", LENGTH_NUDGE))
                         continue
                     }
-                    if (turn.content.isNotEmpty()) {
-                        history.put(assistantMessage(turn, turn.content))
+                    // 空回复兜底：模型偶尔交白卷（无文字、无工具调用，免费小模型在
+                    // 长上下文尾部的偶发问题）。直接 onFinished("") 的表象是「已完成」
+                    // 却没有任何话、状态条也回到静止——用户以为它断了，只能手动发
+                    // 「继续」。这里替用户把「接着做」说出口，最多 Config.MAX_EMPTY_RETRIES 次。
+                    // 白卷不入历史（assistantMessage 对空内容是 NULL），history 尾部仍是
+                    // 上一轮的 tool 结果，追加一条 user 提醒消息结构完全合法。
+                    if (turn.content.isBlank()) {
+                        if (emptyRetries < Config.MAX_EMPTY_RETRIES) {
+                            emptyRetries += 1
+                            history.put(JSONObject().put("role", "user").put("content", EMPTY_NUDGE))
+                            continue
+                        }
+                        listener.onFinished(
+                            "模型连续 ${emptyRetries + 1} 次返回了空回复，我先停在这里。" +
+                                "发一句「继续」，我会从刚才那一步接着做。",
+                            turns, toolCount,
+                        )
+                        return
                     }
+                    history.put(assistantMessage(turn, turn.content))
                     lastCompleted = true
                     listener.onFinished(turn.content, turns, toolCount)
                     return
                 }
+                emptyRetries = 0
 
                 // 助手这一轮的消息先入历史，连同它要调的工具
                 val callsJson = JSONArray()
@@ -1098,6 +1118,15 @@ class AgentLoop(
          */
         const val LENGTH_NUDGE =
             "（上一段回答刚到长度上限被截断了。从断开的地方接着写完，不要重复已经写过的内容，也不要重新开头。）"
+
+        /**
+         * 空回复兜底时替用户说的那句话。白卷不入历史，所以这条 user 消息紧跟在上一轮
+         * tool 结果后面，模型看得到刚才做到哪一步。短是刻意的：只出现在异常路径，
+         * 但一旦出现就要立刻把任务拉回正轨。
+         */
+        const val EMPTY_NUDGE =
+            "（你的上一条回复是空的：没有文字，也没有工具调用。如果任务还没完成，就接着做下一步；" +
+                "如果已经完成，用一两句话向用户说明结果。不要再返回空内容。）"
 
         /** 无效操作提醒：动作报了 ok 但界面没动——点错图层时最常见。 */
         const val STALL_INEFFECTIVE_NUDGE =

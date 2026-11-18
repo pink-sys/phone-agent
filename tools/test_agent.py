@@ -203,7 +203,7 @@ SCENARIO_X = [
     text_frames("接着答：还是那个设置页。"),
 ]
 
-counters = {"SUB": 0, "S": 0, "IG": 0, "A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "H": 0, "I": 0, "J": 0, "K": 0, "L": 0, "M": 0, "N": 0, "O": 0, "P": 0, "Q": 0, "R": 0, "T": 0, "TN": 0, "U": 0, "V": 0, "W": 0, "X": 0, "Y": 0}
+counters = {"SUB": 0, "S": 0, "IG": 0, "A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "H": 0, "I": 0, "J": 0, "K": 0, "L": 0, "M": 0, "N": 0, "O": 0, "P": 0, "Q": 0, "R": 0, "T": 0, "TN": 0, "U": 0, "V": 0, "W": 0, "X": 0, "Y": 0, "Z": 0}
 auth_headers = []
 requests_by_scenario = {}
 get_paths = []
@@ -262,6 +262,17 @@ class Handler(BaseHTTPRequestHandler):
             counters["A"] += 1
             script = SCENARIO_A[i] if i < len(SCENARIO_A) else text_frames("（剧本用完了）")
             self.stream(script)
+
+        # Z：空回复。模型偶发交白卷（无文字、无工具调用、finish=stop）——
+        # 旧逻辑直接 onFinished("")，界面显示「已完成」却一句话没有。
+        # 第 1 次白卷后 loop 必须替用户推一把（EMPTY_NUDGE）再问一次。
+        elif scenario == "Z":
+            i = counters["Z"]
+            counters["Z"] += 1
+            if i == 0:
+                self.stream([frame({}, finish="stop")])
+            else:
+                self.stream(text_frames("第二次正常答了。"))
 
         elif scenario == "C":
             counters["C"] += 1
@@ -711,6 +722,9 @@ def static_checks():
     check("撞输出上限自动续写（finish_reason=length → 替用户说「接着写」）",
           'turn.finishReason == "length"' in al and "LENGTH_NUDGE" in al,
           "length 没有续写")
+    check("空回复兜底（白卷 → 替用户推一把再试，推不动才收尾并把话说清）",
+          "EMPTY_NUDGE" in al and "MAX_EMPTY_RETRIES" in al and "turn.content.isBlank()" in al,
+          "空回复兜底没写")
     check("失败后撤掉没人回答的 user 消息（否则重发一次等于同一句话问两遍）",
           "private fun dropDanglingUser" in al and "dropDanglingUser()" in al,
           "孤儿 user 消息没清理")

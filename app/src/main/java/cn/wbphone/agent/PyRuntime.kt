@@ -240,7 +240,7 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
      * 产物也写工作台（相对当前目录 /bench）——这样 python 生成的文件天然被
      * fs_read / docx_write / text_shot 接住，不用另通文件桥。
      */
-    override fun run(script: File, args: List<String>, timeoutSec: Int): String {
+    override fun run(script: File, args: List<String>, timeoutSec: Int, onProgress: (String) -> Unit): String {
         if (!isReady()) {
             // 触发后台下载；四种情形给模型四种准确口径，让它能如实转告用户
             // （「已经重新开始下了」和「还在下，已 4MB」是两回事，含糊会导致
@@ -348,12 +348,39 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         pump.start()
 
         val limit = timeoutSec.coerceIn(1, MAX_PY_TIMEOUT).toLong()
+
+        // —— 进度上报 ticker（进程活着才报，5 秒一跳）——
+        // 必须在 waitFor 之前起：长任务真正的「无声期」就是同步等结果的那几分钟
+        // （真机实录：apk 装 166 个包、proot 首次 import scipy 都是分钟级，
+        // 界面全程只挂一行「跑 Python」，用户以为断了）。本线程等结束后掐掉它。
+        val startedAt = System.currentTimeMillis()
+        val ticker = Thread {
+            while (true) {
+                try {
+                    Thread.sleep(5_000)
+                } catch (e: InterruptedException) {
+                    return@Thread
+                }
+                if (!proc.isAlive) return@Thread
+                val sec = (System.currentTimeMillis() - startedAt) / 1000
+                try {
+                    onProgress("python 运行中 · 已 ${sec}s（上限 ${limit}s）")
+                } catch (e: Exception) {
+                }
+            }
+        }
+        ticker.isDaemon = true
+        ticker.start()
+
         val finished = try {
             proc.waitFor(limit, java.util.concurrent.TimeUnit.SECONDS)
         } catch (e: InterruptedException) {
+            ticker.interrupt()
             proc.destroyForcibly()
             return err("INTERRUPTED", "被中断了")
         }
+        ticker.interrupt()
+
         if (!finished) {
             proc.destroyForcibly()
             try { proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) } catch (e: InterruptedException) {}

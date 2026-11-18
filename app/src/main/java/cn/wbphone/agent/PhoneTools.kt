@@ -166,7 +166,9 @@ class PhoneToolbox(
             ) {
                 val bench = workbench
                     ?: return ToolResult(err("NO_WORKBENCH", "工作台没有启用"))
-                return ToolResult(bench.execute(name, args))
+                // onProgress 目前只有 python_run 用（运行中的秒数上报），透传给所有
+                // 工作台工具是安全的——其余工具的签名直接忽略它。
+                return ToolResult(bench.execute(name, args, onProgress))
             }
 
             // 系统意图不碰屏幕：设闹钟、拨号盘、分享这类交给系统应用去办。不读序号、
