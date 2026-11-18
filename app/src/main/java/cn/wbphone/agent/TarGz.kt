@@ -59,6 +59,9 @@ object TarGz {
                 }
                 val size = octal(header, 124, 12) ?: 0L
                 if (size < 0 || size > 4L * 1024 * 1024 * 1024) throw Bad("成员体积异常：$size")
+                // 权限位（100 偏移 8 字节八进制）：只用得上「可执行」，其他位
+                // 按落盘默认走——应用私有目录，读写本来就是 owner 的事
+                val mode = octal(header, 100, 8) ?: 0
 
                 var type = header[156].toInt().toChar()
                 var name = str(header, 0, 100)
@@ -160,6 +163,11 @@ object TarGz {
                         f.parentFile?.mkdirs()
                         if (f.isDirectory) f.delete()
                         f.outputStream().use { it.write(data) }
+                        // 恢复可执行位：usr/bin/python3、proot loader 这些没有 +x
+                        // 直接就「not executable」。JVM 落盘的默认权限不带 x，
+                        // 必须照 tar 头补；owner-only 够用——proot 和宿主同一个 uid。
+                        // 73 = 0o111（rwx 位），Kotlin 没有八进制字面量
+                        if (mode and 73L != 0L) f.setExecutable(true, true)
                         count++
                         onEntry(safe, size)
                     }

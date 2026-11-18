@@ -1,12 +1,17 @@
 package cn.wbphone.agent
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicInteger
+
+/** logcat 埋点标签。真机排查下载问题全靠它：`adb logcat -s PyRuntime`。 */
+private const val PYTAG = "PyRuntime"
 
 /**
  * Python 运行时：proot + Alpine rootfs，月溯里唯一的「真 Linux」。
@@ -74,7 +79,12 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         else "连接中…"
     }
 
-    private fun isReady(): Boolean = File(rootfsDir, PYVER).isFile
+    // 标记文件内容以 tag 开头才算就绪（写入时 tag 后面跟着构建信息）。
+    // 解包逻辑改了（比如这次补 exec 位）tag 就得变，旧 rootfs 自动整包重装。
+    // 注意是 startsWith 不是 equals——曾因写入「tag + 构建信息」却按全文比较，
+    // 永远不匹配，无限重下载又回来了。
+    private fun isReady(): Boolean =
+        File(rootfsDir, PYVER).takeIf { it.isFile }?.readText()?.trim()?.startsWith(PYVER_TAG) == true
 
     /**
      * 触发后台下载。返回值区分四种情形，run() 据此给模型准确的口径：
@@ -90,6 +100,7 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
             // 就能带着新网络重新起一条线程。不掐的话旧线程能龟速拖几分钟，
             // 把所有重试都挡在锁外。
             if (lastProgressAt > 0 && System.currentTimeMillis() - lastProgressAt > STALL_MS) {
+                Log.i(PYTAG, "watchdog: no byte progress for ${STALL_MS / 1000}s, aborting stuck connection")
                 currentConn?.disconnect()
                 return "stalled"
             }
@@ -127,7 +138,11 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
                 break
             } catch (e: Exception) {
                 why = "${e.javaClass.simpleName}: ${e.message}"
-                part.delete()
+                Log.i(PYTAG, "fetch failed from ${runCatching { URL(url).host }.getOrDefault(url)}: $why")
+                // .part 故意留着：下一次尝试（换源或整轮重试）从断点续传，
+                // 不再从 0 开始——「快下完又重头」就是这里以前直接 delete 造成的。
+                // 例外：超过体积上限说明下到的是垃圾，留着只会让续传永远 416。
+                if (part.length() > MAX_DOWNLOAD_BYTES) part.delete()
             }
         }
         if (!fetched) throw Exception("rootfs 下载失败（$why）")
@@ -135,9 +150,11 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         val sha = MessageDigest.getInstance("SHA-256").digest(part.readBytes())
             .joinToString("") { "%02x".format(it) }
         if (sha != ROOTFS_SHA256) {
+            Log.i(PYTAG, "sha mismatch: got $sha")
             part.delete()
             throw Exception("rootfs 校验失败（SHA-256 不符），丢弃了下载内容。可能是网络劫持，稍后再试")
         }
+        Log.i(PYTAG, "sha ok, extracting ${part.length() / 1048576} MB")
 
         val staging = File(appContext.filesDir, "rootfs.tmp")
         staging.deleteRecursively()
@@ -153,9 +170,19 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         if (!staging.renameTo(rootfsDir)) {
             throw Exception("rootfs 就位失败：目录改名被系统拒绝")
         }
+        // 就绪标记——isReady() 只认这个文件且内容必须等于 PYVER_TAG。**忘了写
+        // 它 = 下载永远白下**：每次调用都判「未就绪」再从头下载一遍，「快下完
+        // 又重新开始」的真凶就是它。内容是 tag + 构建信息，便于以后排查。
+        File(rootfsDir, PYVER).writeText("$PYVER_TAG alpine-3.24 python-3.14 built 2026-11-18")
+        Log.i(PYTAG, "rootfs ready at ${rootfsDir.absolutePath}")
     }
 
     private fun fetchTo(url: String, out: File) {
+        // 断点续传：本地已有多长的 .part 就从那里接着下（GitHub 的 CDN 支持
+        // Range）。服务器不支持时返回 200 全量，从头覆盖就是了。
+        val already = if (out.exists()) out.length() else 0L
+        val host = runCatching { URL(url).host }.getOrDefault(url)
+        Log.i(PYTAG, "fetch start from $host (resume at ${already / 1048576} MB)")
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             // 这是「单次 read」超时：只要还有字节滴漏就不算超时。慢网的龟速下载
@@ -163,16 +190,25 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
             readTimeout = 60_000
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", Workbench.UA_MOBILE)
+            if (already > 0) setRequestProperty("Range", "bytes=$already-")
         }
         currentConn = conn
         try {
-            if (conn.responseCode !in 200..299) throw Exception("HTTP ${conn.responseCode}")
-            val total = conn.contentLengthLong
-            val input = conn.inputStream
+            val code = conn.responseCode
+            if (code !in 200..299) throw Exception("HTTP $code")
+            // 206 = 续传被接受，响应体是「剩余部分」；200 = 给了全量（或本来就从头下）
+            val resume = code == 206 && already > 0
+            if (already > 0 && !resume) Log.i(PYTAG, "server ignored Range (HTTP $code), restart from 0")
+            val base = if (resume) already else 0L
+            val total = conn.contentLengthLong + base
             progressTotal = if (total > 0) total else -1L
-            out.outputStream().use { fos ->
+            progressBytes = base
+            Log.i(PYTAG, "response $code, total ${(total) / 1048576} MB, resume=$resume")
+            val input = conn.inputStream
+            FileOutputStream(out, resume).use { fos ->
                 val buf = ByteArray(64 * 1024)
-                var got = 0L
+                var got = base
+                var lastLog = 0L
                 while (true) {
                     val n = input.read(buf)
                     if (n < 0) break
@@ -180,10 +216,16 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
                     got += n
                     progressBytes = got
                     lastProgressAt = System.currentTimeMillis()
+                    // 每 2MB 落一行，够定位「死在第几 MB」又不刷屏
+                    if (got - lastLog >= 2L * 1048576) {
+                        lastLog = got
+                        Log.i(PYTAG, "progress $got/$total")
+                    }
                     // 上限 64MB：正常 16MB，超过说明下到了错误的东西
                     if (got > MAX_DOWNLOAD_BYTES) throw Exception("下载超出体积上限，中止")
                 }
             }
+            Log.i(PYTAG, "fetch done: ${out.length()} bytes")
             if (out.length() < 1_000_000) throw Exception("下载内容只有 ${out.length()} 字节，不完整")
         } finally {
             currentConn = null
@@ -251,6 +293,7 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
             "/usr/bin/python3", guestScript,
         )
         cmd.addAll(args)
+        Log.i(PYTAG, "exec: python3 ${args.joinToString(" ")} (timeout ${timeoutSec}s)")
 
         val proc = try {
             ProcessBuilder(cmd)
@@ -341,6 +384,9 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
             private set
 
         private const val PYVER = "pyver.txt"
+
+        /** rootfs 代次。解包逻辑有变更（权限位/结构）就 +1，旧环境自动重装。 */
+        private const val PYVER_TAG = "v3-exec"
 
         /**
          * rootfs 下载源，依次尝试。都是同一个文件的镜像，SHA-256 校验兜底——
