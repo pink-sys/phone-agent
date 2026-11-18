@@ -1,48 +1,58 @@
-# 月溯 · 手机操作 Agent
+# 月溯 · 装在手机里的 Agent
 
-一个跑在 Android 手机里的 AI agent：读得懂屏幕、点得动按钮、能往输入框里写字、
-能自己判断下一步做什么。模型在云端，**引擎在手机上**——不需要电脑配合，不需要局域网，
+**会操作手机，也能干活。** 跑在 Android 上的 AI agent：一边读得懂屏幕、点得动按钮，
+替你完成「打开微信给某人发条消息」这种真机操作；一边有自己的工作台——
+能跑 **Python**、生成 **Word / Excel / PPT / PDF**、画**图表**、把**运行结果截图**插进文档、
+渲染自己写的网页。模型在云端，**引擎在手机上**——不需要电脑配合，不需要局域网，
 电脑关着也能用。
 
-- 零第三方依赖：没有 AppCompat、没有 OkHttp、没有 Retrofit、没有 Gson。
-  网络用 `HttpURLConnection`，SSE 手写解析，界面全部代码构建。
-- 只用系统给的两样能力：**无障碍服务**（手和眼）与**截图 API**（API 30+）。
-- 全部动作经过一道**审批闸门**：付款、密码、验证码、删除这类操作在执行前拦下，用户点头才放行。
+- **零第三方依赖**：没有 AppCompat、没有 OkHttp、没有 Gson。网络用 `HttpURLConnection`，
+  SSE 手写解析，OOXML（docx/xlsx/pptx）全部手写，tar.gz 解包、PNG/JPEG 尺寸解析也是手写的，
+  APK 只有 1.3MB。
+- **只用系统给的两样能力**：无障碍服务（手和眼）与截图 API（API 30+）。
+  Python 不越界：proot 四个二进制以 `lib*.so` 名义进 APK，走系统解压的 nativeLibraryDir
+  执行，无 root、无特殊权限。
+- **全部动作经过一道审批闸门**：付款、密码、验证码、删除这类操作在执行前拦下，用户点头才放行。
 - **烧的是你自己的 WorkBuddy 积分**：登录谁的账号就扣谁的积分，没有公共 Key 可蹭；
-  默认模型 Hy4 flash 当前倍率 `x0.00`（限时免费，11/16–11/30），换到别的档位就按倍率扣。细节见[登录](#登录)、[积分](#积分花的是你自己的)。
+  默认模型 Hy4 flash 当前倍率 `x0.00`（限时免费，11/16–11/30）。细节见[登录](#登录)、[积分](#积分花的是你自己的)。
 
 ```
-┌─────────────────────────── 手机 ────────────────────────────┐
-│  MainActivity / ChatUi（登录 · 对话 · 日志 · 审批 · 工作台）  │
-│        │                                                     │
-│  AgentHost   会话、线程、落盘、流水账                          │
-│        │                                                     │
-│  AgentLoop   模型 → 工具 → 结果回填 → 再问模型，直到收敛      │
-│    ├── CloudClient   POST /v2/chat/completions，读 SSE 流     │
-│    ├── Auth          轮询式登录 + Keystore 加密存令牌         │
-│    ├── PhoneToolbox  23 个工具 ──→ Approval 拦截敏感动作      │
-│    │                    └──────→ 无障碍服务（读屏/点按/输入）  │
-│    └── Workbench     文件、文档、网页、记忆、技能、shell       │
-└──────────────────────────────┬───────────────────────────────┘
-                               │ HTTPS
-                        云端推理接口
+┌────────────────────────────── 手机 ──────────────────────────────┐
+│   MainActivity / ChatUi（登录 · 对话 · 日志 · 审批 · 工作台）      │
+│         │                                                        │
+│   AgentHost     会话、线程、落盘、流水账、引擎注入                 │
+│         │                                                        │
+│   AgentLoop     模型 → 工具 → 结果回填 → 再问模型，直到收敛        │
+│     ├── CloudClient    POST /v2/chat/completions，读 SSE 流       │
+│     ├── Auth           轮询式登录 + Keystore 加密存令牌            │
+│     ├── PhoneToolbox   手机 11 个 ──→ Approval 拦截敏感动作        │
+│     │                    └──────→ 无障碍服务（读屏/点按/输入）     │
+│     ├── Workbench      工作台 18 个：文件/文档/表格/图表/网页/     │
+│     │                  记忆/技能/shell（默认关）                   │
+│     │        └── PyRuntime  proot + Alpine rootfs → python_run    │
+│     └── SubAgent       只读子代理，查资料不污染主线                │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │ HTTPS
+                          云端推理接口
 ```
 
 ---
 
 ## 下载安装
 
-到 [Releases](https://github.com/pink-sys/phone-agent/releases) 下载 `yuesu-1.0.0.apk`
+到 [Releases](https://github.com/pink-sys/phone-agent/releases) 下载最新版的 `yuesu-<版本>.apk`
 传到手机上安装，打开后**先登录**（见下节），再按 App 内的引导开启三项权限：
 **无障碍服务**（手和眼）、**悬浮窗**（任务跑到别的应用上时显示状态胶囊）、**通知**（审批提醒）。
 
 - 最低 Android 8.0（`minSdk 26`）；截图相关能力要 Android 11 及以上，低版本会自动降级成读屏大纲。
+- Python 环境是**可选**的：设置 → 权限里默认关，开了之后首次使用联网下载约 16MB 的
+  Alpine rootfs（SHA-256 校验，`releases/latest/download` 固定地址，仓库公开是它的前提）。
 - APK 用仓库里的本地 keystore 签名。自己构建时首次会生成**一台机器一份**的证书，
   所以自建包和 Release 包不能互相覆盖安装，切换时要先卸载；同一来源的后续版本直接覆盖安装，数据保留。
-- 每个 Release 都附 SHA-256，下载后可以自己核对：
+- 每个 Release 都附 SHA-256，下载后可以自己核对（文件名以 Release 页为准）：
 
   ```bash
-  sha256sum yuesu-1.0.0.apk     # Windows: certutil -hashfile yuesu-1.0.0.apk SHA256
+  sha256sum yuesu-1.2.0.apk     # Windows: certutil -hashfile yuesu-1.2.0.apk SHA256
   ```
 
 ---
@@ -130,10 +140,21 @@ App     GET  /v2/plugin/auth/token?state=…  每 1 秒问一次，拿到 access
 
 ## 它能做什么
 
+真机操作（读屏 → 判断 → 动作 → 验证，全程可审批）：
+
 - 「打开微信给小罗发个你好」——启动应用、点搜索框、写文字、点发送
-- 「把这周的记录整理成一份 Word 周报」——读文件、生成 `.docx`，产物直接出现在对话里
-- 「看看这个页面写了什么，把价格记下来」——读屏 + 截图识别，结果存进记忆
 - 「帮我填一下这个表单」——按序号点、按坐标点、输入文字，逐个字段来
+- 「明早八点提醒我去取快递」——闹钟/日程/拨号/短信草稿走系统意图，一步到位
+
+工作台干活（文件都在应用私有沙箱里，产物直接出现在对话里）：
+
+- 「把这周记录整理成 Word 周报」——读文件 → `docx_write`，A4 排版、真项目符号
+- 「跑一下我这个 score.py，把结果截图放进 Word」——`python_run` 真跑脚本
+  （Alpine + Python 3.14 + pip），`text_shot` 渲染终端截图，`docx_write` 的
+  image 块插图——**交作业那种「代码 + 运行结果截图」直接出成品**
+- 「这组数据做个 Excel，再画张柱状图」——`xlsx_write` 出可编辑表格、
+  `chart_write` 出柱状/折线/饼图 PNG
+- 「查查这个活动今年的主题」——`web_search` 联网，四引擎退让，附失败原因
 
 ---
 
@@ -175,10 +196,19 @@ App     GET  /v2/plugin/auth/token?state=…  每 1 秒问一次，拿到 access
 - **额度 3 次/任务**：每个子代理都是真金白银的若干轮请求，用完就让它用现有工具自己做。
 - token 也记账：子代理烧的算进本轮用量，界面上的数字才和账单对得上。
 
-### 工作台（17 个）
+### 工作台（18 个，shell 默认关）
 
 `fs_list` `fs_read` `fs_write` `fs_edit` `fs_search` `web_search` `web_fetch`
-`pdf_write` `pptx_write` `docx_write` `xlsx_write` `chart_write` `text_shot` `html_preview` `memory_save` `skill_load` `shell`（默认关闭）
+`pdf_write` `pptx_write` `docx_write` `xlsx_write` `chart_write` `text_shot` `python_run`
+`html_preview` `memory_save` `skill_load` `shell`（默认关闭）
+
+- **Python 环境（python_run）**：proot + Alpine Linux + Python 3.14 + pip，模型
+  `fs_write` 写脚本 → 真跑 → stdout/退出码回填，产物写工作台被上面的工具接住
+  （画图出 PNG 插 docx、算表出 xlsx 直接读回）。proot 四个二进制改名 `lib*.so`
+  进 jniLibs，借系统解压的 nativeLibraryDir 绕开「不可执行自己可写目录里的二进制」
+  （Android 10+ W^X），无 root、targetSdk 不用降。rootfs 首次联网下载约 16MB
+  （SHA-256 校验 + 进度可见 + 90 秒卡死看门狗，网络切换自动重试），之后秒级启动。
+  装 pip 包就在脚本里 `subprocess.run(["pip", "install", "包名"])`，py3-pip 已内置。
 
 - **HTML 渲染**：写完网页调 `html_preview`，App 内置 WebView 全屏渲染
   （localStorage、相对路径的 css/js/图片都可用）。页面经本机回环 HTTP 服务
