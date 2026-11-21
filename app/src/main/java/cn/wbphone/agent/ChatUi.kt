@@ -120,7 +120,7 @@ class ChatUi(
 
     /** 附件底栏（＋ 展开）：拍照 / 相册 / 文件。 */
     private lateinit var attachPanel: LinearLayout
-    private lateinit var plusButton: TextView
+    private lateinit var plusButton: PlusIconView
 
     /** 输入条里的麦克风：点一下开始听，再点一下结束。 */
     private lateinit var micButton: MicIconView
@@ -328,9 +328,10 @@ class ChatUi(
         inputRow.setPadding(dp(6), dp(6), dp(6), dp(6))
         inputRow.background = Ui.solid(act, Ui.GLASS, 28, Ui.GLASS_LINE, 1)
 
-        // ＋：展开附件底栏（拍照 / 相册 / 文件）。展开时变成 ✕，再点收起。
-        plusButton = Ui.text(act, "＋", 24f, Ui.INK).apply {
-            gravity = Gravity.CENTER
+        // ＋：展开附件底栏（拍照 / 相册 / 文件）。展开时旋转成 ✕，再点收起。
+        // Canvas 手绘而不是文字「＋」：全角加号的字面自带大留白，加字号也看不出变大，
+        // 而「✕」字面是满的，同字号会爆——两个图形各自画，大小永远一致（真机反馈）
+        plusButton = PlusIconView(act).apply {
             contentDescription = "添加附件"
             background = Ui.solid(act, Ui.GLASS_SOFT, 19)
             setOnClickListener { toggleAttach() }
@@ -430,14 +431,14 @@ class ChatUi(
 
     private fun showAttach() {
         attachPanel.visibility = View.VISIBLE
-        plusButton.text = "✕"
+        plusButton.open = true
         // 底栏出现时把提示行让出来，不然两行小字挤在一起
         footer.visibility = View.GONE
     }
 
     private fun hideAttach() {
         attachPanel.visibility = View.GONE
-        plusButton.text = "＋"
+        plusButton.open = false
         footer.visibility = View.VISIBLE
     }
 
@@ -2016,5 +2017,40 @@ private class MicIconView(context: Context) : View(context) {
         // 竖杆 + 底座
         c.drawLine(cx, 16.5f * u + yOff, cx, 19.5f * u + yOff, stroke)
         c.drawLine(cx - 3.5f * u, 19.5f * u + yOff, cx + 3.5f * u, 19.5f * u + yOff, stroke)
+    }
+}
+
+/**
+ * 附件键的图标：Canvas 手绘的加号，展开附件栏时旋转成 ✕（45°）。
+ * 为什么不用文字：全角「＋」字面自带大留白——加字号视觉没变化；「✕」字面是满的，
+ * 同字号会显得巨大。自己画的两条线，闭合/展开同一个尺寸、永远居中（真机反馈）。
+ */
+private class PlusIconView(context: Context) : View(context) {
+
+    /** 附件栏展开中：显示 ✕。 */
+    var open: Boolean = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    override fun onDraw(c: Canvas) {
+        p.color = Ui.INK
+        p.strokeWidth = width * 2f / 30f
+        val half = width * 8f / 30f
+        val cx = width / 2f
+        val cy = height / 2f
+        if (!open) {
+            c.drawLine(cx - half, cy, cx + half, cy, p)
+            c.drawLine(cx, cy - half, cx, cy + half, p)
+        } else {
+            c.drawLine(cx - half, cy - half, cx + half, cy + half, p)
+            c.drawLine(cx - half, cy + half, cx + half, cy - half, p)
+        }
     }
 }
