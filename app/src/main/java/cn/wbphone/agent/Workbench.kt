@@ -1595,7 +1595,7 @@ class Workbench(
                 "type": "object",
                 "properties": {
                   "path": {"type": "string", "description": "文件相对路径，父目录会自动创建"},
-                  "content": {"type": "string", "description": "完整的新内容。JSON 里 / 直接写，别转义成 \\/"}
+                  "content": {"type": "string", "description": "完整的新内容。"}
                 },
                 "required": ["path", "content"]
               }

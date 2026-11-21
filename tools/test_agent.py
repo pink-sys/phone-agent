@@ -742,7 +742,7 @@ def static_checks():
     so = src("ScreenOutline.kt")
     check("微信三步不再常驻 SYSTEM（指针在，全文在 phone_input 描述）",
           "剪贴板三步盲操作" in body and "工具描述里" in body
-          and "三步——phone_input" in src("PhoneTools.kt"),
+          and "剪贴板三步 phone_input" in src("PhoneTools.kt"),
           "wechat pointer missing")
     check("读屏遇到微信挂工序卡（v1.4.5 侧挂，不靠模型记得）",
           "com.tencent.mm" in so and "〔微信〕" in so
@@ -1486,9 +1486,12 @@ def main():
           'replace("\\\\/"' in ar and 'replace("\\\\/"' in mk, "missing render unescape")
     check("工作台预览读文件入口归一（显示+复制都干净）",
           'read.replace("\\\\/"' in ma, "missing preview unescape")
-    check("提示词钉住 fs_edit 转义纪律与失败预算",
-          "别写成 \\/" in src("PhonePrompt.kt") and "连败 2 次就整段重写" in src("PhonePrompt.kt"),
-          "missing prompt discipline")
+    check("JSON 转义警告只留 fs_edit 调用现场一处（代码侧已自动归一，冗余警告每轮白付 token）",
+          "别写成 \\/" not in src("PhonePrompt.kt")
+          and "别转义成" not in wb
+          and "不用转义" in wb
+          and "连败 2 次就整段重写" in src("PhonePrompt.kt"),
+          "escape warning count wrong")
     check("清单声明了 <queries>（Android 11+ 包可见性）",
           "<queries>" in mf and "category.LAUNCHER" in mf,
           "queries=%s" % ("<queries>" in mf))
@@ -2072,9 +2075,26 @@ def main():
           "STALL_REPEAT_ROUNDS" in cf and "nudged" in al
           and 'put("content", STALL_NUDGE)' in al,
           "missing repeat stall")
-    check("卡死检测：连续 5 轮所有操作全失败也止损",
-          "STALL_FAIL_ROUNDS = 5" in cf and "failedRounds" in al,
+    check("卡死检测：连续屏幕动作失败按调用累计止损（读屏成功不清零，治「每轮换序号」绕过）",
+          "STALL_FAIL_CALLS = 6" in cf and "mutatingFails" in al
+          and "if (anyOk)" not in al and "failedRounds" not in al,
           "missing fail stall")
+    check("失败的动作不清「界面没动」计数（只有成功的动作才证明界面动了）",
+          "mutatingFails = 0" in al and "mutatingFails += 1" in al
+          and "只有**成功**的动作才有资格证明" in al,
+          "failed action resets ineffective counter")
+    check("微信三步文案唯一一份拷贝（三个注入点全引用 WECHAT_PASTE_STEPS）",
+          "const val WECHAT_PASTE_STEPS" in src("PhoneTools.kt")
+          and src("PhoneTools.kt").count("WECHAT_PASTE_STEPS") >= 3
+          and "WECHAT_PASTE_STEPS" in so
+          and "仅有的两份" not in so,
+          "wechat steps duplicated")
+    check("压缩摘要带「不通的路」（失败工具按 路：现象 记账，多级压缩继承）",
+          "deadEnds" in al and "callRoads" in al and '"- 堵："' in al,
+          "missing dead-end brief")
+    check("识图 800 字按图类型放宽（文档/题目/表格 1500）",
+          "界面/照片类总长不超过 800 字" in al and "1500 字" in al,
+          "missing img-note widen")
     check("无效操作检测：动作前后大纲一致时给 screen_changed:false + 改道提示",
           "beforeActionOutline" in pt and "screen_changed" in pt and "warning" in pt,
           "missing unchanged signal")

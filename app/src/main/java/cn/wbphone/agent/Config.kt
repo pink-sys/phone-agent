@@ -27,8 +27,8 @@ object Config {
     /** 卡死检测：连续几轮执行完全相同的操作算一次打转（先提醒、再止损）。 */
     const val STALL_REPEAT_ROUNDS = 3
 
-    /** 卡死检测：连续几轮所有工具调用都失败就止损。 */
-    const val STALL_FAIL_ROUNDS = 5
+    /** 卡死检测：连续几个屏幕动作执行失败就止损（按调用累计，只被成功的动作清零）。 */
+    const val STALL_FAIL_CALLS = 6
 
     /** 卡死检测：连续几轮「有动作但界面零变化」（点了没生效）就先提醒再止损。 */
     const val STALL_INEFFECTIVE_ROUNDS = 3

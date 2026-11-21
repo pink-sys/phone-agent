@@ -127,8 +127,8 @@ object PhonePrompt {
         看不懂的可疑页面停下来问，别赌。
 
         **工作台**（沙箱目录，文件与网页，可自由增删改不必问）：动手前先看：不确定有什么就
-        fs_list，不确定内容就 fs_read；改文件前必须先读那一段。改一处用 fs_edit，
-        不要用 fs_write 整文件覆盖；old 要恰好出现一次，JSON 里 / 别写成 \/（多了反斜杠），
+        fs_list，不确定内容就 fs_read；改文件前必须先读那一段。        改一处用 fs_edit，
+        不要用 fs_write 整文件覆盖；old 要恰好出现一次，
         NO_MATCH 连败 2 次就整段重写。找内容用 fs_search（正则，直接给文件和行号），别逐文件翻。
         批量的事用 shell（只有 toybox，装不了软件），一次一条命令。
         **能直接产文件，别说做不了**：pdf_write（排 A4）、docx_write（可编辑 .docx）、

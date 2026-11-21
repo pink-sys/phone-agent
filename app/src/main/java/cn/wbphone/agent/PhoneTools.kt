@@ -54,6 +54,20 @@ data class ShotFrame(
 }
 
 /**
+ * 微信剪贴板三步工序的统一文案——**运行时刻只许这一份拷贝**。
+ *
+ * 三个注入点全部用它拼（改文案改这一处就够）：
+ *  - phone_input 工具描述（调用现场必看）；
+ *  - launch_app 微信成功时挂的 note（模型正准备输入）；
+ *  - ScreenOutline 读到 com.tencent.mm 时挂的卡（读屏现场）。
+ *
+ * 之前三处各写一份、注释还写着「仅有的两份」，2026-11-21 复盘指出改一处漏两处是迟早的事。
+ */
+const val WECHAT_PASTE_STEPS =
+    "输入走剪贴板三步 phone_input(文字) → phone_long_press(输入框/搜索栏中心坐标) → " +
+        "phone_tap_at 点「粘贴」，盲操作、不做验证、同一段文字只写一次。"
+
+/**
  * 工具定义与执行器。
  *
  * 和之前走桥的版本相比，这里少了一层"桥渲染大纲、桥算坐标"——
@@ -556,12 +570,10 @@ class PhoneToolbox(
             var note = result.optString("note")
             // 微信的控件树对无障碍隐藏，普通输入路径全部失效。启动成功的这一刻模型正
             // 准备输入，把三步工序卡直接挂在 note 上，不用先读一次空屏交学费
-            // （2026-11-20 真机实录；ScreenOutline 里还有一份读屏时的同款卡）。
+            // （2026-11-20 真机实录；文案统一走 WECHAT_PASTE_STEPS，见其注释）。
             if (resolved == "com.tencent.mm" || target.contains("微信")) {
                 note = (if (note.isEmpty()) "" else "$note ") +
-                    "微信控件树对无障碍隐藏，读屏无效：输入走剪贴板三步 phone_input(文字) → " +
-                    "phone_long_press(输入框/搜索栏中心坐标) → phone_tap_at 点「粘贴」，" +
-                    "盲操作、不验证、不重复。"
+                    "微信控件树对无障碍隐藏，读屏无效：" + WECHAT_PASTE_STEPS
             }
             val notePart = if (note.isNotEmpty()) ",\"note\":\"${escape(note)}\"" else ""
             "{\"ok\":true,\"package\":\"${escape(resolved)}\"$notePart}"
@@ -787,7 +799,7 @@ class PhoneToolbox(
             "type": "function",
             "function": {
               "name": "phone_input",
-              "description": "输入文本。普通应用：直接写进当前焦点输入框（先 phone_tap 点一下输入框确保聚焦）。微信这类读不到控件树的应用：本工具只把文字写进剪贴板，完整输入是三步——phone_input(文字) → phone_long_press(输入框中心坐标) → phone_tap_at 点菜单里的「粘贴」；盲操作不做验证，同一段文字只写一次。",
+              "description": "输入文本。普通应用：直接写进当前焦点输入框（先 phone_tap 点一下输入框确保聚焦）。微信这类读不到控件树的应用：本工具只把文字写进剪贴板，完整${WECHAT_PASTE_STEPS}",
               "parameters": {
                 "type": "object",
                 "properties": {

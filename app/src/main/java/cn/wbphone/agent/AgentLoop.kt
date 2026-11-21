@@ -273,7 +273,10 @@ class AgentLoop(
         var lastSig = ""
         var repeatRounds = 0
         var nudged = false
-        var failedRounds = 0
+        // 连续失败的屏幕动作（按调用累计，只有成功的动作清零）。读屏永远会成功，
+        // 拿它清零等于永远不触发——「读屏成功+点某个序号失败、每轮换个序号」的
+        // 死循环（2026-11-21 复盘）就是靠中间夹一次成功读屏躲过旧口径二的。
+        var mutatingFails = 0
         var ineffectiveRounds = 0
         // 连续空回复计数。出现一次正常轮次就清零——长任务里偶发的白卷不该累计成死刑。
         var emptyRetries = 0
@@ -393,9 +396,8 @@ class AgentLoop(
                 var aborted = false
                 // 手机被别的会话占着：这一轮剩下的调用直接作废（也不能留空配对）
                 var phoneBusy = false
-                var anyOk = false
                 var touched = false        // 这轮有没有动作类调用
-                var screenMoved = false    // 动作之后界面有没有真的变化
+                var screenMoved = false    // 有没有**成功**的动作让界面真的变化
 
                 // 每条结果的入账（历史、界面、产物卡）都走这里——串行/并行两条路共用，
                 // 别在两处各写一份，早晚算岔。
@@ -410,14 +412,21 @@ class AgentLoop(
                     val ok = runCatching {
                         JSONObject(result.text).optBoolean("ok", true)
                     }.getOrDefault(true)
-                    if (ok) anyOk = true
                     // 手机被别人占着：记下这一条（下面是真实原因），本轮剩下的调用作废。
                     // 判据用 code 而不是整段文案——文案以后会改，code 是契约。
                     if (!ok && result.text.contains("\"code\":\"PHONE_BUSY\"")) phoneBusy = true
                     if (call.name in MUTATING) {
                         touched = true
-                        // PhoneTools 会在「动作前后界面零变化」时给 screen_changed:false
-                        if (!result.text.contains("\"screen_changed\":false")) screenMoved = true
+                        if (ok) {
+                            mutatingFails = 0
+                            // PhoneTools 会在「动作前后界面零变化」时给 screen_changed:false。
+                            // 只有**成功**的动作才有资格证明「界面动了」：失败的动作结果里
+                            // 根本没有 screen_changed 字段，旧逻辑不判 ok 就查字段，把失败
+                            // 当成「动了」清掉零变化计数——死循环的另一半藏身处。
+                            if (!result.text.contains("\"screen_changed\":false")) screenMoved = true
+                        } else {
+                            mutatingFails += 1
+                        }
                     }
                     listener.onToolEnd(call.name, args, result.text, ok)
 
@@ -584,20 +593,22 @@ class AgentLoop(
                     }
                 }
 
-                // 口径二：连续几轮所有工具调用都失败——模型在反复撞同一堵墙。
-                if (anyOk) failedRounds = 0 else failedRounds += 1
-                if (failedRounds >= Config.STALL_FAIL_ROUNDS) {
+                // 口径二：连续几个**屏幕动作**执行失败——模型在反复撞同一堵墙。
+                // 按调用累计、只被成功的动作清零（见 mutatingFails 的注释）：中间夹着
+                // 的成功读屏不算台阶。每轮换个失败姿势（换序号、换措辞）也躲不过。
+                if (mutatingFails >= Config.STALL_FAIL_CALLS) {
                     listener.onFinished(
-                        "连续 $failedRounds 轮每个操作都失败了，多半是这条路走不通。\n" +
+                        "连续 $mutatingFails 个屏幕动作都执行失败了，多半是这条路走不通。\n" +
                             "你可以说「继续」并换个思路指点我，或者自己上手做剩下的部分。",
                         turns, toolCount,
                     )
                     return
                 }
 
-                // 口径三：动作做了、报告 ok、但界面零变化——学习通这类 WebView 的经典坑
+                // 口径三：动作做了但界面零变化——学习通这类 WebView 的经典坑
                 // （无障碍点击「成功」，实际没反应）。这比口径一更隐蔽：参数每轮都在换，
-                // 签名比对抓不到。先提醒一次，再犯就止损。
+                // 签名比对抓不到。失败的点按不再清零（见 record 里的注释），每轮换个
+                // 序号点不进去同样会被计到。先提醒一次，再犯就止损。
                 if (touched) {
                     if (screenMoved) ineffectiveRounds = 0 else ineffectiveRounds += 1
                 } else {
@@ -941,6 +952,12 @@ class AgentLoop(
         // 这份文字是它唯一的替身——丢了图里的题目就等于丢了任务。
         val figs = ArrayList<String>()
         val steps = ArrayList<String>()
+        // 已试过且不通的路（工具失败的结果）。「过程」从尾部取、越早的越先被挤掉，
+        // 不单独记账的话，压完一轮模型就忘了哪条路撞过墙，转头原样再撞一次。
+        val deadEnds = ArrayList<String>()
+        // tool_call_id → 「工具名(参数摘要)」。失败的路要写全「路 + 失败现象」，
+        // 光有报错没有路，模型根本不知道哪条别再走。
+        val callRoads = HashMap<String, String>()
         var calls = 0
 
         for (i in from until to) {
@@ -974,18 +991,35 @@ class AgentLoop(
                             val s = line.trim()
                             if (s.startsWith("- 图：") && s.length > 4) figs.add(s.removePrefix("- 图："))
                         }
+                        // 不通的路也继承：多级压缩时这一栏断了，撞墙史就清零了。
+                        for (line in t.lines()) {
+                            val s = line.trim()
+                            if (s.startsWith("- 堵：") && s.length > 3) deadEnds.add(s.removePrefix("- 堵："))
+                        }
                     } else if (t.isNotBlank()) {
                         if (goal.isEmpty()) goal.append(t.take(240))
                         else asks.add(t.replace('\n', ' ').take(160))
                     }
                 }
                 "assistant" -> {
+                    val tc = m.optJSONArray("tool_calls")
+                    if (tc != null) for (j in 0 until tc.length()) {
+                        val o = tc.optJSONObject(j) ?: continue
+                        val f = o.optJSONObject("function") ?: continue
+                        val args = f.optString("arguments")
+                        callRoads[o.optString("id")] =
+                            f.optString("name") + "(" + (if (args.length > 60) args.take(60) + "…" else args) + ")"
+                    }
                     val t = m.optString("content")
                     if (t.isNotBlank() && t != "null") steps.add(t.replace('\n', ' ').take(120))
                 }
                 "tool" -> {
                     calls++
-                    steps.add(briefResult(m.optString("content")))
+                    val line = briefResult(m.optString("content"))
+                    if (line.startsWith("失败：")) {
+                        val road = callRoads[m.optString("tool_call_id")]
+                        deadEnds.add(if (road.isNullOrEmpty()) line.removePrefix("失败：") else "$road：${line.removePrefix("失败：")}")
+                    } else steps.add(line)
                 }
             }
         }
@@ -999,6 +1033,9 @@ class AgentLoop(
         // 用户中途补的要求逐条列出。这是用户原话的缩写，不是「细节」——丢了它们，
         // 模型就会把活干完一半（给了推荐没给链接），用户只能重新提示一遍。
         for (a in asks.distinct().takeLast(6)) body.append("- 要求：").append(a).append('\n')
+        // 不通的路：最多 4 条，每条写路 + 失败现象，排在「过程」前面——它是「别再试」
+        // 清单，比流水账的过程更需要活着走到下一轮。
+        for (d in deadEnds.distinct().takeLast(4)) body.append("- 堵：").append(d.take(90)).append('\n')
         if (steps.isNotEmpty()) {
             body.append("过程：\n")
             var used = 0
@@ -1449,7 +1486,8 @@ class AgentLoop(
                 "2) 文字：图里出现的文字逐字抄录（标题、题干、按钮、数字、表格），看不清用「?」；\n" +
                 "3) 要求：如果图里是题目、任务、报错或用户要照着做的东西，一两句写清它要求什么。\n" +
                 "只描述和抄录，不要评论、不要替用户解决问题、不要输出与图无关的内容。" +
-                "总长不超过 800 字。"
+                "界面/照片类总长不超过 800 字；文档、题目、表格类放宽到 1500 字，抄关键信息别硬压，" +
+                "最要紧的（题干、要求、路径）放前面——消息里只带前 800 字，其余在工作台全文里。"
 
         /**
          * 持久化前把历史里的图片剥掉。一张截图的 base64 有上百 KB，
