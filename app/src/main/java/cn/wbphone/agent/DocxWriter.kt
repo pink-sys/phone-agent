@@ -19,8 +19,11 @@ import kotlin.math.roundToInt
  * WPS/Word 的导航窗格能直接跳）、要点列表用真项目符号（numbering，不是手打 •）、
  * 引用块左侧品牌色竖线。字体走「等线/微软雅黑」，WPS 和 Word 都有。
  *
- * 块结构和 pdf_write 保持一致（h1/h2/h3/p/bullet/quote/pagebreak/spacer），
+ * 块结构和 pdf_write 保持一致（h1/h2/h3/p/bullet/quote/pagebreak/spacer/code），另加两个
+ * Word 专用块：table（三线表，见 [docxTable]）和 subtitle（封面副标题/署名）；
  * 模型不用学第二套方言；行内 **粗体** 和 `代码` 复用 [Marked.inline]，口径也一致。
+ * code 块（整段源码逐行等宽，见 [codePara]）是给附录源代码的：真机实录，模型把
+ * 带换行的整段代码塞进 p 块，段落转义吃掉换行，交付稿里附录缠成一坨缠不清的密文。
  */
 object DocxWriter {
 
@@ -34,13 +37,13 @@ object DocxWriter {
     private const val PAGE_W = 11906
     private const val PAGE_H = 16838
 
-    // 版式配色跟雾蓝主题走，和 PPT 的深浅关系一致
-    private const val TITLE_INK = "14395B"
-    private const val HEAD_INK = "1F4E79"
-    private const val ACCENT = "4B67B4"
+    // 版式配色：正文一律黑（1F2933 视觉上等同黑，打印不失真），标题不再用品牌蓝——
+    // 真机反馈：正式文档里彩色标题显突兀，「正常黑色就行」。PPT 仍走雾蓝主题，那是设计品。
+    private const val TITLE_INK = "1F2933"
+    private const val HEAD_INK = "1F2933"
+    private const val ACCENT = "1F2933"
     private const val BODY_INK = "1F2933"
     private const val QUOTE_INK = "555F6B"
-    private const val RULE = "DCE4F2"
 
     // 字号单位是「半磅」：21=10.5pt（五号），32=16pt，44=22pt
     private const val BODY_SZ = 21
@@ -99,8 +102,10 @@ object DocxWriter {
         val lineRaw = if (b.has("line")) b.opt("line").toString() else ""
         val line: Int? = Regex("(\\d+(?:\\.\\d+)?)").find(lineRaw)?.groupValues?.get(1)
             ?.toDoubleOrNull()?.let { (it * 240).roundToInt().coerceIn(240, 960) }
-        return BlockStyle(font, ascii, size, bold, align, line,
-            noIndent = align == "center" || align == "right")
+        // indent:false → 顶格段（「关键词：」这类要与「摘要」左边对齐的行），不再首行缩进
+        val noIndent = align == "center" || align == "right" ||
+            (b.has("indent") && !b.optBoolean("indent"))
+        return BlockStyle(font, ascii, size, bold, align, line, noIndent)
     }
 
     private fun esc(s: String): String {
@@ -153,7 +158,16 @@ object DocxWriter {
         }
         var chars = 0
         for (i in 0 until blocks.length()) {
-            chars += blocks.optJSONObject(i)?.optString("text").orEmpty().length
+            val b = blocks.optJSONObject(i) ?: continue
+            chars += b.optString("text").length + b.optString("caption").length
+            // 表格的正文在 head/rows 里，不算进来就等于给自己开了个绕过字数上限的后门
+            val grid = b.optJSONArray("rows") ?: continue
+            val hd = b.optJSONArray("head")
+            if (hd != null) for (c in 0 until hd.length()) chars += hd.opt(c).toString().length
+            for (r in 0 until grid.length()) {
+                val row = grid.optJSONArray(r) ?: continue
+                for (c in 0 until row.length()) chars += row.opt(c).toString().length
+            }
         }
         if (chars > MAX_CHARS) {
             return err("TOO_LONG", "正文太长（$chars 字），上限 $MAX_CHARS 字。拆成多份文档")
@@ -180,9 +194,24 @@ object DocxWriter {
                     if (lv == 1) headings++
                     body.append(headingPara(text, lv, st))
                 }
-                "p", "para", "text", "" -> if (text.isNotEmpty()) body.append(bodyPara(text, st))
+                // p 块里混进换行（模型把代码/诗歌塞进正文）时按行拆段——esc 会把
+                // \n 压成空格，不拆就变成一坨分不出行的字
+                "p", "para", "text", "" ->
+                    for (ln in text.split('\n')) if (ln.isNotBlank()) body.append(bodyPara(ln.trim(), st))
                 "bullet" -> if (text.isNotEmpty()) body.append(bulletPara(text, st))
                 "quote" -> if (text.isNotEmpty()) body.append(quotePara(text, st))
+                // 分隔线：封面署名区与「摘要」之间的那条界线
+                "hr", "rule", "separator" -> body.append(hrPara())
+                // 代码块：text 是一整段源码（含换行缩进），写进前按行拆开——见 codePara
+                "code", "pre", "codeblock" -> {
+                    val raw = b.optString("text").trimEnd('\n', '\r')
+                    if (raw.isNotBlank()) body.append(codePara(raw))
+                }
+                // 表格：模型只要给 head + rows，样式全在这里定死——见 docxTable 的注释。
+                "table", "tbl" -> body.append(docxTable(b, st))
+                // 封面副标题 / 署名行：居中灰字、不缩进。封面用它，别拿表格摆姓名日期。
+                "subtitle", "meta", "center" ->
+                    if (text.isNotEmpty()) body.append(subtitlePara(text, st))
                 "pagebreak", "page_break" -> body.append(PAGE_BREAK)
                 "spacer", "blank" -> body.append("<w:p/>")
                 "image", "img", "picture" -> {
@@ -261,6 +290,7 @@ object DocxWriter {
             .put("bytes", out.length())
             .put("note", "DOCX 已生成（A4、1.5 倍行距、正文首行缩进两字、标题带大纲级别，WPS/Word 可直接编辑；" +
                 "块上可用 font/size/bold/align/line 逐段指定字体字号行距对齐；" +
+                "table 块（head+rows）出三线表；code 块放源代码（text 给一整段，逐行等宽排版）；" +
                 "image 块插工作台图片，text 当图注）。" +
                 "共 $words 字。" +
                 "要图表或精确分页改 pdf_write；要演示文稿改 pptx_write")
@@ -309,28 +339,29 @@ object DocxWriter {
             if (sz != BODY_SZ) rPr.append("<w:sz w:val=\"$sz\"/><w:szCs w:val=\"$sz\"/>")
             sb.append("<w:r>")
             if (rPr.isNotEmpty()) sb.append("<w:rPr>").append(rPr).append("</w:rPr>")
+            // 链接段：Word 里不做超链接（要挂 relationship，成本太高），
+            // 但 inline() 已把 [文字](url) 剥成文字，url 不补回来就真丢了——
+            // 跟在文字后面并进同一个 run：rPr 里 color 只能有一个，另开 run 得再写一遍配色
+            val shown = if (seg.link != null && seg.link!!.startsWith("http"))
+                seg.text + "（" + seg.link + "）" else seg.text
             // xml:space=preserve：中文段首空格、英文单词间空格才不会被吃掉
-            sb.append("<w:t xml:space=\"preserve\">").append(esc(seg.text)).append("</w:t></w:r>")
+            sb.append("<w:t xml:space=\"preserve\">").append(esc(shown)).append("</w:t></w:r>")
         }
         return sb.toString()
     }
 
     /**
-     * 文档大标题：居中、22pt 深蓝、标题下一条细线。
+     * 文档大标题：居中、22pt 黑。**不带装饰线**——真机对照交付稿（WorkBuddy 桌面版
+     * 出的文档），标题下面直接就是副标题/摘要，压一条横线反而显得样式重。
+     * 给了 title_style 就按它来（论文题目「宋体三号加粗」这类）。
      *
-     * 给了 title_style 就按它来（论文题目「宋体三号加粗」这类），并且**去掉装饰线**——
-     * 题目下划横线过不了格式审查。颜色也回到纯黑。
-     *
-     * pPr 的子元素顺序是 schema 定死的：pBdr → spacing → jc。顺序写反 Word 会
+     * pPr 的子元素顺序是 schema 定死的：spacing → jc。顺序写反 Word 会
      * 认为是「内容有错误」弹修复提示，WPS 更敏感——所以这里刻意按序拼。
      */
     private fun titlePara(title: String, st: BlockStyle? = null): String {
-        val rule = if (st == null)
-            "<w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"8\" w:color=\"$RULE\"/></w:pBdr>"
-        else ""
-        val spacing = "<w:spacing w:before=\"240\" w:after=\"360\"/>"
+        val spacing = "<w:spacing w:before=\"240\" w:after=\"160\"/>"
         val jc = "<w:jc w:val=\"${st?.align ?: "center"}\"/>"
-        return "<w:p><w:pPr>$rule$spacing$jc</w:pPr>" +
+        return "<w:p><w:pPr>$spacing$jc</w:pPr>" +
             runs(title, size = st?.size ?: 44, color = if (st == null) TITLE_INK else null,
                 bold = st?.bold ?: true, st = st) + "</w:p>"
     }
@@ -372,6 +403,195 @@ object DocxWriter {
             "<w:spacing w:before=\"120\" w:after=\"160\"$line/>" +
             "<w:ind w:left=\"480\" w:right=\"240\"/>" + jc +
             "</w:pPr>" + runs(text, color = QUOTE_INK, st = st) + "</w:p>"
+    }
+
+    /**
+     * 副标题 / 署名行：居中、黑色小字（小四），默认**宋体**——等线的破折号「——」
+     * 字形中间有断口，副标题里的「——以××为例」看起来像「- -」断开的（真机反馈）；
+     * 宋体（交付稿正文用的字体）的破折号是连续一条线。块上给 font 可覆写。
+     *
+     * 存在的理由很具体：以前要做封面，模型只能拿一张「项目 | 内容」两列表把姓名日期
+     * 摆上去——打开就是一张黑色全网格表盖在标题下，谁看都觉得土。给它一个正经的
+     * 居中行，封面才有第二种写法。
+     */
+    private fun subtitlePara(text: String, st: BlockStyle? = null): String {
+        val merged = BlockStyle(
+            st?.font ?: "宋体", st?.ascii, st?.size ?: 24, st?.bold,
+            "center", st?.line, true)
+        return "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"80\"/><w:jc w:val=\"center\"/></w:pPr>" +
+            runs(text, st = merged) + "</w:p>"
+    }
+
+    /**
+     * 分隔线：全宽细黑线，上下留空。给封面署名区和「摘要」之间用的——交付稿的
+     * 封面到正文有一条干净的界线，没有它标题区和正文黏在一起显得松散。
+     */
+    private fun hrPara(): String =
+        "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"$HEAD_INK\"/></w:pBdr>" +
+            "<w:spacing w:before=\"120\" w:after=\"240\"/></w:pPr></w:p>"
+
+    /**
+     * 代码块：一行一个段落，Consolas 9pt、单倍行距、不首行缩进，缩进原样保留
+     * （tab 折算成 4 个空格；xml:space=preserve 让段首空格不被吃）。
+     * 预览端靠「整段全等宽」认出它转成代码围栏——见 OfficeText.isCodePara。
+     */
+    private fun codePara(text: String): String {
+        val sb = StringBuilder()
+        for (raw in text.split('\n')) {
+            val line = raw.replace("\t", "    ").trimEnd()
+            sb.append("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"260\" w:lineRule=\"auto\"/>" +
+                "<w:ind w:left=\"240\"/></w:pPr>")
+                .append(codeRun(line))
+                .append("</w:p>")
+        }
+        return sb.toString()
+    }
+
+    /** 代码行的 run：等宽字体，不走 Marked.inline——代码里的星号反引号是字面量，不是标记。 */
+    private fun codeRun(line: String): String =
+        "<w:r><w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\" w:eastAsia=\"等线\"/>" +
+            "<w:color w:val=\"$BODY_INK\"/><w:sz w:val=\"18\"/><w:szCs w:val=\"18\"/></w:rPr>" +
+            "<w:t xml:space=\"preserve\">${esc(line)}</w:t></w:r>"
+
+    // ------------------------------------------------------------ 表格
+
+    /** 表头底色：浅灰，配黑表头字——纯黑白灰的表在任何报告里都不突兀。 */
+    private const val TABLE_HEAD_FILL = "F2F2F2"
+
+    /** 行分隔线：淡灰，只用来引导视线，不抢内容。 */
+    private const val TABLE_ROW_RULE = "D9D9D9"
+
+    /** 单表上限：超过就该走 xlsx_write，Word 里塞宽表谁都不好读。 */
+    private const val TABLE_MAX_ROWS = 200
+
+    /** 纯数字（含千分位、小数、正负、百分号、货币符号）——这种格子右对齐才像样。 */
+    private val NUMERIC = Regex("^[-+±¥$￥]?[\\d,]+(?:\\.\\d+)?\\s*(?:%|‰|万|亿|元)?$")
+
+    /** 表格里的一个格子：文字 + 是不是纯数字（决定右对齐）。 */
+    private class Cell(val text: String, val numeric: Boolean)
+
+    /**
+     * 表格块 → w:tbl。**样式在这里定死**，模型只需要给 head + rows：
+     *
+     * - 三线表：上下各一条黑色粗线、表头下一条中线、行间淡灰细线，**没有竖线**。
+     *   全黑网格是 Word 默认表的观感，也是「丑表格」的来源；三线表是中文报告/论文的通行样式。
+     * - 表头：浅灰底 + 黑色加粗字 + 垂直居中 + 跨页重复（tblHeader）。
+     * - 列宽按内容长度分配（中文按两字宽算），铺满正文区，短列不会被挤成竖排。
+     * - 数字列右对齐：财务/统计表一眼看出量级。
+     * - 表格前一行居中小字表题（caption/text），表后留一行空隙。
+     */
+    private fun docxTable(b: JSONObject, st: BlockStyle?): String {
+        val rows = b.optJSONArray("rows") ?: return ""
+        val head = b.optJSONArray("head")
+        fun readRow(arr: JSONArray?): List<Cell> {
+            if (arr == null) return emptyList()
+            val out = ArrayList<Cell>(arr.length())
+            for (i in 0 until arr.length()) {
+                val v = arr.opt(i)
+                val s = when (v) {
+                    null, JSONObject.NULL -> ""
+                    is JSONObject -> v.optString("text")
+                    else -> v.toString()
+                }.trim().replace('\n', ' ')
+                out.add(Cell(s, s.isNotEmpty() && NUMERIC.matches(s)))
+            }
+            return out
+        }
+
+        val headCells = readRow(head)
+        val bodyRows = ArrayList<List<Cell>>()
+        for (i in 0 until rows.length()) {
+            if (i >= TABLE_MAX_ROWS) break
+            val r = readRow(rows.optJSONArray(i)) 
+            if (r.isEmpty()) continue
+            bodyRows.add(r)
+        }
+        if (bodyRows.isEmpty() && headCells.isEmpty()) return ""
+        val cols = (listOf(headCells.size) + bodyRows.map { it.size }).maxOrNull() ?: 0
+        if (cols == 0) return ""
+
+        // 列宽：按每列最长内容的「显示宽度」分（中日韩字符算 2），短列给下限 4，
+        // 长列压到 30——否则一列长句会把别的列挤成一条竖线。
+        val weights = IntArray(cols) { c ->
+            var w = 4
+            if (c < headCells.size) w = maxOf(w, dispWidth(headCells[c].text))
+            for (r in bodyRows) if (c < r.size) w = maxOf(w, dispWidth(r[c].text))
+            w.coerceAtMost(30)
+        }
+        val sum = weights.sum().coerceAtLeast(1)
+        val widths = IntArray(cols) { c -> (CONTENT_W_TW * weights[c] / sum).coerceAtLeast(720) }
+
+        val sb = StringBuilder()
+        // 表题：caption 优先，没给就退到 text（和 image 块的图注同一套用法）
+        val capText = b.optString("caption").trim().ifEmpty { b.optString("text").trim() }
+        if (capText.isNotEmpty()) {
+            sb.append("<w:p><w:pPr><w:keepNext/><w:spacing w:before=\"200\" w:after=\"80\"/>")
+                .append("<w:jc w:val=\"center\"/></w:pPr>")
+                .append(runs(capText, size = 19, color = BODY_INK, bold = true))
+                .append("</w:p>")
+        }
+
+        sb.append("<w:tbl><w:tblPr><w:tblW w:w=\"5000\" w:type=\"pct\"/><w:jc w:val=\"center\"/>")
+            .append("<w:tblBorders>")
+            .append("<w:top w:val=\"single\" w:sz=\"12\" w:space=\"0\" w:color=\"$HEAD_INK\"/>")
+            .append("<w:left w:val=\"nil\"/><w:bottom w:val=\"single\" w:sz=\"12\" w:space=\"0\" w:color=\"$HEAD_INK\"/>")
+            .append("<w:right w:val=\"nil\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"$TABLE_ROW_RULE\"/>")
+            .append("<w:insideV w:val=\"nil\"/></w:tblBorders>")
+            .append("<w:tblLayout w:type=\"fixed\"/>")
+            .append("<w:tblCellMar><w:top w:w=\"70\" w:type=\"dxa\"/><w:left w:w=\"110\" w:type=\"dxa\"/>")
+            .append("<w:bottom w:w=\"70\" w:type=\"dxa\"/><w:right w:w=\"110\" w:type=\"dxa\"/></w:tblCellMar>")
+            .append("<w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"0\" ")
+            .append("w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr>")
+            .append("<w:tblGrid>")
+        for (w in widths) sb.append("<w:gridCol w:w=\"$w\"/>")
+        sb.append("</w:tblGrid>")
+
+        if (headCells.isNotEmpty()) {
+            sb.append("<w:tr><w:trPr><w:cantSplit/><w:tblHeader/></w:trPr>")
+            for (c in 0 until cols) {
+                val cell = headCells.getOrNull(c)
+                sb.append(cellXml(widths[c], cell?.text ?: "", head = true, numeric = false, st = st))
+            }
+            sb.append("</w:tr>")
+        }
+        for (r in bodyRows) {
+            sb.append("<w:tr><w:trPr><w:cantSplit/></w:trPr>")
+            for (c in 0 until cols) {
+                val cell = r.getOrNull(c)
+                sb.append(cellXml(widths[c], cell?.text ?: "", head = false, numeric = cell?.numeric == true, st = st))
+            }
+            sb.append("</w:tr>")
+        }
+        sb.append("</w:tbl>")
+        // 表格后补一行空段：Word 里表格紧贴正文会显得挤，且连续两个表格必须隔开
+        sb.append("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"120\"/></w:pPr></w:p>")
+        return sb.toString()
+    }
+
+    /** 一个单元格：宽度、底纹、垂直居中，段内不缩进。 */
+    private fun cellXml(width: Int, text: String, head: Boolean, numeric: Boolean, st: BlockStyle?): String {
+        val fill = if (head) "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$TABLE_HEAD_FILL\"/>" else ""
+        val jc = when {
+            head -> "center"
+            numeric -> "right"
+            else -> "left"
+        }
+        val size = if (head) 20 else BODY_SZ
+        val color = if (head) HEAD_INK else BODY_INK
+        // tcPr 子元素同样有固定顺序：tcW → tcBorders → shd → vAlign
+        val cellSt = BlockStyle(st?.font, st?.ascii, size, head, jc, null, true)
+        val para = if (text.isEmpty()) "" else runs(text, size = size, color = color, st = cellSt)
+        return "<w:tc><w:tcPr><w:tcW w:w=\"$width\" w:type=\"dxa\"/>" + fill +
+            "<w:vAlign w:val=\"center\"/></w:tcPr>" +
+            "<w:p><w:pPr><w:spacing w:before=\"40\" w:after=\"40\" w:line=\"280\" w:lineRule=\"auto\"/>" +
+            "<w:jc w:val=\"$jc\"/></w:pPr>" + para + "</w:p></w:tc>"
+    }
+
+    /** 显示宽度：中日韩全角算 2，其余算 1。列宽分配靠它，不然中文表格列宽全算错。 */
+    private fun dispWidth(s: String): Int {
+        var w = 0
+        for (c in s) w += if (c.code >= 0x2E80) 2 else 1
+        return w
     }
 
     // ------------------------------------------------------------ 图片

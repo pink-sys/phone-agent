@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
@@ -280,8 +281,111 @@ class MainActivity : Activity(), AgentHost.Listener {
     /**
      * 把持久化的历史画回消息流。截图的 base64 没存（太大），只留一条说明；
      * 工具卡按 tool_call_id 配对结果，折叠状态与实时跑完一致。
+     *
+     * 数据源有两条：**流水账优先**（全量、带照片、不受压缩截断），老会话回退模型历史。
      */
     private fun restoreTranscript(view: ChatUi, history: org.json.JSONArray) {
+        // 流水账是只追加、永不压缩的那份记录——豆包/DeepSeek 那种「往回翻全都在」
+        // 靠的就是它。压缩摘要、240 条截断只作用于模型视角的 history，动不到这里。
+        // 升级前的老会话流水账没记全（或还没记），回退到老渲染兜底。
+        val sid = AgentHost.currentSessionId()
+        val entries = if (sid != null) Transcript.read(this, sid) else emptyList()
+        val chatEntries = entries.filter { e ->
+            when (e.optString("type")) {
+                "user", "assistant", "tool", "error" -> true
+                else -> false
+            }
+        }
+        // 至少有一条真消息（user/assistant）才走流水账：只有 tool/error 的空壳不如老路径
+        val hasChat = chatEntries.any {
+            (it.optString("type") == "user" || it.optString("type") == "assistant") &&
+                it.optString("text").isNotBlank()
+        }
+        if (hasChat) {
+            restoreFromTranscript(view, chatEntries)
+            return
+        }
+        restoreFromModelHistory(view, history)
+    }
+
+    /**
+     * 从流水账画全量历史。照片按文件名从磁盘解码（后台线程，几张 JPEG 别卡主线程）。
+     * 分叉锚点传 -1：按正文找回回答的位置（AgentHost.forkFrom 自带兜底）。
+     */
+    private fun restoreFromTranscript(view: ChatUi, entries: List<JSONObject>) {
+        val photoNames = LinkedHashSet<String>()
+        for (e in entries) {
+            val arr = e.optJSONArray("photos") ?: continue
+            for (i in 0 until arr.length()) {
+                arr.optString(i).takeIf { it.isNotEmpty() }?.let { photoNames.add(it) }
+            }
+        }
+        Thread {
+            val bitmaps = HashMap<String, Bitmap>()
+            for (name in photoNames) {
+                val f = java.io.File(java.io.File(filesDir, "photos"), name)
+                if (!f.exists()) continue
+                runCatching { BitmapFactory.decodeFile(f.absolutePath) }
+                    .getOrNull()?.let { bitmaps[name] = it }
+            }
+            runOnUiThread { paintTranscript(view, entries, bitmaps) }
+        }.start()
+    }
+
+    private fun paintTranscript(view: ChatUi, entries: List<JSONObject>, bitmaps: Map<String, Bitmap>) {
+        val answers = StringBuilder()
+        for (e in entries) {
+            when (e.optString("type")) {
+                "user" -> {
+                    val photos = ArrayList<Bitmap>()
+                    val arr = e.optJSONArray("photos")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            bitmaps[arr.optString(i)]?.let { photos.add(it) }
+                        }
+                    }
+                    val text = AgentLoop.visibleUserText(e.optString("text"))
+                    // 空文字又没照片的条目（理论上不该有）不画，省一条空气泡
+                    if (text.isNotEmpty() || photos.isNotEmpty()) {
+                        view.collapseTurn()
+                        view.addUser(text, photos)
+                    }
+                }
+                "assistant" -> {
+                    val text = e.optString("text")
+                    if (text.isBlank()) continue
+                    view.addAssistant(text, -1)
+                    view.closeAssistant()
+                    answers.append(text).append('\n')
+                }
+                "tool" -> {
+                    val name = e.optString("name")
+                    val args = runCatching { JSONObject(e.optString("args")) }
+                        .getOrDefault(JSONObject())
+                    view.addTool(toolLabel(name), compactArgs(args))
+                    val okFlag = e.optBoolean("ok", true)
+                    val result = e.optString("result")
+                    view.finishTool(okFlag, toolSummary(result), prettyResult(result))
+                    // 写文件类工具补产物卡。流水账的 result 截到 300 字，path 一般就在开头；
+                    // 截丢了还有 revealMentionedArtifacts 按回答里提到的文件名兜底。
+                    if (okFlag && (name == "fs_write" || name == "fs_edit")) {
+                        val p = Regex("\"path\"\\s*:\\s*\"([^\"]+)\"").find(result)
+                            ?.groupValues?.get(1).orEmpty()
+                        if (p.isNotEmpty()) view.addArtifact(p)
+                    }
+                }
+                "error" -> {
+                    view.collapseTurn()
+                    view.addAssistant("（那次任务出错了：" + e.optString("message") + "）")
+                    view.closeAssistant()
+                }
+            }
+        }
+        revealMentionedArtifacts(answers.toString())
+        view.collapseTurn()
+    }
+
+    private fun restoreFromModelHistory(view: ChatUi, history: org.json.JSONArray) {
         val resultsById = HashMap<String, String>()
         for (i in 0 until history.length()) {
             val m = history.optJSONObject(i) ?: continue
@@ -311,11 +415,11 @@ class MainActivity : Activity(), AgentHost.Listener {
                         }
                         // 带文件的历史：正文只给过模型，气泡里裁掉，留一句「含文件 xxx」
                         val marker = "\n---\n【用户附上文件："
-                        val shown = if (content.contains(marker)) {
+                        val shown = AgentLoop.visibleUserText(if (content.contains(marker)) {
                             val head = content.substringBefore(marker).trim()
                             val fname = content.substringAfter(marker, "").substringBefore("】")
                             "$head（含文件 $fname）".trim()
-                        } else content
+                        } else content)
                         if (shown.isNotEmpty()) {
                             // 上一轮在这里收尾：过程收进一个折叠行，跟跑完时同一个形态
                             view.collapseTurn()
@@ -331,7 +435,7 @@ class MainActivity : Activity(), AgentHost.Listener {
                             if (part.optString("type") == "text") text.append(part.optString("text"))
                             if (part.optString("type") == "image_url") hasImage = true
                         }
-                        val shown = text.toString().trim()
+                        val shown = AgentLoop.visibleUserText(text.toString())
                         if (shown.isNotEmpty()) {
                             // 上一轮在这里收尾：过程收进一个折叠行，跟跑完时同一个形态
                             view.collapseTurn()
@@ -360,8 +464,12 @@ class MainActivity : Activity(), AgentHost.Listener {
                             .getOrDefault(JSONObject())
                         view.addTool(toolLabel(name), compactArgs(args))
                         val result = resultsById[fn.optString("id")] ?: ""
+                        // 失败判定走解析：org.json 键序不定，ok 未必排在串首，
+                        // startsWith 会把失败当成功（子代理熔断静默失效就是它）
+                        val okFlag = runCatching { JSONObject(result).optBoolean("ok", true) }
+                            .getOrDefault(true)
                         view.finishTool(
-                            !result.startsWith("{\"ok\":false"),
+                            okFlag,
                             toolSummary(result),
                             prettyResult(result),
                         )
@@ -370,7 +478,7 @@ class MainActivity : Activity(), AgentHost.Listener {
                         if (name == "fs_write" || name == "fs_edit") {
                             val p = runCatching { JSONObject(result).optString("path") }
                                 .getOrNull().orEmpty()
-                            if (!result.startsWith("{\"ok\":false") && p.isNotEmpty()) {
+                            if (okFlag && p.isNotEmpty()) {
                                 view.addArtifact(p)
                             }
                         }
@@ -462,7 +570,33 @@ class MainActivity : Activity(), AgentHost.Listener {
         view.setRunning(true, "正在准备…")
         running = true
         uiSession = sid
-        AgentHost.ask(toModel, sessionListener(sid), images)
+        // 照片落盘：流水账是全量历史的显示源，图片必须以文件形式留下来，
+        // 不然恢复会话时只剩「（含图片）」一行字——用户发过的照片就再也看不到了。
+        // dataUrl 本身就是压好的 JPEG，解码写文件是毫秒级，不值得为它开线程。
+        val photoFiles = savePhotoFiles(sid, images)
+        AgentHost.ask(toModel, sessionListener(sid), images, displayText = text, photoFiles = photoFiles)
+    }
+
+    /**
+     * 把这次附带的照片存进 filesDir/photos/，返回文件名列表（按发送顺序）。
+     * 文件名带会话 id 前缀：删会话时 AgentHost 按前缀清理，不留孤儿文件。
+     * 单张解码失败不影响其余——少一张图总好过整条消息发不出去。
+     */
+    private fun savePhotoFiles(sid: String, images: List<String>?): List<String> {
+        if (images.isNullOrEmpty()) return emptyList()
+        val dir = java.io.File(filesDir, "photos").apply { mkdirs() }
+        val stamp = System.currentTimeMillis()
+        val saved = ArrayList<String>()
+        for ((i, dataUrl) in images.withIndex()) {
+            val payload = dataUrl.substringAfter(',', "")
+            if (payload.isEmpty()) continue
+            val f = java.io.File(dir, "$sid-$stamp-$i.jpg")
+            val ok = runCatching {
+                f.writeBytes(android.util.Base64.decode(payload, android.util.Base64.NO_WRAP))
+            }.isSuccess
+            if (ok) saved.add(f.name)
+        }
+        return saved
     }
 
     // ---------------------------------------------------------------- 附件
@@ -605,29 +739,33 @@ class MainActivity : Activity(), AgentHost.Listener {
             setText("1-$MAX_PDF_PAGES")
             setSingleLine(true)
             textSize = 15f
-            setPadding(pad, pad / 2, pad, pad / 2)
+            setTextColor(Ui.INK)
+            setHintTextColor(Ui.INK4)
+            background = Ui.solid(this@MainActivity, Ui.SOFT, 12, Ui.LINE, 1)
+            setPadding(pad, dp(12), pad, dp(12))
             setSelectAllOnFocus(true)
         }
         val wrap = android.widget.FrameLayout(this).apply {
-            setPadding(pad, pad / 3, pad, 0)
             addView(box)
         }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("选页码范围")
-            .setMessage("《$name》共 $total 页。页数太多拼成一张长图会被压糊，一次最多带 $MAX_PDF_PAGES 页——填页码或范围（如 7-12，也可写 1-3,8）。")
-            .setView(wrap)
-            .setPositiveButton("发送") { _, _ ->
+        Dlg.alert(this) {
+            title = "选页码范围"
+            message = "《$name》共 $total 页。页数太多拼成一张长图会被压糊，一次最多带 $MAX_PDF_PAGES 页——填页码或范围（如 7-12，也可写 1-3,8）。"
+            view = wrap
+            positive = "发送"
+            onPositive = {
                 val pages = FileText.parsePages(box.text.toString(), total, MAX_PDF_PAGES)
                 if (pages == null) {
                     toast("页码没看懂（例：7-12），重新发一次文件再选")
-                    AttachPicker.cleanup(this)
+                    AttachPicker.cleanup(this@MainActivity)
                 } else {
                     Thread { renderPdfPages(file, name, pages, total) }.start()
                 }
             }
-            .setNegativeButton("取消") { _, _ -> AttachPicker.cleanup(this) }
-            .setOnCancelListener { AttachPicker.cleanup(this) }
-            .show()
+            negative = "取消"
+            onNegative = { AttachPicker.cleanup(this@MainActivity) }
+            onCancel = { AttachPicker.cleanup(this@MainActivity) }
+        }
     }
 
     /** 把选定页渲染拼图。pages 是 1 基页码，来自整本或用户圈的范围。 */
@@ -714,7 +852,7 @@ class MainActivity : Activity(), AgentHost.Listener {
         // 思考增量：不显示的话，用户面对的就是几秒纯空白，感觉「卡住了」
         override fun onThinking(delta: String) = post { if (mine) uiOnThinking(delta) }
         override fun onToolStart(name: String, args: JSONObject) = post { if (mine) uiOnToolStart(name, args) }
-        override fun onToolEnd(name: String, result: String, ok: Boolean) = post { if (mine) uiOnToolEnd(result, ok) }
+        override fun onToolEnd(name: String, args: JSONObject, result: String, ok: Boolean) = post { if (mine) uiOnToolEnd(result, ok) }
         override fun onImage(dataUrl: String) = post { if (mine) uiOnImage(dataUrl) }
 
         // 每轮结束就落一次盘：App 中途被杀（闪退、系统回收）最多丢当前这轮，
@@ -948,16 +1086,16 @@ class MainActivity : Activity(), AgentHost.Listener {
      * 那套识别跟着输入法走（讯飞/搜狗/百度输入法都有），识别结果直接写进输入框。
      */
     private fun explainNoVoice() {
-        AlertDialog.Builder(this)
-            .setTitle("这台手机没有语音识别服务")
-            .setMessage(
+        Dlg.alert(this) {
+            title = "这台手机没有语音识别服务"
+            message =
                 "月溯不做离线识别，声音要靠系统里的「语音转文字」服务，这台设备没装。\n\n" +
-                    "· 用键盘话筒（立刻可用）：点下面的按钮弹出键盘，再按输入法上的 🎤 说，字会直接进输入框；\n" +
-                    "· 或者装一个带识别能力的应用（Google、讯飞语记等），回来再点 🎤。"
-            )
-            .setPositiveButton("打开键盘") { _, _ -> chat?.focusInput() }
-            .setNegativeButton("知道了", null)
-            .show()
+                "· 用键盘话筒（立刻可用）：点下面的按钮弹出键盘，再按输入法上的 🎤 说，字会直接进输入框；\n" +
+                "· 或者装一个带识别能力的应用（Google、讯飞语记等），回来再点 🎤。"
+            positive = "打开键盘"
+            onPositive = { chat?.focusInput() }
+            negative = "知道了"
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -1152,34 +1290,37 @@ class MainActivity : Activity(), AgentHost.Listener {
                     sheet.dismiss()
                 }
                 row.setOnLongClickListener {
-                    android.app.AlertDialog.Builder(this)
-                        .setTitle(m.title)
-                        .setItems(arrayOf("看流水账（每一步做了什么）", "删除这个会话")) { _, which ->
-                            if (which == 0) {
+                    Dlg.alert(this) {
+                        this.title = m.title
+                        items = listOf(
+                            "看流水账（每一步做了什么）" to {
                                 sheet.dismiss()
                                 showTranscript(m.id, m.title)
-                                return@setItems
-                            }
-                            android.app.AlertDialog.Builder(this)
-                                .setTitle("删除这个会话？")
-                                .setMessage("「${m.title}」的${m.count} 条消息会一起删掉，不可恢复。")
-                                .setPositiveButton("删除") { _, _ ->
-                                    if (!AgentHost.deleteSession(m.id)) {
-                                        toast("这个会话还有任务在跑，停了再删")
-                                    } else {
-                                        if (isCur) {
-                                            chat?.welcome()
-                                            chat?.resetFooter()
+                            },
+                            "删除这个会话" to {
+                                Dlg.alert(this@MainActivity) {
+                                    this.title = "删除这个会话？"
+                                    message = "「${m.title}」的${m.count} 条消息会一起删掉，不可恢复。"
+                                    danger = true
+                                    positive = "删除"
+                                    onPositive = {
+                                        if (!AgentHost.deleteSession(m.id)) {
+                                            toast("这个会话还有任务在跑，停了再删")
+                                        } else {
+                                            if (isCur) {
+                                                chat?.welcome()
+                                                chat?.resetFooter()
+                                            }
+                                            toast("已删除")
+                                            sheet.dismiss()
+                                            showSessions()
                                         }
-                                        toast("已删除")
-                                        sheet.dismiss()
-                                        showSessions()
                                     }
+                                    negative = "算了"
                                 }
-                                .setNegativeButton("算了", null)
-                                .show()
-                        }
-                        .show()
+                            }
+                        )
+                    }
                     true
                 }
                 listBox.addView(row, Ui.margin(this, top = 2, bottom = 2))
@@ -1295,11 +1436,11 @@ class MainActivity : Activity(), AgentHost.Listener {
         toast("发一条最小请求确认…")
         AgentHost.probeModel { report ->
             runOnUiThread {
-                AlertDialog.Builder(this)
-                    .setTitle("模型自检")
-                    .setMessage(report)
-                    .setPositiveButton("知道了", null)
-                    .show()
+                Dlg.alert(this) {
+                    title = "模型自检"
+                    message = report
+                    positive = "知道了"
+                }
             }
         }
     }
@@ -1308,11 +1449,11 @@ class MainActivity : Activity(), AgentHost.Listener {
         toast("经本地网关发一条…")
         AgentHost.probeGateway { report ->
             runOnUiThread {
-                AlertDialog.Builder(this)
-                    .setTitle("网关自检")
-                    .setMessage(report)
-                    .setPositiveButton("知道了", null)
-                    .show()
+                Dlg.alert(this) {
+                    title = "网关自检"
+                    message = report
+                    positive = "知道了"
+                }
             }
         }
     }
@@ -1452,6 +1593,100 @@ class MainActivity : Activity(), AgentHost.Listener {
     /** 设置页正盖在对话页上；返回键先收设置页，不直接退 App。 */
     private var settingsShowing = false
 
+    /** 上次设置页的滚动位置：拨开关/异步回调都是整页重画，不恢复就弹回顶部（真机反馈）。 */
+    private var settingsScroll = 0
+
+    /**
+     * 工作台各层目录的滚动位置（key = 子目录相对路径，"" = 根目录）。
+     * 一层一个位置：进子页、退回上层、开预览再回来，都各自回原处。
+     * 早先用单个变量，从子页返回时把子页的偏移量套到根目录上，列表会莫名往上一跳（真机反馈）。
+     */
+    private val workspaceScrolls = HashMap<String, Int>()
+
+    private fun workspaceKey(folder: String?): String = folder ?: ""
+
+    /** container 当前整页里第一个纵向 ScrollView（设置/工作台/预览的滚动容器）。 */
+    private fun pageScroll(): android.widget.ScrollView? {
+        if (container.childCount == 0) return null
+        fun find(v: View): android.widget.ScrollView? {
+            if (v is android.widget.ScrollView) return v
+            if (v is ViewGroup) for (i in 0 until v.childCount) find(v.getChildAt(i))?.let { return it }
+            return null
+        }
+        return find(container.getChildAt(0))
+    }
+
+    private fun rememberScroll(): Int = pageScroll()?.scrollY ?: 0
+
+    /** 重画后把滚动位置放回去；post 到下一帧，内容变矮时 layout 自动钳到底部。 */
+    private fun restoreScroll(y: Int) {
+        if (y <= 0) return
+        val sv = pageScroll() ?: return
+        sv.post { sv.scrollTo(0, y) }
+    }
+
+    /**
+     * 设置页各行动态值文字的登记表（标题 → 值 TextView）。建页时填，整页拆掉时清。
+     * 值变了不再整页重画——重画那一帧整页闪一下，就算把滚动位置救回来也看得见晃动
+     * （真机反馈），改用 [refreshSettings] 原地改文字。
+     */
+    private val settingsValueViews = LinkedHashMap<String, android.widget.TextView>()
+
+    /**
+     * 各行动态值的唯一来源：建页时用它填初值，值变了 [refreshSettings] 也用它重算，
+     * 两处永远不会算岔。返回空串表示这行是静态文字，刷新时跳过。
+     */
+    private fun settingValue(title: String): String = when (title) {
+        "模型" -> ModelRegistry.resolve(AgentHost.modelId()).summary()
+        "思考深度" -> thinkStatusText()
+        "手机操控" -> if (accessibilityOn) "已开启" else "未开启"
+        "悬浮状态窗" ->
+            if (!settings.floatOn) "关"
+            else if (FloatStatus.permitted(this)) "开" else "需要授权"
+        "审批悬浮卡" ->
+            if (ApprovalOverlay.permitted(this)) "已授权 · 点这里试一下"
+            else "未授权 · 每次都要切回月溯"
+        "长期记忆" -> if (!settings.memoryOn) "关"
+        else {
+            val dir = getExternalFilesDir(null) ?: filesDir
+            val n = Memory.entries(dir).size
+            if (n == 0) "暂无记忆" else "已记 $n 条"
+        }
+        "技能包" -> if (!settings.skillsOn) "关"
+        else {
+            val all = AgentHost.skillItems()
+            val on = all.count { it.name !in settings.disabledSkills }
+            when {
+                all.isEmpty() -> "暂无"
+                on == all.size -> "已启用 ${all.size} 个"
+                else -> "已启用 $on / ${all.size}"
+            }
+        }
+        "自动恢复无障碍" -> if (A11yKeeper.granted(this)) "已授权" else "未授权"
+        "执行命令（shell）" -> if (settings.shellOn) "已打开" else "已关闭"
+        "Python 环境" -> pyStatusText()
+        "自动朗读回答" -> if (settings.voiceOn) "每轮都念" else "关"
+        "语音输入" -> voiceStatusText()
+        "人情味" -> if (settings.emotionOn) "开 · 回答带温度" else "关"
+        "任务后自动回对话页" -> if (settings.autoReturn) "开" else "关"
+        "状态行" -> "手机操控 " + (if (accessibilityOn) "已开启" else "未开启") +
+            " · 命令行 " + (if (settings.shellOn) "开" else "关") +
+            " · Python " + (if (settings.pyOn) "开" else "关")
+        else -> ""
+    }
+
+    /**
+     * 值变了只原地改各行的值文字，整页不动——不闪、滚动位置天然不丢。
+     * 结构变化（进出预览/换页）仍走整页重画。
+     */
+    private fun refreshSettings() {
+        if (!settingsShowing) return
+        for ((title, tv) in settingsValueViews) {
+            val v = settingValue(title)
+            if (v.isNotEmpty()) tv.text = v
+        }
+    }
+
     /**
      * 设置页：整页自绘，照 dsh-Go 的设置版式——
      * 顶部返回圆钮 + 大标题，下面是账户卡 + 分组卡片（AI / 权限 / 通用），
@@ -1459,14 +1694,19 @@ class MainActivity : Activity(), AgentHost.Listener {
      * 和这套雾蓝界面不是一路的，而且 12 行列表塞进对话框也没法分组。
      */
     private fun showSettings() {
+        // 重画（拨开关/弹窗回调）时记住原位置；首次进入用上次离开时记的位置
+        if (settingsShowing) settingsScroll = rememberScroll()
         settingsShowing = true
         container.removeAllViews()
         container.addView(buildSettingsPage(), FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        restoreScroll(settingsScroll)
     }
 
     private fun closeSettings() {
+        settingsScroll = rememberScroll()
         settingsShowing = false
+        settingsValueViews.clear()   // 值视图已随整页拆掉，别留悬挂引用
         reattachChat()
     }
 
@@ -1480,6 +1720,7 @@ class MainActivity : Activity(), AgentHost.Listener {
     private fun buildSettingsPage(): View {
         val page = Ui.column(this)
         page.background = Ui.screen(this)
+        settingsValueViews.clear()
 
         // ---- 顶栏：返回圆钮 + 大标题
         val head = Ui.row(this)
@@ -1521,20 +1762,18 @@ class MainActivity : Activity(), AgentHost.Listener {
         status.addView(View(this).apply {
             background = Ui.circle(this@MainActivity, if (accessibilityOn) Ui.OK else Ui.WARN, 7)
         }, LinearLayout.LayoutParams(dp(7), dp(7)).apply { rightMargin = dp(9) })
-        status.addView(Ui.text(this,
-                "手机操控 " + (if (accessibilityOn) "已开启" else "未开启") +
-                " · 命令行 " + (if (settings.shellOn) "开" else "关") +
-                " · Python " + (if (settings.pyOn) "开" else "关"),
-            12f, Ui.INK3))
+        val statusTv = Ui.text(this, settingValue("状态行"), 12f, Ui.INK3)
+        settingsValueViews["状态行"] = statusTv
+        status.addView(statusTv)
         account.addView(status)
         body.addView(account, Ui.margin(this, bottom = 18))
 
         // ---- AI
         body.addView(settingsGroup("AI", listOf(
             settingsRow("✦", Ui.BRAND_BG, Ui.ON_BRAND_BG, "模型",
-                ModelRegistry.resolve(AgentHost.modelId()).summary()) { showModelPicker() },
+                settingValue("模型")) { showModelPicker() },
             settingsRow("◐", Ui.BRAND_BG, Ui.ON_BRAND_BG, "思考深度",
-                thinkStatusText()) { showThinkPicker() },
+                settingValue("思考深度")) { showThinkPicker() },
             settingsRow("⇅", Ui.BRAND_BG, Ui.ON_BRAND_BG, "模型自检",
                 "发一条最小请求") { checkModel() },
             settingsRow("◇", Ui.BRAND_BG, Ui.ON_BRAND_BG, "网关自检",
@@ -1546,10 +1785,9 @@ class MainActivity : Activity(), AgentHost.Listener {
         // ---- 权限
         body.addView(settingsGroup("权限", listOf(
             settingsRow("◉", Ui.OK_BG, Ui.OK, "手机操控",
-                if (accessibilityOn) "已开启" else "未开启") { openAccessibilityDetails() },
+                settingValue("手机操控")) { openAccessibilityDetails() },
             settingsRow("◈", Ui.BRAND_BG, Ui.ON_BRAND_BG, "悬浮状态窗",
-                if (!settings.floatOn) "关"
-                else if (FloatStatus.permitted(this)) "开" else "需要授权") {
+                settingValue("悬浮状态窗")) {
                 if (!settings.floatOn) {
                     settings.floatOn = true
                     if (!FloatStatus.permitted(this)) FloatStatus.openPermissionPage(this)
@@ -1559,13 +1797,12 @@ class MainActivity : Activity(), AgentHost.Listener {
                     FloatStatus.refresh(this)
                     toast("已关闭悬浮状态窗")
                 }
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
             },
             // 跟「悬浮状态窗」分开：那个是看进度用的、可以关；这个是确认框能不能
             // 直接浮在目标应用上，关掉就得每次切回月溯点允许。
             settingsRow("◇", Ui.WARN_BG, Ui.WARN, "审批悬浮卡",
-                if (ApprovalOverlay.permitted(this)) "已授权 · 点这里试一下"
-                else "未授权 · 每次都要切回月溯") {
+                settingValue("审批悬浮卡")) {
                 if (ApprovalOverlay.permitted(this)) {
                     // 就地自检：不用真跑一个任务，也能确认卡片能不能浮起来、按钮能不能点。
                     // 排查过「卡片一闪就没 / 一直卡在等待审批」，这类问题肉眼两秒就能看出来。
@@ -1588,70 +1825,56 @@ class MainActivity : Activity(), AgentHost.Listener {
                 }
             },
             settingsRow("◎", Ui.BRAND_BG, Ui.BRAND, "长期记忆",
-                if (!settings.memoryOn) "关"
-                else {
-                    val dir = getExternalFilesDir(null) ?: filesDir
-                    val n = Memory.entries(dir).size
-                    if (n == 0) "暂无记忆" else "已记 $n 条"
-                }) { showMemory() },
+                settingValue("长期记忆")) { showMemory() },
             settingsRow("◈", Ui.BRAND_BG, Ui.BRAND, "技能包",
-                if (!settings.skillsOn) "关"
-                else {
-                    val all = AgentHost.skillItems()
-                    val on = all.count { it.name !in settings.disabledSkills }
-                    when {
-                        all.isEmpty() -> "暂无"
-                        on == all.size -> "已启用 ${all.size} 个"
-                        else -> "已启用 $on / ${all.size}"
-                    }
-                }) { showSkills() },
+                settingValue("技能包")) { showSkills() },
             settingsRow("↺", Ui.OK_BG, Ui.OK, "自动恢复无障碍",
-                if (A11yKeeper.granted(this)) "已授权" else "未授权") { showKeeperGuide() },
+                settingValue("自动恢复无障碍")) { showKeeperGuide() },
             settingsRow("❯", Ui.WARN_BG, Ui.WARN, "执行命令（shell）",
-                if (settings.shellOn) "已打开" else "已关闭") {
+                settingValue("执行命令（shell）")) {
                 toggleShell()
-                if (settingsShowing) showSettings()   // 值变了，整页重画
+                if (settingsShowing) refreshSettings()   // 值变了，原地刷新
             },
             settingsRow("⌗", Ui.BRAND_BG, Ui.ON_BRAND_BG, "Python 环境",
-                pyStatusText()) {
+                settingValue("Python 环境")) {
                 togglePy()
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
             },
         )), Ui.margin(this, bottom = 18))
 
         // ---- 语音
         body.addView(settingsGroup("语音", listOf(
             settingsRow("◍", Ui.BRAND_BG, Ui.BRAND, "自动朗读回答",
-                if (settings.voiceOn) "每轮都念" else "关") {
+                settingValue("自动朗读回答")) {
                 settings.voiceOn = !settings.voiceOn
                 toast(
                     if (settings.voiceOn) "以后每轮回答自动念出来（长回答只说重点）"
                     else "已关闭自动朗读，想听点回答下面的「朗读」"
                 )
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
             },
             settingsRow("🎤", Ui.BRAND_BG, Ui.ON_BRAND_BG, "语音输入",
-                voiceStatusText()) { voiceCheck() },
+                settingValue("语音输入")) { voiceCheck() },
         )), Ui.margin(this, bottom = 18))
 
         // ---- 通用
         body.addView(settingsGroup("通用", listOf(
             settingsRow("♡", Ui.BRAND_BG, Ui.BRAND, "人情味",
-                if (settings.emotionOn) "开 · 回答带温度" else "关") {
+                settingValue("人情味")) {
                 settings.emotionOn = !settings.emotionOn
                 toast(
                     if (settings.emotionOn) "以后回答先接情绪再干活，像聊天一样（下一条消息生效）"
                     else "已切回干练模式"
                 )
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
             },
             settingsRow("▢", Ui.SOFT2, Ui.INK2, "工作台目录",
                 "文件写在这里") { closeSettings(); showWorkspace("settings") },
             settingsRow("⇄", Ui.SOFT2, Ui.INK2, "任务后自动回对话页",
-                if (settings.autoReturn) "开" else "关") {
+                settingValue("任务后自动回对话页")) {
                 settings.autoReturn = !settings.autoReturn
                 toast(if (settings.autoReturn) "做完会自动回到对话页" else "已关闭，做完不再自动回来")
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
             },
             settingsRow("✎", Ui.SOFT2, Ui.INK2, "开启新会话",
                 "旧的保留在抽屉里") {
@@ -1693,12 +1916,14 @@ class MainActivity : Activity(), AgentHost.Listener {
         row.addView(Ui.text(this, title, 14f, Ui.INK),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         if (value.isNotEmpty()) {
-            row.addView(Ui.text(this, value, 12f, Ui.INK3).apply {
+            val tv = Ui.text(this, value, 12f, Ui.INK3).apply {
                 setPadding(0, 0, dp(7), 0)
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 maxWidth = dp(140)
-            })
+            }
+            settingsValueViews[title] = tv   // 值变了由 refreshSettings() 原地改
+            row.addView(tv)
         }
         row.addView(Ui.text(this, "›", 15f, Ui.INK4))
         row.setOnClickListener { onClick() }
@@ -1735,6 +1960,9 @@ class MainActivity : Activity(), AgentHost.Listener {
     /** 工作台整页正盖在对话页上；返回键先收工作台。 */
     private var workspaceShowing = false
 
+    /** 工作台当前浏览的子目录（null = 根目录）。点文件夹进子页，返回回上一层。 */
+    private var workspaceFolder: String? = null
+
     /** 工作台是从哪进来的（chat / settings），返回时回到原处。 */
     private var workspaceFrom = "chat"
 
@@ -1745,20 +1973,39 @@ class MainActivity : Activity(), AgentHost.Listener {
      * 「能点开的东西」比一段路径文字有用得多。顶部保留复制路径和清空两个操作。
      */
     private fun showWorkspace(from: String = "chat") {
+        // 重画（删除文件/弹窗回调）时把当前位置记到当前这一层
+        if (workspaceShowing) workspaceScrolls[workspaceKey(workspaceFolder)] = rememberScroll()
         workspaceFrom = from
         workspaceShowing = true
-        container.removeAllViews()
-        container.addView(buildWorkspacePage(), FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        renderWorkspace(workspaceKey(workspaceFolder))
     }
 
     private fun closeWorkspace() {
+        workspaceScrolls[workspaceKey(workspaceFolder)] = rememberScroll()
         workspaceShowing = false
+        workspaceFolder = null
         if (workspaceFrom == "settings") {
             showSettings()
         } else {
             reattachChat()
         }
+    }
+
+    /** 进入某个子目录页（null = 回根目录）。删除文件等回调里的 showWorkspace(workspaceFrom) 会停在当前目录。 */
+    private fun showWorkspaceAt(folder: String?) {
+        // 换层之前先按「旧层」的 key 记账——否则旧页的偏移量会被记到目标层头上
+        if (workspaceShowing) workspaceScrolls[workspaceKey(workspaceFolder)] = rememberScroll()
+        workspaceFolder = folder
+        workspaceShowing = true
+        renderWorkspace(workspaceKey(folder))
+    }
+
+    /** 画出工作台并恢复 [restoreKey] 那一层的位置（换页统一走这里，避免各处口径不一致）。 */
+    private fun renderWorkspace(restoreKey: String) {
+        container.removeAllViews()
+        container.addView(buildWorkspacePage(), FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        restoreScroll(workspaceScrolls[restoreKey] ?: 0)
     }
 
     /** 把对话页装回容器（设置/工作台等整页关闭时共用）。 */
@@ -1771,25 +2018,61 @@ class MainActivity : Activity(), AgentHost.Listener {
     }
 
     private fun buildWorkspacePage(): View {
-        val dir = getExternalFilesDir(null) ?: filesDir
-        val files = dir.walkTopDown().filter { it.isFile }
+        val root = getExternalFilesDir(null) ?: filesDir
+        val folder = workspaceFolder
+        val dir = if (folder.isNullOrEmpty()) root else java.io.File(root, folder)
+        // 隐藏文件（.artifacts.json 成品登记表）不进列表
+        val files = dir.walkTopDown().filter { it.isFile && !it.name.startsWith(".") }
             .sortedByDescending { it.lastModified() }
             .take(500)
             .toList()
 
+        // 分组判定，两层：①登记过的成品永远置顶（脚本也能是成品——Workbench 登记
+        // 了就认）；②没登记的按扩展名兜底分文档类。其余按顶层文件夹分组，
+        // 文件夹跟文件一样是一张白卡，点开进子目录页——2026-11-20 ACM 押题实录：
+        // 40 个字体子集 + 一堆 .py 把 PDF 压在下面
+        val artifactSet = runCatching {
+            val arr = org.json.JSONArray(java.io.File(root, ".artifacts.json").readText())
+            (0 until arr.length()).map { arr.optString(it) }.toHashSet()
+        }.getOrDefault(hashSetOf())
+        val DELIVER_EXT = setOf("pdf", "docx", "pptx", "xlsx", "csv", "html")
+
+        fun relOf(f: java.io.File) = f.relativeTo(dir).path.replace('\\', '/')
+        // 登记表记的是相对工作台根目录的路径；子页里换算成相对当前目录再比对
+        fun registered(f: java.io.File): Boolean {
+            val rel = relOf(f)
+            if (folder.isNullOrEmpty()) return rel in artifactSet
+            return "$folder/$rel" in artifactSet
+        }
+        val deliverables = files.filter { registered(it) || it.extension.lowercase() in DELIVER_EXT }
+        val rest = files.filter { it !in deliverables }
+        // 其余文件按顶层文件夹分组：当前目录散件一组，每个子目录一组
+        val byFolder = rest.groupBy { f ->
+            val rel = relOf(f)
+            if ('/' in rel) rel.substringBefore('/') else ""
+        }
+        val loose = byFolder[""] ?: emptyList()
+        val folders = byFolder.keys.filter { it.isNotEmpty() }.sorted()
+
         val page = Ui.column(this)
         page.background = Ui.screen(this)
 
-        // ---- 顶栏：返回圆钮 + 大标题 + 复制路径
+        // ---- 顶栏：返回圆钮 + 大标题 + 复制路径。子目录页标题显示目录名，返回回上一层
+        val backTo = if (folder == null) null
+        else folder.substringBeforeLast('/', missingDelimiterValue = "").ifEmpty { null }
         val head = Ui.row(this)
         head.setPadding(dp(14), dp(14), dp(14), dp(4))
         head.addView(Ui.text(this, "←", 17f, Ui.INK).apply {
             gravity = android.view.Gravity.CENTER
             contentDescription = "返回"
             background = Ui.solid(this@MainActivity, Ui.GLASS, 20)
-            setOnClickListener { closeWorkspace() }
+            setOnClickListener {
+                if (backTo == null && folder == null) closeWorkspace() else showWorkspaceAt(backTo)
+            }
         }, LinearLayout.LayoutParams(dp(40), dp(40)))
-        head.addView(Ui.text(this, "工作台", 20f, Ui.INK, true).apply {
+        head.addView(Ui.text(this,
+            if (folder.isNullOrEmpty()) "工作台" else folder.substringAfterLast('/'),
+            20f, Ui.INK, true).apply {
             setPadding(dp(12), 0, 0, 0)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         head.addView(Ui.textButton(this, "复制路径", Ui.INK2, 12.5f) {
@@ -1807,6 +2090,46 @@ class MainActivity : Activity(), AgentHost.Listener {
             "${dir.absolutePath.replace("/storage/emulated/0", "内部存储")} · 共 ${files.size} 个文件",
             10.5f, Ui.INK4).apply { setPadding(dp(2), dp(4), dp(2), dp(12)) })
 
+        // 一个文件行卡片：文件名 + 大小 + 改动时间 + 删除钮，点开进阅读页预览
+        fun fileRow(f: java.io.File) {
+            val rel = f.relativeTo(dir).path.replace('\\', '/')
+            val row = Ui.row(this)
+            row.setPadding(dp(13), dp(11), dp(13), dp(11))
+            row.background = Ui.solid(this, Ui.CARD, 14, Ui.LINE, 1)
+
+            val text = Ui.column(this)
+            val name = Ui.text(this, rel, 13f, Ui.INK, true).apply {
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            }
+            text.addView(name)
+            val time = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINESE)
+                .format(java.util.Date(f.lastModified()))
+            text.addView(Ui.text(this, "${humanSize(f.length())} · $time", 11f, Ui.INK3)
+                .apply { setPadding(0, dp(3), 0, 0) })
+            row.addView(text, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            // 删除钮：视觉小但热区 44dp；先确认再删，误触一次长按或点到不会直接丢文件
+            row.addView(Ui.text(this, "🗑", 13f, Ui.INK4).apply {
+                gravity = android.view.Gravity.CENTER
+                contentDescription = "删除 $rel"
+                setOnClickListener { confirmDeleteFile(f, rel) }
+            }, LinearLayout.LayoutParams(dp(44), dp(44)))
+            row.addView(Ui.text(this, "›", 14f, Ui.INK4))
+
+            row.setOnClickListener { showArtifactPreview(rel) }
+            body.addView(row, Ui.margin(this, bottom = 8))
+        }
+
+        fun section(label: String, hint: String) {
+            body.addView(Ui.text(this, label, 12.5f, Ui.INK, true).apply {
+                setPadding(dp(2), dp(10), dp(2), dp(2))
+            })
+            body.addView(Ui.text(this, hint, 10.5f, Ui.INK4).apply {
+                setPadding(dp(2), 0, dp(2), dp(8))
+            })
+        }
+
         if (files.isEmpty()) {
             val empty = Ui.column(this)
             empty.gravity = android.view.Gravity.CENTER
@@ -1819,39 +2142,43 @@ class MainActivity : Activity(), AgentHost.Listener {
             })
             body.addView(empty)
         } else {
-            for (f in files) {
-                val rel = f.relativeTo(dir).path.replace('\\', '/')
-                val row = Ui.row(this)
-                row.setPadding(dp(13), dp(11), dp(13), dp(11))
-                row.background = Ui.solid(this, Ui.CARD, 14, Ui.LINE, 1)
-
-                val text = Ui.column(this)
-                val name = Ui.text(this, rel, 13f, Ui.INK, true).apply {
-                    maxLines = 1
-                    ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            if (deliverables.isNotEmpty()) {
+                section("成品文件", "任务产出的交付物，直接点开用")
+                for (f in deliverables) fileRow(f)
+            }
+            // 文件夹行：跟文件行同一张白卡（圆角、描边、内距一致），点开进子目录页
+            if (folders.isNotEmpty()) {
+                section("文件夹", "按目录分组，点开进入")
+                for (name in folders) {
+                    val items = byFolder[name] ?: continue
+                    val head = Ui.row(this)
+                    head.setPadding(dp(13), dp(11), dp(13), dp(11))
+                    head.gravity = android.view.Gravity.CENTER_VERTICAL
+                    head.background = Ui.solid(this, Ui.CARD, 14, Ui.LINE, 1)
+                    val text = Ui.column(this)
+                    text.addView(Ui.text(this, name, 13f, Ui.INK, true).apply {
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                    })
+                    text.addView(Ui.text(this, "${items.size} 个文件", 11f, Ui.INK3)
+                        .apply { setPadding(0, dp(3), 0, 0) })
+                    head.addView(text, LinearLayout.LayoutParams(
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    head.addView(Ui.text(this, "›", 14f, Ui.INK4))
+                    head.setOnClickListener {
+                        showWorkspaceAt(if (folder.isNullOrEmpty()) name else "$folder/$name")
+                    }
+                    body.addView(head, Ui.margin(this, bottom = 8))
                 }
-                text.addView(name)
-                val time = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINESE)
-                    .format(java.util.Date(f.lastModified()))
-                text.addView(Ui.text(this, "${humanSize(f.length())} · $time", 11f, Ui.INK3)
-                    .apply { setPadding(0, dp(3), 0, 0) })
-                row.addView(text, LinearLayout.LayoutParams(
-                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                // 删除钮：视觉小但热区 44dp；先确认再删，误触一次长按或点到不会直接丢文件
-                row.addView(Ui.text(this, "🗑", 13f, Ui.INK4).apply {
-                    gravity = android.view.Gravity.CENTER
-                    contentDescription = "删除 $rel"
-                    setOnClickListener { confirmDeleteFile(f, rel) }
-                }, LinearLayout.LayoutParams(dp(44), dp(44)))
-                row.addView(Ui.text(this, "›", 14f, Ui.INK4))
-
-                row.setOnClickListener { showArtifactPreview(rel) }
-                body.addView(row, Ui.margin(this, bottom = 8))
+            }
+            if (loose.isNotEmpty()) {
+                section("其他文件", "脚本与中间产物")
+                for (f in loose) fileRow(f)
             }
         }
 
-        // ---- 底部危险操作：清空
-        if (files.isNotEmpty()) {
+        // ---- 底部危险操作：清空（只在根目录给，子目录里误触会波及整库）
+        if (files.isNotEmpty() && folder == null) {
             body.addView(Ui.textButton(this, "清空工作台", Ui.DANGER, 13f) {
                 confirmWipeWorkspace(dir)
             }, Ui.margin(this, top = 10))
@@ -1969,7 +2296,7 @@ class MainActivity : Activity(), AgentHost.Listener {
         }
         val content = try {
             val cap = 400_000
-            if (f.length() > cap) {
+            var read = if (f.length() > cap) {
                 val head = f.inputStream().use { input ->
                     val buf = ByteArray(cap)
                     val n = input.read(buf)
@@ -1980,12 +2307,18 @@ class MainActivity : Activity(), AgentHost.Listener {
             } else {
                 f.readText()
             }
+            // 模型把 / 过度转义成 \/ 落盘的老文件：预览和复制都按归一后的内容给，
+            // 和微信等 CommonMark 阅读器的显示口径一致，复制出去也不再带斜线
+            if (read.contains("\\/")) read = read.replace("\\/", "/")
+            read
         } catch (e: Exception) {
             toast("读不出来，可能是二进制文件")
             return
         }
 
         artifactShowing = true
+        // 从工作台点进预览前记住列表位置——返回时列表重画要回到原地
+        if (workspaceShowing) workspaceScrolls[workspaceKey(workspaceFolder)] = rememberScroll()
         container.removeAllViews()
         container.addView(
             ArtifactReader.build(
@@ -2009,6 +2342,8 @@ class MainActivity : Activity(), AgentHost.Listener {
             container.removeAllViews()
             container.addView(buildWorkspacePage(), FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            // 列表重画后回到点进来时的位置（弹回顶部是真机反馈的不便）
+            restoreScroll(workspaceScrolls[workspaceKey(workspaceFolder)] ?: 0)
         } else {
             reattachChat()
         }
@@ -2075,19 +2410,19 @@ class MainActivity : Activity(), AgentHost.Listener {
             toast("已关闭：助手不能再执行命令")
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("允许执行命令？")
-            .setMessage(
+        Dlg.alert(this) {
+            title = "允许执行命令？"
+            message =
                 "打开后，助手可以在工作台目录里执行 shell 命令，批量处理文件会快很多。\n\n" +
-                    "它没有 root 权限，碰不到系统和其他应用的数据。但命令能做的事比读写文件多，" +
-                    "建议先用几天文件工具，觉得信得过再打开。"
-            )
-            .setPositiveButton("打开") { _, _ ->
+                "它没有 root 权限，碰不到系统和其他应用的数据。但命令能做的事比读写文件多，" +
+                "建议先用几天文件工具，觉得信得过再打开。"
+            positive = "打开"
+            onPositive = {
                 settings.shellOn = true
                 toast("已打开。下一次对话生效")
             }
-            .setNegativeButton("算了", null)
-            .show()
+            negative = "算了"
+        }
     }
 
     /**
@@ -2102,25 +2437,25 @@ class MainActivity : Activity(), AgentHost.Listener {
             toast("已关闭：助手不能跑 Python 了（已下载的环境保留）")
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("打开 Python 环境？")
-            .setMessage(
+        Dlg.alert(this) {
+            title = "打开 Python 环境？"
+            message =
                 "打开后，助手可以在一个完整的 Linux 环境（Alpine + Python 3 + pip）里运行脚本，" +
-                    "数据处理、画图、跑现成的 .py 代码都会更顺手。\n\n" +
-                    "首次使用会自动在 Wi-Fi/流量下下载约 16MB 的运行环境（下载后占用约 60MB 存储）。" +
-                    "全程没有 root 权限，只能在应用自己的目录里活动。"
-            )
-            .setPositiveButton("打开") { _, _ ->
+                "数据处理、画图、跑现成的 .py 代码都会更顺手。\n\n" +
+                "首次使用会自动在 Wi-Fi/流量下下载约 16MB 的运行环境（下载后占用约 60MB 存储）。" +
+                "全程没有 root 权限，只能在应用自己的目录里活动。"
+            positive = "打开"
+            onPositive = {
                 settings.pyOn = true
                 // 开关打开就着手准备，别等会话里第一次调用才动——用户在这里
                 // 看着状态行呢，立刻给出「准备中 + 进度」的反馈才对。
                 // prepare() 幂等：已在下载/已就绪时直接返回，不会重复下。
                 PyRuntime.shared?.prepare()
                 toast("已打开。正在后台准备环境（约 16MB）")
-                if (settingsShowing) showSettings()   // 弹窗回调晚于整页重画，这里补一次
+                if (settingsShowing) refreshSettings()   // 弹窗回调晚于建页，这里补一次
             }
-            .setNegativeButton("算了", null)
-            .show()
+            negative = "算了"
+        }
     }
 
     /** 设置行上 Python 的状态小字。 */
@@ -2139,23 +2474,27 @@ class MainActivity : Activity(), AgentHost.Listener {
 
     /** 删单个文件：确认一次再动手，删完好回列表。 */
     private fun confirmDeleteFile(f: java.io.File, rel: String) {
-        AlertDialog.Builder(this)
-            .setTitle("删除这个文件？")
-            .setMessage("$rel\n\n删了就找不回来了。")
-            .setPositiveButton("删除") { _, _ ->
+        Dlg.alert(this) {
+            title = "删除这个文件？"
+            message = "$rel\n\n删了就找不回来了。"
+            danger = true
+            positive = "删除"
+            onPositive = {
                 if (f.delete()) toast("已删除 $rel") else toast("没删掉：文件可能被占用")
                 // 整页重画：计数、空状态、列表都要跟着变
                 if (workspaceShowing) showWorkspace(workspaceFrom)
             }
-            .setNegativeButton("取消", null)
-            .show()
+            negative = "取消"
+        }
     }
 
     private fun confirmWipeWorkspace(dir: java.io.File) {
-        AlertDialog.Builder(this)
-            .setTitle("清空工作台？")
-            .setMessage("会删掉助手写在这个目录里的所有文件，不可撤销。")
-            .setPositiveButton("删掉") { _, _ ->
+        Dlg.alert(this) {
+            title = "清空工作台？"
+            message = "会删掉助手写在这个目录里的所有文件，不可撤销。"
+            danger = true
+            positive = "删掉"
+            onPositive = {
                 val n = dir.walkTopDown().count { it.isFile }
                 dir.deleteRecursively()
                 dir.mkdirs()
@@ -2163,8 +2502,8 @@ class MainActivity : Activity(), AgentHost.Listener {
                 // 整页重画：列表和空状态要跟着变
                 if (workspaceShowing) showWorkspace(workspaceFrom)
             }
-            .setNegativeButton("取消", null)
-            .show()
+            negative = "取消"
+        }
     }
 
     // ---------------------------------------------------------------- 接入 dsh-Go
@@ -2239,12 +2578,14 @@ class MainActivity : Activity(), AgentHost.Listener {
         )
         box.addView(fieldRow("直连 API Key", token, token, "点一下复制整串令牌"))
 
-        AlertDialog.Builder(this)
-            .setTitle("接入 dsh-Go")
-            .setView(ScrollView(this).apply { addView(box) })
-            .setPositiveButton("复制全部") { _, _ -> copy("dsh-Go 配置", dshGoText(local, modelIds)) }
-            .setNegativeButton("关闭", null)
-            .show()
+        Dlg.alert(this) {
+            title = "接入 dsh-Go"
+            view = ScrollView(this@MainActivity).apply { addView(box) }
+            viewMaxHeightDp = 480
+            positive = "复制全部"
+            onPositive = { copy("dsh-Go 配置", dshGoText(local, modelIds)) }
+            negative = "关闭"
+        }
     }
 
     private fun sectionTitle(text: String): View =
@@ -2559,7 +2900,7 @@ class MainActivity : Activity(), AgentHost.Listener {
                     else "思考深度「${Think.label(level)}」，下一句话生效"
                 )
                 dialog.dismiss()
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
             }
             card.addView(row, Ui.margin(this, bottom = 8))
         }
@@ -2596,15 +2937,14 @@ class MainActivity : Activity(), AgentHost.Listener {
     fun showKeeperGuide() {
         val command = A11yKeeper.grantCommand(packageName)
         if (A11yKeeper.granted(this)) {
-            AlertDialog.Builder(this)
-                .setTitle("自动恢复已授权")
-                .setMessage(
+            Dlg.alert(this) {
+                title = "自动恢复已授权"
+                message =
                     "开关被系统关掉时，它会在两秒内自己写回去；重启手机后也会补回来。\n\n" +
-                        "想彻底停用，先在设置里关掉这个功能，再去系统设置里关无障碍——" +
-                        "否则你手动关掉，它会把开关又写回来。"
-                )
-                .setPositiveButton("知道了", null)
-                .show()
+                    "想彻底停用，先在设置里关掉这个功能，再去系统设置里关无障碍——" +
+                    "否则你手动关掉，它会把开关又写回来。"
+                positive = "知道了"
+            }
             return
         }
 
@@ -2619,14 +2959,15 @@ class MainActivity : Activity(), AgentHost.Listener {
             textSize = 13.5f
             setTextColor(Ui.INK2)
             setLineSpacing(dp(4).toFloat(), 1f)
-            setPadding(dp(18), dp(8), dp(18), dp(4))
+            setPadding(dp(2), dp(0), dp(2), dp(0))
         }
-        AlertDialog.Builder(this)
-            .setTitle("让它自己把开关写回来")
-            .setView(body)
-            .setPositiveButton("复制命令") { _, _ -> copyToClipboard("wb-a11y-grant", command) }
-            .setNegativeButton("知道了", null)
-            .show()
+        Dlg.alert(this) {
+            title = "让它自己把开关写回来"
+            view = body
+            positive = "复制命令"
+            onPositive = { copyToClipboard("wb-a11y-grant", command) }
+            negative = "知道了"
+        }
     }
 
     /**
@@ -2679,7 +3020,7 @@ class MainActivity : Activity(), AgentHost.Listener {
         master.setOnClickListener {
             AgentHost.setMemoryOn(!enabled)
             toast(if (!enabled) "已开启：新会话会带上记下的偏好和事实" else "已关闭：请求不再带记忆（文件还在）")
-            if (settingsShowing) showSettings()
+            if (settingsShowing) refreshSettings()
             dialog.dismiss()
             showMemory()
         }
@@ -2715,18 +3056,20 @@ class MainActivity : Activity(), AgentHost.Listener {
             row.addView(Ui.text(this, "删", 12.5f, Ui.WARN, true).apply {
                 setPadding(dp(12), dp(10), dp(12), dp(10))
                 setOnClickListener {
-                    AlertDialog.Builder(this@MainActivity)
-                        .setTitle("让它忘掉这条？")
-                        .setMessage(bodyText)
-                        .setPositiveButton("删掉") { _, _ ->
+                    Dlg.alert(this@MainActivity) {
+                        title = "让它忘掉这条？"
+                        message = bodyText
+                        danger = true
+                        positive = "删掉"
+                        onPositive = {
                             AgentHost.forgetMemory(line)
                             toast("已删掉，下一轮请求就不带它了")
-                            if (settingsShowing) showSettings()
+                            if (settingsShowing) refreshSettings()
                             dialog.dismiss()
                             showMemory()
                         }
-                        .setNegativeButton("留着", null)
-                        .show()
+                        negative = "留着"
+                    }
                 }
             })
             list.addView(row, Ui.margin(this, bottom = 8))
@@ -2752,18 +3095,20 @@ class MainActivity : Activity(), AgentHost.Listener {
             foot.addView(Ui.text(this, "清空全部", 12.5f, Ui.INK3).apply {
                 setPadding(dp(10), dp(10), dp(10), dp(10))
                 setOnClickListener {
-                    AlertDialog.Builder(this@MainActivity)
-                        .setTitle("清空 ${entries.size} 条记忆？")
-                        .setMessage("记下的偏好和事实都会没掉，之后要重新教。这一步不能撤销。")
-                        .setPositiveButton("清空") { _, _ ->
+                    Dlg.alert(this@MainActivity) {
+                        title = "清空 ${entries.size} 条记忆？"
+                        message = "记下的偏好和事实都会没掉，之后要重新教。这一步不能撤销。"
+                        danger = true
+                        positive = "清空"
+                        onPositive = {
                             AgentHost.clearMemory()
                             toast("已清空")
-                            if (settingsShowing) showSettings()
+                            if (settingsShowing) refreshSettings()
                             dialog.dismiss()
                             showMemory()
                         }
-                        .setNegativeButton("算了", null)
-                        .show()
+                        negative = "算了"
+                    }
                 }
             })
         }
@@ -2785,14 +3130,17 @@ class MainActivity : Activity(), AgentHost.Listener {
             textSize = 14f
             setSingleLine(false)
             maxLines = 4
+            setTextColor(Ui.INK)
+            setHintTextColor(Ui.INK4)
+            background = Ui.solid(this@MainActivity, Ui.SOFT, 12, Ui.LINE, 1)
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        val wrap = FrameLayout(this).apply { setPadding(dp(6), dp(2), dp(6), 0) }
-        wrap.addView(input)
-        AlertDialog.Builder(this)
-            .setTitle("记一条")
-            .setView(wrap)
-            .setPositiveButton("记下") { _, _ ->
+        val wrap = FrameLayout(this).apply { addView(input) }
+        Dlg.alert(this) {
+            title = "记一条"
+            view = wrap
+            positive = "记下"
+            onPositive = {
                 val saved = AgentHost.rememberManually(input.text.toString())
                 toast(
                     when {
@@ -2801,11 +3149,11 @@ class MainActivity : Activity(), AgentHost.Listener {
                         else -> "跟最近记过的重复，没再记一遍"
                     }
                 )
-                if (settingsShowing) showSettings()
+                if (settingsShowing) refreshSettings()
                 showMemory()
             }
-            .setNegativeButton("算了", null)
-            .show()
+            negative = "算了"
+        }
     }
 
     /**
@@ -2856,7 +3204,7 @@ class MainActivity : Activity(), AgentHost.Listener {
             if (AgentHost.skillsOn()) Ui.BRAND else Ui.INK3, true))
         master.setOnClickListener {
             AgentHost.setSkillsOn(!AgentHost.skillsOn())
-            if (settingsShowing) showSettings()
+            if (settingsShowing) refreshSettings()
             dialog.dismiss()
             showSkills()
         }
@@ -2894,7 +3242,7 @@ class MainActivity : Activity(), AgentHost.Listener {
                 setOnClickListener {
                     val nowOn = AgentHost.toggleSkill(item.name)
                     toast(if (nowOn) "已启用「${item.title}」" else "已停用「${item.title}」，清单里不再出现")
-                    if (settingsShowing) showSettings()
+                    if (settingsShowing) refreshSettings()
                     dialog.dismiss()
                     showSkills()
                 }
@@ -2942,16 +3290,17 @@ class MainActivity : Activity(), AgentHost.Listener {
             setBackgroundColor(0xFF12141A.toInt())
             addView(body)
         }
-        AlertDialog.Builder(this)
-            .setTitle("${item.title} · ${item.bytes / 1024} KB")
-            .setView(scroll)
-            .setPositiveButton("关闭", null)
-            .setNeutralButton("复制") { _, _ ->
+        Dlg.alert(this) {
+            title = "${item.title} · ${item.bytes / 1024} KB"
+            view = scroll
+            positive = "关闭"
+            neutral = "复制"
+            onNeutral = {
                 val cm = getSystemService(ClipboardManager::class.java)
                 cm?.setPrimaryClip(ClipData.newPlainText(item.name, Skill.body(item)))
                 toast("已复制全文")
             }
-            .show()
+        }
     }
 
     private fun copyToClipboard(label: String, text: String) {
@@ -2976,17 +3325,18 @@ class MainActivity : Activity(), AgentHost.Listener {
             setBackgroundColor(0xFF12141A.toInt())
             addView(body)
         }
-        AlertDialog.Builder(this)
-            .setTitle("运行日志")
-            .setView(scroll)
-            .setPositiveButton("关闭", null)
+        Dlg.alert(this) {
+            title = "运行日志"
+            view = scroll
+            positive = "关闭"
             // 之前这里只有「关闭」：想反馈问题只能截图，一屏二十行，翻十屏也发不全
-            .setNegativeButton("复制全文") { _, _ ->
+            negative = "复制全文"
+            onNegative = {
                 getSystemService(ClipboardManager::class.java)
                     ?.setPrimaryClip(ClipData.newPlainText("运行日志", text))
                 toast("已复制全文，可以直接粘给我")
             }
-            .show()
+        }
     }
 
     /**
@@ -3038,16 +3388,18 @@ class MainActivity : Activity(), AgentHost.Listener {
     private val TRANSCRIPT_PREVIEW = 60_000
 
     private fun confirmLogout() {
-        AlertDialog.Builder(this)
-            .setTitle("退出登录")
-            .setMessage("会删掉本机保存的令牌，下次要重新登录。对话上下文也会清空。")
-            .setPositiveButton("退出") { _, _ ->
+        Dlg.alert(this) {
+            title = "退出登录"
+            message = "会删掉本机保存的令牌，下次要重新登录。对话上下文也会清空。"
+            danger = true
+            positive = "退出"
+            onPositive = {
                 AgentHost.logout()
                 settings.onboardingDone = false
                 showOnboarding()
             }
-            .setNegativeButton("算了", null)
-            .show()
+            negative = "算了"
+        }
     }
 
     private fun requestNotificationPermission() {

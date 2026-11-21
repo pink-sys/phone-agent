@@ -57,6 +57,14 @@ class AgentLoop(
      * 屏幕上没动静，钱还在另一个循环里继续花。
      */
     private val externalCancel: () -> Boolean = { false },
+    /**
+     * 图说落盘的出口：给（文件名, 全文）返回工作台里的相对路径，写不进去返回 null。
+     *
+     * loop 自己够不到工作台（那是 toolbox 的沙箱，路径校验、目录映射都在它那边），
+     * 所以由宿主注入一个写文件的口子。默认 null = 不落盘，只把图说挂进消息里
+     * （JVM 测试、子代理都走这条降级路）。
+     */
+    private val saveNote: ((String, String) -> String?)? = null,
 ) {
 
     interface Listener {
@@ -75,8 +83,12 @@ class AgentLoop(
         /** 要调工具了 */
         fun onToolStart(name: String, args: JSONObject)
 
-        /** 工具执行完了，result 是回填给模型的那段文本 */
-        fun onToolEnd(name: String, result: String, ok: Boolean)
+        /**
+         * 工具执行完了，result 是回填给模型的那段文本。
+         * args 一起带上：并行执行时同名工具可能同时跑两个，宿主不能靠
+         * 「最后一次 start 的参数」来配对，得按调用自己带。
+         */
+        fun onToolEnd(name: String, args: JSONObject, result: String, ok: Boolean)
 
         /** 一轮模型调用结束（可能还有下一轮） */
         fun onTurnEnd(turn: Int)
@@ -238,7 +250,14 @@ class AgentLoop(
      *   有图时这条 user 消息用多模态 parts 承载（一段文字 + N 张图）——
      *   和工具截图走同一种格式，服务端只认这一种。
      */
-    fun run(userText: String, listener: Listener, imageDataUrls: List<String>? = null) {
+    fun run(
+        userText: String,
+        listener: Listener,
+        imageDataUrls: List<String>? = null,
+        // 自动续跑次数。主对话用默认值（长任务别停）；子代理传 0——它自己设了
+        // 轮数上限，再被自动续 2 次就是 3 倍时长（真机实录：10 轮变 30 轮，19 分钟）。
+        maxContinues: Int = Config.MAX_CONTINUES,
+    ) {
         cancelled = false
         lastCompleted = false
         // 每轮开始取一次。轮内多次请求里保持逐字节稳定，不打碎尾部缓存。
@@ -268,6 +287,13 @@ class AgentLoop(
 
         try {
             history.put(JSONObject().put("role", "user").put("content", userContent(userText, imageDataUrls)))
+            // 图先让模型说一遍（见 attachImageNote 的理由）：压缩只留文字，图一到摘要就变
+            // 「[附一张图片]」，图里的题目要求、学号、表格数据全丢——真机实录里压缩完
+            // 模型连「要做什么」都不知道了，只能重新猜。
+            if (!imageDataUrls.isNullOrEmpty()) {
+                listener.onRetry("正在看图，记下画面和文字…")
+                attachImageNote(history.length() - 1, imageDataUrls)
+            }
             // 话题词要在记忆检索之前定下来（含刚追加的这条）
             memQuery = topicQuery()
             val tools = toolbox.schemas()
@@ -317,7 +343,7 @@ class AgentLoop(
                     // 撞了输出上限：模型没说完，而且它是**知道自己被截断的**。
                     // 之前完全不看 finish_reason，8192 一撞就停在半句上，界面上像正常结束。
                     // 这里替用户把「接着写」说出口，最多续 Config.MAX_CONTINUES 次。
-                    if (turn.finishReason == "length" && continuations < Config.MAX_CONTINUES) {
+                    if (turn.finishReason == "length" && continuations < maxContinues) {
                         continuations += 1
                         budget += 1
                         if (turn.content.isNotEmpty()) {
@@ -370,34 +396,20 @@ class AgentLoop(
                 var anyOk = false
                 var touched = false        // 这轮有没有动作类调用
                 var screenMoved = false    // 动作之后界面有没有真的变化
-                for (call in turn.toolCalls) {
-                    // 已停止或已中止：剩下的调用仍然要补一条 tool 消息。
-                    // tool_calls 和 tool 消息必须成对，少一条下一轮请求会被服务端拒掉，
-                    // 那样连"任务已停止"这句话都发不出去。
-                    if (stopped() || aborted || phoneBusy) {
-                        history.put(
-                            JSONObject()
-                                .put("role", "tool")
-                                .put("tool_call_id", call.id)
-                                .put("content", SKIPPED)
-                        )
-                        continue
-                    }
 
-                    toolCount += 1
-                    val args = parseArgs(call.args)
-                    listener.onToolStart(call.name, args)
-
-                    val result = toolbox.execute(call.name, args, owner, { note ->
-                        // 子代理这类「工具里还套着若干轮请求」的调用，过程必须往外报一句：
-                        // 否则界面在十几轮里一直停在「派子代理…」上，用户以为卡死了。
-                        listener.onSubProgress(note)
-                    }, { stopped() })
+                // 每条结果的入账（历史、界面、产物卡）都走这里——串行/并行两条路共用，
+                // 别在两处各写一份，早晚算岔。
+                fun record(call: CloudClient.ToolCall, args: JSONObject, result: ToolResult) {
                     // 工具自己烧的 token（目前只有 task 会填）也要算进本轮：
                     // 不报的话，界面上会出现「聊了十分钟，积分几乎没动」的假象。
                     promptTokens += result.promptTokens
                     completionTokens += result.completionTokens
-                    val ok = !result.text.startsWith("{\"ok\":false")
+                    // 判失败别用 startsWith("{\"ok\":false")：org.json 的键序是 HashMap 序，
+                    // err() 出来的串可能是 {"code":...,"ok":false,...}——ok 不在开头，
+                    // 失败会被当成功（子代理熔断就是这么静默失效的）。真解析一次。
+                    val ok = runCatching {
+                        JSONObject(result.text).optBoolean("ok", true)
+                    }.getOrDefault(true)
                     if (ok) anyOk = true
                     // 手机被别人占着：记下这一条（下面是真实原因），本轮剩下的调用作废。
                     // 判据用 code 而不是整段文案——文案以后会改，code 是契约。
@@ -407,7 +419,7 @@ class AgentLoop(
                         // PhoneTools 会在「动作前后界面零变化」时给 screen_changed:false
                         if (!result.text.contains("\"screen_changed\":false")) screenMoved = true
                     }
-                    listener.onToolEnd(call.name, result.text, ok)
+                    listener.onToolEnd(call.name, args, result.text, ok)
 
                     // 单条结果不能无限进上下文：read_file 一次能读 256KB，那差不多是 3 万
                     // token，而且之后**每一轮**都要重发一遍——一个 40 轮的任务，光这一条就
@@ -423,10 +435,15 @@ class AgentLoop(
                             )
                     )
 
-                    // 写了文件（或生成了 PDF/PPT）就报给界面，让产物出现在对话里
+                    // 写了文件就报给界面，让产物出现在对话里——但只报登记过的成品
+                    // （pdf/docx/用户文档等，见 Workbench.noteDelivery）。中间脚本
+                    // 一屏一屏刷卡是 2026-11-20 ACM 押题的实录教训；模型真交付了
+                    // 脚本时，最终回答会点名它，末尾 revealMentionedArtifacts 兜底补卡。
                     if (ok && call.name in ARTIFACT_TOOLS) {
                         runCatching { JSONObject(result.text).optString("path") }.getOrNull()
-                            ?.takeIf { it.isNotEmpty() }?.let { listener.onArtifact(it) }
+                            ?.takeIf { it.isNotEmpty() }
+                            ?.takeIf { toolbox.isDelivered(it) }
+                            ?.let { listener.onArtifact(it) }
                     }
 
                     // html_preview 成功 = 用户要看到的网页渲染好了，立刻全屏打开
@@ -436,10 +453,18 @@ class AgentLoop(
                     }
 
                     // 截图这类工具返回图片。role:"tool" 只能放文本，所以紧跟一条 user 消息承载图片。
+                    // showInChat=false 的图（pdf_write 排版预览）只进模型通道，聊天里不显示。
                     result.imageDataUrl?.let { url ->
-                        listener.onImage(url)
+                        if (result.showInChat) listener.onImage(url)
+                        // 说明文字按工具分流：截图是「当前屏幕」，pdf_write 的预览图是
+                        // 「生成的 PDF 前几页」——写错口径模型会拿预览图去报屏幕坐标
+                        val caption = when (call.name) {
+                            "phone_screenshot" -> "（这是当前屏幕的截图）"
+                            "pdf_write" -> "（这是刚生成的 PDF 的前几页预览图。用它检查排版和文字是否正常；不要按这张图报坐标）"
+                            else -> "（这是该工具返回的预览图）"
+                        }
                         val parts = JSONArray()
-                            .put(JSONObject().put("type", "text").put("text", "（这是当前屏幕的截图）"))
+                            .put(JSONObject().put("type", "text").put("text", caption))
                             .put(
                                 JSONObject()
                                     .put("type", "image_url")
@@ -449,6 +474,69 @@ class AgentLoop(
                     }
 
                     if (toolbox.shouldAbort()) aborted = true
+                }
+
+                // —— 这一轮要不要并行跑 ——
+                // 模型经常在同一个回合里「派子代理 + 自己搜」：它嘴上说的「同时」，引擎以前
+                // 是串行的——task 独占九十多秒，搜索干等，用户看着就是「子代理慢得要死」。
+                // 只有全部落在 [PARALLEL_SAFE] 白名单里才各跑各的线程；含任何有隐式时序
+                // 依赖的调用（写文件、跑 Python、点手机）整轮维持串行，顺序绝对不乱。
+                val goParallel = turn.toolCalls.size > 1 && !stopped() &&
+                    turn.toolCalls.all { it.name in PARALLEL_SAFE }
+
+                if (goParallel) {
+                    val parsed = turn.toolCalls.map { parseArgs(it.args) }
+                    // start 事件在派发前按序发——宿主的流水账/UI 都不用操心并发交错
+                    for ((idx, call) in turn.toolCalls.withIndex()) {
+                        toolCount += 1
+                        listener.onToolStart(call.name, parsed[idx])
+                    }
+                    val results = arrayOfNulls<ToolResult>(turn.toolCalls.size)
+                    val pool = java.util.concurrent.Executors.newFixedThreadPool(
+                        turn.toolCalls.size.coerceAtMost(4))
+                    val futures = turn.toolCalls.mapIndexed { idx, call ->
+                        pool.submit {
+                            results[idx] = toolbox.execute(
+                                call.name, parsed[idx], owner,
+                                { note ->
+                                    // 并行时可能几路子代理一起报进度，串行化后再进宿主
+                                    synchronized(listener) { listener.onSubProgress(note) }
+                                },
+                                { stopped() })
+                        }
+                    }
+                    for (f in futures) runCatching { f.get() }
+                    pool.shutdown()
+                    // 结果按原调用顺序入账：和串行时完全一样的顺序，模型侧零差别
+                    for ((idx, call) in turn.toolCalls.withIndex()) {
+                        results[idx]?.let { record(call, parsed[idx], it) }
+                    }
+                } else {
+                    for (call in turn.toolCalls) {
+                        // 已停止或已中止：剩下的调用仍然要补一条 tool 消息。
+                        // tool_calls 和 tool 消息必须成对，少一条下一轮请求会被服务端拒掉，
+                        // 那样连"任务已停止"这句话都发不出去。
+                        if (stopped() || aborted || phoneBusy) {
+                            history.put(
+                                JSONObject()
+                                    .put("role", "tool")
+                                    .put("tool_call_id", call.id)
+                                    .put("content", SKIPPED)
+                            )
+                            continue
+                        }
+
+                        toolCount += 1
+                        val args = parseArgs(call.args)
+                        listener.onToolStart(call.name, args)
+
+                        val result = toolbox.execute(call.name, args, owner, { note ->
+                            // 子代理这类「工具里还套着若干轮请求」的调用，过程必须往外报一句：
+                            // 否则界面在十几轮里一直停在「派子代理…」上，用户以为卡死了。
+                            listener.onSubProgress(note)
+                        }, { stopped() })
+                        record(call, args, result)
+                    }
                 }
 
                 // 手机被另一个会话占着：别再绕了。
@@ -537,7 +625,7 @@ class AgentLoop(
             // —— 到达本段轮数上限还没收敛 ——
             // 先别停：替用户把「继续」说出口。之前是硬停等用户点「继续」，
             // 多数时候人根本不在看，任务就晾在那了。
-            if (continuations < Config.MAX_CONTINUES) {
+            if (continuations < maxContinues) {
                 continuations += 1
                 budget += maxTurns
                 history.put(
@@ -609,7 +697,7 @@ class AgentLoop(
         for (i in 0 until history.length()) {
             val m = history.optJSONObject(i) ?: continue
             if (i != lastImage && hasImage(m)) {
-                out.put(JSONObject().put("role", "user").put("content", DROPPED_IMAGE))
+                out.put(JSONObject().put("role", "user").put("content", droppedImageText(m)))
             } else if (m.has(THINK_KEY)) {
                 // 思考只留给用户回看，**不**发回模型：多带一份纯属白烧 token，
                 // 严格的网关还会因为不认识的字段直接 400。拷贝一份再摘，history 里的留着。
@@ -810,7 +898,7 @@ class AgentLoop(
      */
     private fun maybeCompact(listener: Listener) {
         if (history.length() < KEEP_TAIL + 4) return
-        if (history.toString().length < COMPACT_AT_CHARS) return
+        if (historyChars(history) < COMPACT_AT_CHARS) return
 
         // 切点只能是「非 tool」的消息。
         //
@@ -849,6 +937,9 @@ class AgentLoop(
         // 用户中途补的要求（「顺便给下载地址」「整理成 md」）一条都不能丢——
         // 只留第一条当目标的话，模型压完就「忘了」这些要求，用户只能一步步再提示。
         val asks = ArrayList<String>()
+        // 用户发来的图片的图说。图片本身活不到摘要里（base64 太大、落盘就剥），
+        // 这份文字是它唯一的替身——丢了图里的题目就等于丢了任务。
+        val figs = ArrayList<String>()
         val steps = ArrayList<String>()
         var calls = 0
 
@@ -858,7 +949,9 @@ class AgentLoop(
                 "user" -> {
                     // 带图消息的 content 是 JSON 数组（text + base64 图片），optString 会把
                     // 整段 base64 原样掏出来——截断后就是用户看到的「乱码」。只取文字部分。
-                    val t = briefUserText(m)
+                    // 图说段单独摘出来：它属于「任务是什么」的一部分，不能混进目标行被截断。
+                    val (t, fromMsg) = splitImageNotes(briefUserText(m))
+                    figs.addAll(fromMsg)
                     if (isSummary(m)) {
                         // 上一份摘要：解包继承它的目标与要求，过程行并入步骤——绝不是把它当
                         // 新目标再包一层。否则压第二次就出现「目标：[早期步骤摘要…目标：[早期
@@ -874,6 +967,12 @@ class AgentLoop(
                         for (line in t.lines()) {
                             val s = line.trim()
                             if (s.startsWith("- 要求：") && s.length > 5) asks.add(s.removePrefix("- 要求："))
+                        }
+                        // 图也继承：图说是「任务是什么」的一部分，压第二次丢了它，
+                        // 模型就只剩半句目标，又开始瞎猜。
+                        for (line in t.lines()) {
+                            val s = line.trim()
+                            if (s.startsWith("- 图：") && s.length > 4) figs.add(s.removePrefix("- 图："))
                         }
                     } else if (t.isNotBlank()) {
                         if (goal.isEmpty()) goal.append(t.take(240))
@@ -895,6 +994,8 @@ class AgentLoop(
         body.append("[早期步骤摘要｜已压缩 ").append(to - from).append(" 条消息、")
             .append(calls).append(" 次工具调用]\n")
         if (goal.isNotEmpty()) body.append("目标：").append(goal).append('\n')
+        // 图里的内容排在目标后面、要求前面：它是任务本身的一部分，不是用户后来补的附加条件。
+        for (f in figs.distinct().takeLast(MAX_BRIEF_FIGS)) body.append("- 图：").append(f).append('\n')
         // 用户中途补的要求逐条列出。这是用户原话的缩写，不是「细节」——丢了它们，
         // 模型就会把活干完一半（给了推荐没给链接），用户只能重新提示一遍。
         for (a in asks.distinct().takeLast(6)) body.append("- 要求：").append(a).append('\n')
@@ -953,6 +1054,110 @@ class AgentLoop(
     /** 这条 user 消息是压缩摘要而不是用户说的话？compact 标记优先，前缀匹配兜底旧会话。 */
     private fun isSummary(m: JSONObject): Boolean = isSummaryMessage(m)
 
+    /**
+     * 收到图先让模型把图「说」一遍，追加到那条 user 消息的末尾，全文另存到工作台。
+     *
+     * 为什么必须在收到图的当口做：图片只活在内存里（落盘前 base64 被剥掉），
+     * 而压缩只保留文字——一旦那条消息被压进摘要，图就变成一行「[附一张图片]」。
+     * 真机实录：用户发一张作业截图 +「我的学号后三位是002」，压缩之后模型只剩这半句话，
+     * 不知道要做什么作业，转头去搜「002 开头的股票」。
+     *
+     * 为什么是「图说」而不是「抄字」：很多图里根本没有字——一台机器的照片、一个界面、
+     * 一张图表。只让它誊文字，这类图等于什么都没留下。所以要求三样：画面是什么、
+     * 上面写了什么、图里要求做什么。
+     *
+     * 为什么还要落盘：消息里的图说会被摘要截断（一条只留 400 字），而 sessions 有上限、
+     * 历史也会瘦身。全文写进工作台的 images 目录（md 文件），压缩后模型照着路径 fs_read 就能拿回细节，
+     * 用户自己也能打开看。
+     *
+     * 读不出来不影响正事：这一轮模型照样看得见原图，只是压缩以后没得继承——降级成旧行为。
+     */
+    private fun attachImageNote(index: Int, urls: List<String>) {
+        val note = describeImages(urls)
+        if (note.isBlank()) return
+        val parts = history.optJSONObject(index)?.optJSONArray("content") ?: return
+        // 路径放在最前面：摘要里每条只留 400 字，截断时也先保住「去哪儿拿全文」。
+        val saved = saveNote?.let { sink ->
+            val name = "img-" + java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                .format(java.util.Date()) + ".md"
+            sink(name, note)?.let { "全文 $it\n" }
+        } ?: ""
+        parts.put(
+            JSONObject().put("type", "text")
+                .put("text", "\n\n" + IMG_NOTE_HEAD + "\n" + saved + note.take(IMG_NOTE_INLINE))
+        )
+    }
+
+    /** 一次专门的「看图说话」请求：只描述，不让它完成任务，免得跑偏成第二个任务。 */
+    private fun describeImages(urls: List<String>): String {
+        val parts = JSONArray().put(JSONObject().put("type", "text").put("text", IMG_NOTE_PROMPT))
+        for (u in urls) {
+            parts.put(
+                JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", u))
+            )
+        }
+        return try {
+            val one = JSONArray().put(JSONObject().put("role", "user").put("content", parts))
+            client.stream(one, null, isCancelled = { stopped() }).content.trim().take(IMG_NOTE_MAX)
+        } catch (e: Exception) {
+            "" // 读不了就算了，别把整个任务带崩
+        }
+    }
+
+    /**
+     * 从 user 文本里拆出图说段：返回（剩下的正文, 图说列表）。
+     * 摘要要单独列它们——图说动辄几百字，混进「目标」行会把任务本身挤掉。
+     */
+    private fun splitImageNotes(text: String): Pair<String, List<String>> {
+        if (!text.contains(IMG_NOTE_HEAD)) return text to emptyList()
+        val figs = ArrayList<String>()
+        val plain = StringBuilder()
+        var rest = text
+        while (true) {
+            val i = rest.indexOf(IMG_NOTE_HEAD)
+            if (i < 0) {
+                plain.append(rest)
+                break
+            }
+            plain.append(rest.substring(0, i))
+            val body = rest.substring(i + IMG_NOTE_HEAD.length)
+            val next = body.indexOf(IMG_NOTE_HEAD)
+            val seg = (if (next < 0) body else body.substring(0, next)).trim()
+            if (seg.isNotEmpty()) figs.add(seg.replace('\n', ' ').take(IMG_NOTE_KEEP))
+            if (next < 0) break
+            rest = body.substring(next)
+        }
+        return plain.toString() to figs
+    }
+
+    /**
+     * 旧截图降级成占位时，把图说一并留下。
+     *
+     * 占位的意义是「省 token 但别丢信息」：只留一句「截图已省略」，模型就再也不知道
+     * 那张图里写过什么；带上图说，省的是图片本身那一千来个 token，内容还在。
+     */
+    private fun droppedImageText(m: JSONObject): String {
+        val note = imageNoteOf(m)
+        return if (note.isEmpty()) DROPPED_IMAGE else DROPPED_IMAGE + "\n" + IMG_NOTE_HEAD + note
+    }
+
+    /** 一条消息里带着的图说（没有就空串）。 */
+    private fun imageNoteOf(m: JSONObject): String {
+        val parts = m.optJSONArray("content") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) {
+            val p = parts.optJSONObject(i) ?: continue
+            if (p.optString("type") != "text") continue
+            val t = p.optString("text")
+            val at = t.indexOf(IMG_NOTE_HEAD)
+            if (at < 0) continue
+            if (sb.isNotEmpty()) sb.append(' ')
+            sb.append(t.substring(at + IMG_NOTE_HEAD.length).trim().replace('\n', ' ').take(IMG_NOTE_KEEP))
+        }
+        return sb.toString()
+    }
+
+
     /** 从摘要正文里抠出「目标：」那一行——多级压缩时它始终是最初的那个任务。 */
     private fun summaryGoal(text: String): String = summaryGoalOf(text)
 
@@ -1005,6 +1210,15 @@ class AgentLoop(
         fun isSummaryMessage(m: JSONObject): Boolean =
             m.optBoolean("compact") || m.optString("content").startsWith(SUMMARY_PREFIX)
 
+        /**
+         * 界面上显示用户消息时用这份文本：图说段是给模型看的，气泡里不要——
+         * 用户没打过这些字，几百字的描述糊在自己消息里只会显得莫名其妙。
+         */
+        fun visibleUserText(text: String): String {
+            val at = text.indexOf(IMG_NOTE_HEAD)
+            return (if (at < 0) text else text.substring(0, at)).trim()
+        }
+
         /** 旧截图降级后的占位。保留在原来的位置，维持消息序列合法。 */
         const val DROPPED_IMAGE = "[此处原有一张更早的屏幕截图，为节省上下文已省略。需要时重新调用 phone_screenshot。]"
 
@@ -1024,6 +1238,54 @@ class AgentLoop(
                 )
             }
             return parts
+        }
+
+        /**
+         * 历史的「真实体积」：文本按字符数，截图按固定折算。
+         *
+         * 之前直接 history.toString().length 计账——一张截图的 base64 就有 15~30 万字符，
+         * 而 COMPACT_AT_CHARS 才 4.8 万，等于**截图一进历史就永远超阈值，每轮必压**。
+         * 真机实录（2026-11-20 学习通/微信两个任务）：流水账里「上下文压缩」每轮一条，
+         * 模型的计划每轮被压掉，表现就是反复点同一个搜索图标、反复重读同一个页面。
+         * 计账必须和 buildMessages 的口径一致：只有最后一张图真发出去（按 [IMAGE_CHAR_COST]
+         * 折算），更早的图降级成一行占位文本（按占位长度算）；工具调用的参数按全文算。
+         */
+        fun historyChars(h: JSONArray): Int {
+            var lastImage = -1
+            for (i in 0 until h.length()) {
+                val parts = h.optJSONObject(i)?.optJSONArray("content") ?: continue
+                for (j in 0 until parts.length()) {
+                    if (parts.optJSONObject(j)?.optString("type") == "image_url") { lastImage = i; break }
+                }
+            }
+            var n = 0
+            for (i in 0 until h.length()) {
+                val m = h.optJSONObject(i) ?: continue
+                n += 40   // role / id / 结构开销的毛估
+                when (val c = m.opt("content")) {
+                    is String -> n += c.length
+                    is JSONArray -> {
+                        var hasImg = false
+                        for (j in 0 until c.length()) {
+                            val p = c.optJSONObject(j) ?: continue
+                            if (p.optString("type") == "image_url") hasImg = true
+                            else n += p.optString("text").length
+                        }
+                        n += when {
+                            !hasImg -> 0
+                            i == lastImage -> IMAGE_CHAR_COST
+                            else -> DROPPED_IMAGE.length
+                        }
+                    }
+                    else -> if (c != null && c != JSONObject.NULL) n += c.toString().length
+                }
+                val tc = m.optJSONArray("tool_calls")
+                if (tc != null) for (j in 0 until tc.length()) {
+                    val f = tc.optJSONObject(j)?.optJSONObject("function") ?: continue
+                    n += f.optString("name").length + f.optString("arguments").length
+                }
+            }
+            return n
         }
 
         /** 被中止/停止后没执行的调用，也得回一条 tool 消息占位。 */
@@ -1082,6 +1344,14 @@ class AgentLoop(
             "phone_tap", "phone_tap_at", "phone_long_press", "phone_input", "phone_press_key", "phone_swipe", "phone_launch_app",
         )
 
+        /**
+         * 同一回合出现多个调用时允许并行的白名单——只放互不依赖的读/派类工具。
+         * 刻意用白名单而不是黑名单：fs_write + fs_edit 这类调用有隐式时序
+         * （先建文件才能改它），chart_write 的产物可能被同回合的 docx_write 引用，
+         * 黑名单永远列不全；不在白名单里的一律排队执行。
+         */
+        val PARALLEL_SAFE = setOf("task", "web_search", "web_fetch", "fs_list", "fs_search", "fs_read")
+
         /** 结果里没有 screen_after 的动作（微信的写入/长按是盲操作），不能挂核对提示。 */
         val NO_VERIFY = setOf("phone_input", "phone_long_press")
 
@@ -1093,6 +1363,13 @@ class AgentLoop(
 
         /** 历史字符数超过这个值就压缩。约 1.6 万 token，留足余量给工具 schema 和输出。 */
         const val COMPACT_AT_CHARS = 48_000
+
+        /**
+         * 最后一张（真正发出的）截图在计账里折成多少「字符」。
+         * provider 端一张图约 1000~2000 token，按 token≈char 的口径折 3000；
+         * 取常数而不是读 base64 长度——base64 是存储成本，不是模型成本。
+         */
+        const val IMAGE_CHAR_COST = 3_000
 
         /** 压缩时保留尾部多少条消息（约 4 轮工具往返）。 */
         const val KEEP_TAIL = 8
@@ -1128,14 +1405,51 @@ class AgentLoop(
             "（你的上一条回复是空的：没有文字，也没有工具调用。如果任务还没完成，就接着做下一步；" +
                 "如果已经完成，用一两句话向用户说明结果。不要再返回空内容。）"
 
-        /** 无效操作提醒：动作报了 ok 但界面没动——点错图层时最常见。 */
+        /** 无效操作提醒：动作报了 ok 但界面没动。普通页=点错图层；答题页=大纲恒定，要按屏幕真实进度判断。 */
         const val STALL_INEFFECTIVE_NUDGE =
-            "你的操作已经连续几轮没有让界面发生任何变化（screen_changed:false）。" +
-                "很可能点在了不响应的控件上。换用 phone_tap 的序号点击、" +
-                "换一个明显不同的位置，或先滑动/返回再试；这条路确实走不通就直说并结束任务。"
+            "你的操作已经连续几轮没有让界面大纲发生变化（screen_changed:false）。两种情况对号入座：" +
+                "① 普通页面——很可能点在了不响应的控件上，换用明显不同的位置、" +
+                "先滑动/返回再试；这条路确实走不通就直说并结束任务。" +
+                "② 答题类页面（大纲里有「单选题」「题干」且每轮一字不变）——大纲不变是正常的，" +
+                "别再重截整屏或重启应用：局部截图看选项选中状态和题号，按屏幕上的真实进度继续逐题作答。"
 
         const val MAX_BRIEF_STEPS = 14
         const val MAX_BRIEF_CHARS = 1_200
+        /** 摘要里最多带几张图的图说。再多就不是摘要了，而且图片类任务通常只有开头那几张要紧。 */
+        const val MAX_BRIEF_FIGS = 3
+
+        /**
+         * 图说段的开头标记。
+         *
+         * 一段专门的文字，跟着 user 消息走：压缩时进摘要的「- 图：」行，落盘时因为
+         * [stripImages] 只丢 image_url、保留文本而活下来，界面上又靠它把这段裁掉
+         * （用户没打过这些字）。三处都认这一个常量。
+         */
+        const val IMG_NOTE_HEAD = "【图片内容】"
+
+        /** 摘要里每条图说留多少字。够带上「全文路径 + 一句话概括」，细节回工作台读。 */
+        const val IMG_NOTE_KEEP = 400
+
+        /** 消息里挂多少字。再长就靠工作台那份全文，不必每轮重发一遍。 */
+        const val IMG_NOTE_INLINE = 800
+
+        /** 落盘全文的上限。图说再长也没信息量了，纯粹是模型在啰嗦。 */
+        const val IMG_NOTE_MAX = 2_000
+
+        /**
+         * 图说提示：画面 + 文字 + 要求，三样都要。
+         *
+         * 只让它「抄字」是上一版的想法，对纯照片、界面、图表等于什么都没留下——
+         * 用户发一张机器照片问「这是什么模块」，抄字抄不出任何东西。
+         * 但它仍然只是「描述」，不许动手解决问题：一旦让它答题，这一趟就成了第二个任务。
+         */
+        const val IMG_NOTE_PROMPT =
+            "看这张图，分三部分写下来：\n" +
+                "1) 画面：整体是什么（界面/照片/图表/文档/实物），关键对象、布局、状态；\n" +
+                "2) 文字：图里出现的文字逐字抄录（标题、题干、按钮、数字、表格），看不清用「?」；\n" +
+                "3) 要求：如果图里是题目、任务、报错或用户要照着做的东西，一两句写清它要求什么。\n" +
+                "只描述和抄录，不要评论、不要替用户解决问题、不要输出与图无关的内容。" +
+                "总长不超过 800 字。"
 
         /**
          * 持久化前把历史里的图片剥掉。一张截图的 base64 有上百 KB，

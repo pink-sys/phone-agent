@@ -270,6 +270,7 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
         }
 
         val rootfs = rootfsDir.absolutePath
+        cleanFailedPipResidue()
         // 脚本必须真的在工作台里，映射成 /bench/… 才传给 python
         val workPath = workDir.canonicalPath
         val scriptPath = script.canonicalPath
@@ -313,6 +314,21 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
                     env["TMPDIR"] = "/tmp"
                     env["LANG"] = "C.UTF-8"
                     env["PYTHONUNBUFFERED"] = "1"
+                    // —— pip 默认走国内镜像 ——
+                    // 直连 pypi.org 在手机上基本等于「装不上」：真机实录里 pip 装 matplotlib
+                    // 卡在源码包下载上超时，模型只能改用 apk 装系统包绕路。镜像不该靠模型
+                    // 「想起来」加 -i，那是环境该配好的事——配在这里，任何 pip 调用都自动生效，
+                    // 模型照常写 pip install 就行。
+                    // 与 apk 源保持一致（rootfs 里 /etc/apk/repositories 已经是清华源）。
+                    env["PIP_INDEX_URL"] = "https://pypi.tuna.tsinghua.edu.cn/simple"
+                    env["PIP_TRUSTED_HOST"] = "pypi.tuna.tsinghua.edu.cn"
+                    // 默认 15 秒对手机网络太紧，弱网一次抖动就要从头再来
+                    env["PIP_DEFAULT_TIMEOUT"] = "60"
+                    // Alpine 的 python 装在系统目录，PEP 668 会拦 pip，除非显式允许
+                    env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+                    // 能拿 wheel 就别拿 sdist：手机上编译 C 扩展是分钟级起步，还常缺头文件
+                    env["PIP_PREFER_BINARY"] = "1"
+                    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
                 }
                 .start()
         } catch (e: Exception) {
@@ -398,12 +414,42 @@ class PyRuntime(context: Context, private val workDir: File) : Workbench.PyEngin
             .put("chars", body.length)
             .put("output", body)
             .put("note", "脚本与产物都在工作台目录（rootfs 里是 /bench）。" +
-                "报错看 output；跑出的 PNG/xlsx/docx 直接用对应工具接住")
+                "报错看 output；跑出的 PNG/xlsx/docx 直接用对应工具接住。" +
+                "中间脚本、下载的依赖包这类过程文件放 tmp/ 子目录（会自动创建），用完可删；" +
+                "几十 MB 的下载物（字体包、模型包）用完当场删掉，工作台不是仓库；" +
+                "工作台根目录只留最终成品，别让用户在一堆脚本里找文件")
             .toString()
     }
 
     private fun err(code: String, message: String): String =
         JSONObject().put("ok", false).put("code", code).put("error", message).toString()
+
+    /**
+     * 清理 pip 构建失败的残留。pip 的临时构建目录（/var/tmp/pip-install-* 等）
+     * 构建成功时会被它自己删掉——能留下来的全是被打断/失败的那次（2026-11-21
+     * 真机实录：PyMuPDF 两次失败构建悄悄堆了 250MB，用户在系统设置里看到 800MB）。
+     *
+     * 口径（用户要求）：只认 pip 前缀的构建目录，别的临时文件一概不碰；
+     * 另加 15 分钟新鲜度保护——万一真有 pip 正在跑，也不误删它脚下的目录。
+     */
+    private fun cleanFailedPipResidue() {
+        val varTmp = File(rootfsDir, "var/tmp")
+        val staleMs = 15 * 60_000L
+        val prefixes = listOf("pip-install-", "pip-unpack-", "pip-build-env-", "pip-req-")
+        val now = System.currentTimeMillis()
+        var freed = 0L
+        runCatching {
+            for (f in varTmp.listFiles() ?: emptyArray()) {
+                if (prefixes.none { f.name.startsWith(it) }) continue
+                if (now - f.lastModified() < staleMs) continue
+                val size = f.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
+                if (f.deleteRecursively()) freed += size
+            }
+        }
+        if (freed > 0) {
+            Log.i(PYTAG, "cleaned %.1f MB failed pip build residue".format(freed / 1048576.0))
+        }
+    }
 
     companion object {
         /** 当前唯一的实例（AgentHost 构造时注册）。MainActivity 只读不造。 */

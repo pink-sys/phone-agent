@@ -307,8 +307,10 @@ class PhoneAccessibilityService : AccessibilityService(), DeviceApi {
             if (!small.contains(x, y) && !insideIme) {
                 return fail(
                     "目标应用在小窗里，($x, $y) 在小窗外面——点小窗外面会把它最小化，" +
-                        "界面会跳回别的应用。先双击小窗顶部横条（或点小窗右上角的放大按钮）" +
-                        "把它放大到全屏，再继续操作。",
+                        "界面会跳回别的应用。小窗里窗口尺寸和位置都变了，全屏坐标和粘贴菜单" +
+                        "位置都会偏，不要在小窗状态凑坐标硬点。先双击小窗顶部横条（或点小窗" +
+                        "右上角的放大按钮）把它放大到全屏，重新 phone_screenshot 确认已是全屏，" +
+                        "再按全屏坐标继续操作。",
                     "SMALL_WINDOW_OUTSIDE",
                 )
             }
@@ -324,7 +326,14 @@ class PhoneAccessibilityService : AccessibilityService(), DeviceApi {
         }
 
         val root = rootInActiveWindow
-        if (root != null) {
+        // WebView 窗口（学习通答题页、公众号文章等）不走 ACTION_CLICK 快捷通道：
+        // 页面内容住在 WebView 里，外面包着一层 clickable 的原生壳（LinearLayout 等），
+        // ACTION_CLICK 打在壳上「返回 true、WebView 收不到触摸」——这就是
+        // 「微信里坐标点按很准、学习通里点不住」的根源：微信整棵树对无障碍隐藏，
+        // 从来都走真手势，反而是准的。真手势（dispatchGesture 注入的触摸事件）
+        // 和手指等价，2026-11-20 在学习通答题页实测：真手势一次选中，ACTION_CLICK 十几次无效。
+        val webViewWindow = root != null && hasWebView(root, 0)
+        if (root != null && !webViewWindow) {
             val exact = findClickable(root, x, y)
             // 落点差几十像素、落在输入框边缘外面时，吸附到最近的输入框：
             // 模型估坐标的误差大多在 60px 内，这一步能把「点空了」变成「点上了」。
@@ -350,16 +359,35 @@ class PhoneAccessibilityService : AccessibilityService(), DeviceApi {
             }
         }
 
-        // 无障碍拿不到可点节点（自绘界面 / Canvas 绘制），退回手势。
+        // 无障碍拿不到可点节点（自绘界面 / Canvas 绘制）或窗口里有 WebView：都退回手势。
         // 100ms：太快（60ms）的轻点会被部分 WebView 当成误触丢掉。
         val tapped = dispatchPath(Path().apply { moveTo(x.toFloat(), y.toFloat()) }, 100)
         Thread.sleep(220)
         android.util.Log.i("YueshuInput", "tap: ($x,$y) gesture=$tapped cur=${currentPackage()}")
         return if (tapped) {
-            ok("navigatedTo" to currentPackage())
+            // activated 标「手势」：tap_at 的结果里模型能看到这次没走 ACTION_CLICK 快捷通道
+            ok("activated" to "手势", "navigatedTo" to currentPackage())
         } else {
             fail("点按没有被系统接受，可能屏幕已锁定或界面正在切换", "GESTURE_REJECTED")
         }
+    }
+
+    /**
+     * 窗口子树里有没有 WebView（含 X5 等第三方内核的类名）。
+     * 有的话，坐标点按必须走真手势——见 [tap] 里的说明。
+     * 深度限制复用 MAX_DEPTH：WebView 通常埋得不深，找不到就当没有，
+     * 代价只是回退到 ACTION_CLICK 旧路径，不会更糟。
+     */
+    private fun hasWebView(node: AccessibilityNodeInfo, depth: Int): Boolean {
+        if (depth > MAX_DEPTH) return false
+        if (node.className?.toString()?.contains("WebView") == true) return true
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val hit = runCatching { hasWebView(child, depth + 1) }.getOrDefault(false)
+            if (Build.VERSION.SDK_INT < 33) runCatching { child.recycle() }
+            if (hit) return true
+        }
+        return false
     }
 
     /** 从坐标点命中的节点往上找第一个可点击祖先，找不到再往子树上找。 */

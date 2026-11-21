@@ -9,16 +9,22 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
+import android.net.Uri
 import android.text.InputType
+import android.text.Spannable
 import android.text.SpannableStringBuilder
 import android.text.Spanned
+import android.text.TextPaint
+import android.text.method.LinkMovementMethod
 import android.text.style.BackgroundColorSpan
+import android.text.style.ClickableSpan
 import android.text.style.ForegroundColorSpan
 import android.text.style.LeadingMarginSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -130,8 +136,8 @@ class ChatUi(
     private var pendingFileText: String? = null
     private var pendingFileName: String? = null
 
-    /** 当前正在流式输出的助手正文；换新一轮就置空。 */
-    private var openBubble: TextView? = null
+    /** 当前正在流式输出的助手回答卡片（容器）；换新一轮就置空。 */
+    private var openBubble: LinearLayout? = null
 
     /** 最后一轮说完整的答案，给轮末「复制/分享」用。 */
     private var lastAnswer: String? = null
@@ -677,7 +683,11 @@ class ChatUi(
 
     // ------------------------------------------------------------ 消息
 
-    fun addUser(text: String) {
+    /**
+     * 一条用户气泡。[photos] 是恢复会话时从磁盘解码回来的照片（发送时仍走 pendingImages）。
+     * 两个来源共用同一套渲染：单张放大图、多张一排小方块。
+     */
+    fun addUser(text: String, photos: List<Bitmap> = emptyList()) {
         dropEmpty()
         finishProcess()
         // 新的一轮：上一轮的过程件已经收过了（或轮到收），清掉再记本轮的
@@ -689,20 +699,21 @@ class ChatUi(
         val wrap = Ui.column(act)
         // 带图的消息：气泡上方先放缩略图（图片本身在历史里，气泡只做视觉提示）。
         // 单张放大图；多选时一排小方块，挤不下的说明本来就贴在气泡文字里。
-        if (pendingImages.isNotEmpty()) {
-            if (pendingImages.size == 1) {
+        val shown = if (photos.isNotEmpty()) photos else pendingImages.map { it.thumb }
+        if (shown.isNotEmpty()) {
+            if (shown.size == 1) {
                 wrap.addView(android.widget.ImageView(act).apply {
                     scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
-                    setImageBitmap(pendingImages[0].thumb)
+                    setImageBitmap(shown[0])
                     background = Ui.solid(act, Ui.GLASS_SOFT, 14)
                     clipToOutline = true
                 }, LinearLayout.LayoutParams(dp(160), dp(120)).apply { gravity = Gravity.END })
             } else {
                 val strip = Ui.row(act).apply { gravity = Gravity.END }
-                for (img in pendingImages) {
+                for (img in shown) {
                     strip.addView(android.widget.ImageView(act).apply {
                         scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
-                        setImageBitmap(img.thumb)
+                        setImageBitmap(img)
                         background = Ui.solid(act, Ui.GLASS_SOFT, 10)
                         clipToOutline = true
                     }, LinearLayout.LayoutParams(dp(52), dp(52)).apply { leftMargin = dp(4) })
@@ -712,20 +723,24 @@ class ChatUi(
                 ).apply { gravity = Gravity.END })
             }
         }
-        val bubble = Ui.text(act, text, 14.5f, Ui.INK).apply {
+        val bubble = Ui.text(act, text, 14.5f, 0xFFFFFFFF.toInt()).apply {
+            // 行距比旧版松一档：白字在深底上更要留出呼吸感，挤着读特别累
+            setLineSpacing(dp(6).toFloat(), 1f)
             setPadding(dp(14), dp(10), dp(14), dp(11))
-            setLineSpacing(dp(4).toFloat(), 1f)
-            // 右下角收一个角，指向「我」这一侧
-            background = Ui.solidRadii(act, Ui.BUBBLE, intArrayOf(dp(18), dp(18), dp(5), dp(18)))
+            // 右下角收一个角，指向「我」这一侧；深蓝实底，和雾蓝底拉开对比
+            background = Ui.solidRadii(act, Ui.BUBBLE_ME, intArrayOf(dp(18), dp(18), dp(5), dp(18)))
             maxWidth = (act.resources.displayMetrics.widthPixels * 0.78f).toInt()
             // 自己发的话也能复制 / 拖选 / 引用回来改：之前只有回答能选，用户想复用自己的
             // 那句提示词只能重新手打一遍。长按走和回答同一套弹层，手感一致。
             setOnLongClickListener { showUserMenu(text); true }
         }
-        wrap.addView(bubble, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.END })
+        // 只有图没打字的 message：bubble 高度压到贴着图，别留一整条空白泡
+        if (text.isNotEmpty()) {
+            wrap.addView(bubble, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.END })
+        }
         feed.addView(wrap, Ui.margin(act, top = 8, bottom = 4))
         scrollDown()
     }
@@ -930,8 +945,20 @@ class ChatUi(
     /**
      * 一条回答在界面上的身份：原文（复制/分享/引用用）+ 它在会话历史里的下标（分叉用）。
      * 下标 -1 表示还不知道（正在流式的那一轮），跑完由 bindAnswerIndex 补上。
+     *
+     * [card] 是白卡容器（feed 的直接子节点，折叠逻辑按 tag 认它），[inner] 是卡里的
+     * 内容列：流式阶段只有 [body] 一个 TextView（span 渲染快），跑完 [collapseTurn]
+     * 调 [renderRich] 换成多视图——分块清晰的收子卡，分不出块的靠浅灰分节线，
+     * 这是一张 TextView 拼不出来的层次（2026-11-20 对照 Muse 改版）。
      */
-    private class AnswerRef(val raw: StringBuilder, var index: Int)
+    private class AnswerRef(
+        val raw: StringBuilder,
+        var index: Int,
+        val card: LinearLayout,
+        val inner: LinearLayout,
+        val body: TextView,
+        var rich: Boolean = false,
+    )
 
     private var openRef: AnswerRef? = null
 
@@ -940,33 +967,56 @@ class ChatUi(
         // 正文来了，思考过程让位
         endThinking()
         finishProcess()
+        val card = Ui.column(act)
+        val inner = Ui.column(act)
+        card.addView(inner, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         val body = Ui.text(act, "", 14.5f, Ui.INK).apply {
-            setLineSpacing(dp(5).toFloat(), 1f)
-            setPadding(dp(2), dp(6), dp(2), dp(6))
+            // 行距从约 1.55 拉到约 1.72：同样的字数眼睛不用逐行硬追，
+            // 长回复也不容易串行。这是「读着舒服」的三分之一，另两份在卡片和间距里。
+            setLineSpacing(dp(8).toFloat(), 1f)
         }
-        val ref = AnswerRef(StringBuilder(text), historyIndex)
+        val ref = AnswerRef(StringBuilder(text), historyIndex, card, inner, body)
         openRef = ref
         openRaw = ref.raw
-        if (text.isNotEmpty()) renderMarked(body, text)
-        body.tag = ref
-        body.setOnLongClickListener { showAnswerMenu(body); true }
-        feed.addView(body, Ui.margin(act, top = 2, bottom = 2))
-        turnPieces.add(body)
-        openBubble = body
+        card.tag = ref
+        // 长按挂在整个卡上：正文/子卡/代码块任何位置长按都出回答菜单
+        card.setOnLongClickListener { showAnswerMenu(card); true }
+        if (text.isNotEmpty()) {
+            // 整段直达（恢复会话、报错提示）：直接进富渲染，不用等收工
+            renderMarked(body, text)
+            dressCard(card)
+            renderRich(ref)
+        }
+        feed.addView(card, Ui.margin(act, top = 4, bottom = 5))
+        turnPieces.add(card)
+        openBubble = card
         scrollDown()
     }
 
+    /** 给回答卡穿上白底 + 描边 + 内边距。空气泡（流式没出字）不穿，免得先闪一枚白豆。 */
+    private fun dressCard(card: LinearLayout) {
+        card.background = Ui.solid(act, Ui.CARD, 18, Ui.CARD_LINE, 1)
+        card.setPadding(dp(14), dp(12), dp(14), dp(12))
+    }
+
     fun appendAssistant(delta: String) {
-        val body = openBubble ?: run {
+        if (openBubble == null) {
             addAssistant(delta)
             return
         }
-        val ref = openRef
-        val raw = ref?.raw ?: StringBuilder().also { openRaw = it }
-        raw.append(delta)
+        val ref = openRef ?: return
+        if (ref.rich) {
+            // 极罕见：富渲染后又来了增量（收工补发）。拆掉富视图回到流式态，别把字丢进真空。
+            ref.rich = false
+            ref.inner.removeAllViews()
+            ref.inner.addView(ref.body)
+        }
+        ref.raw.append(delta)
         // 流式期间整段重渲染：正文撑死了几 KB，解析是微秒级的事，
         // 换来的是星号一对上就变粗体，不用等这轮说完。
-        renderMarked(body, raw.toString())
+        renderMarked(ref.body, ref.raw.toString())
+        dressCard(ref.card)
         scrollDown()
     }
 
@@ -1002,8 +1052,8 @@ class ChatUi(
      * 为什么不直接把正文 TextView 设成可选中：流式期间整段重渲染会把选区打断，
      * 长按手势也一直空着，正好给菜单。「选择文字」单开一个静态弹层，那里随便拖选。
      */
-    private fun showAnswerMenu(tv: TextView) {
-        val ref = tv.tag as? AnswerRef ?: return
+    private fun showAnswerMenu(v: View) {
+        val ref = v.tag as? AnswerRef ?: return
         val raw = ref.raw.toString()
         if (raw.isBlank()) return
         showActionSheet("回答操作", "长按这段回答弹出的操作，只对这一轮生效。", listOf(
@@ -1184,58 +1234,250 @@ class ChatUi(
         val sb = SpannableStringBuilder()
         for (b in Marked.parse(src)) {
             if (sb.isNotEmpty()) sb.append(if (b.gap > 0) "\n\n" else "\n")
-            when (b.kind) {
-                "h" -> {
-                    val start = sb.length
-                    appendSegs(sb, b.lines[0])
-                    sb.setSpan(RelativeSizeSpan(
-                        if (b.level <= 1) 1.24f else if (b.level == 2) 1.14f else 1.07f),
-                        start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    sb.setSpan(StyleSpan(Typeface.BOLD), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                "ul", "ol" -> for ((i, segs) in b.lines.withIndex()) {
-                    if (i > 0) sb.append("\n")
-                    val start = sb.length
-                    if (b.kind == "ul") sb.append("•  ")
-                    appendSegs(sb, segs)
-                    // 悬挂缩进：折行后对齐文字而不是对齐圆点
-                    sb.setSpan(LeadingMarginSpan.Standard(0, dp(15)), start, sb.length,
-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                "quote" -> for ((i, segs) in b.lines.withIndex()) {
-                    if (i > 0) sb.append("\n")
-                    val start = sb.length
-                    sb.append("▎ ")
-                    appendSegs(sb, segs, Ui.INK2)
-                    sb.setSpan(ForegroundColorSpan(Ui.INK2), start, sb.length,
-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                "code" -> {
-                    val start = sb.length
-                    // 每行代码一条：行间补换行，缩进和空行都原样活着
-                    for ((i, segs) in b.lines.withIndex()) {
-                        if (i > 0) sb.append("\n")
-                        appendSegs(sb, segs, Ui.INK)
-                    }
-                    sb.setSpan(TypefaceSpan("monospace"), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    sb.setSpan(BackgroundColorSpan(Ui.SOFT), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    sb.setSpan(RelativeSizeSpan(0.92f), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    // 整块左缩进一点，跟正文分开；折行后也对齐缩进线
-                    sb.setSpan(LeadingMarginSpan.Standard(dp(8), dp(8)), start, sb.length,
-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                "hr" -> {
-                    val start = sb.length
-                    sb.append("──────────")
-                    sb.setSpan(ForegroundColorSpan(Ui.INK4), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                else -> for ((i, segs) in b.lines.withIndex()) {
-                    if (i > 0) sb.append("\n")
-                    appendSegs(sb, segs)
-                }
-            }
+            sb.append(spansOf(b))
         }
         tv.text = sb
+        // 有链接才挂 movement method——不挂的话普通点击/长按原样走气泡自己的逻辑
+        if (sb.getSpans(0, sb.length, ClickableSpan::class.java).isNotEmpty()) {
+            tv.movementMethod = LinkOnlyMovement()
+        }
+    }
+
+    /** 单个 Markdown 块 → span 序列。流式（整段一个 TextView）和富渲染共用。 */
+    private fun spansOf(b: Marked.Block): CharSequence {
+        val sb = SpannableStringBuilder()
+        when (b.kind) {
+            "h" -> {
+                val start = sb.length
+                appendSegs(sb, b.lines[0])
+                sb.setSpan(RelativeSizeSpan(
+                    if (b.level <= 1) 1.24f else if (b.level == 2) 1.14f else 1.07f),
+                    start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(StyleSpan(Typeface.BOLD), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            "ul", "ol" -> for ((i, segs) in b.lines.withIndex()) {
+                if (i > 0) sb.append("\n")
+                val start = sb.length
+                if (b.kind == "ul") sb.append("•  ")
+                appendSegs(sb, segs)
+                // 悬挂缩进：折行后对齐文字而不是对齐圆点
+                sb.setSpan(LeadingMarginSpan.Standard(0, dp(15)), start, sb.length,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            "quote" -> for ((i, segs) in b.lines.withIndex()) {
+                if (i > 0) sb.append("\n")
+                val start = sb.length
+                sb.append("▎ ")
+                appendSegs(sb, segs, Ui.INK2)
+                sb.setSpan(ForegroundColorSpan(Ui.INK2), start, sb.length,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            "code" -> {
+                val start = sb.length
+                // 每行代码一条：行间补换行，缩进和空行都原样活着
+                for ((i, segs) in b.lines.withIndex()) {
+                    if (i > 0) sb.append("\n")
+                    appendSegs(sb, segs, Ui.INK)
+                }
+                sb.setSpan(TypefaceSpan("monospace"), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(BackgroundColorSpan(Ui.SOFT), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(RelativeSizeSpan(0.92f), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                // 整块左缩进一点，跟正文分开；折行后也对齐缩进线
+                sb.setSpan(LeadingMarginSpan.Standard(dp(8), dp(8)), start, sb.length,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            "table" -> for ((i, segs) in b.lines.withIndex()) {
+                if (i > 0) sb.append("\n")
+                val start = sb.length
+                appendSegs(sb, segs)
+                // 表格在窄气泡里画网格必炸：Marked 已收成「首列 · 后续列」，
+                // 这里只管悬挂缩进，折行后对齐文字，跟列表一个节奏
+                sb.setSpan(LeadingMarginSpan.Standard(dp(2), dp(12)), start, sb.length,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            "hr" -> {
+                val start = sb.length
+                sb.append("──────────")
+                sb.setSpan(ForegroundColorSpan(Ui.INK4), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            else -> for ((i, segs) in b.lines.withIndex()) {
+                if (i > 0) sb.append("\n")
+                appendSegs(sb, segs)
+            }
+        }
+        return sb
+    }
+
+    /**
+     * 富渲染：把一条回答从「一坨 span」升级成多视图。
+     *
+     * 分两种长相（2026-11-20 对照 Muse 第三轮改）：
+     * - 分块清晰的（小标题 + 列表/引用）：小标题独立加粗、紧跟门牌的列表收进
+     *   浅灰子卡，一节一目了然；
+     * - 分不出块的叙述型：不再硬塞子卡，靠 Muse 式浅灰细线分节——门牌前一条线，
+     *   节尾回到叙述再一条，纯叙述就只有段落留白。
+     *
+     * 代码块深底浅字、引用浅底。流式期间仍是单 TextView（快），
+     * 跑完由 [collapseTurn] 调这里换装，恢复会话/报错直达时在 [addAssistant] 直接换。
+     */
+    private fun renderRich(ref: AnswerRef) {
+        if (ref.rich) return
+        val src = ref.raw.toString()
+        if (src.isBlank()) return
+        ref.rich = true
+        ref.inner.removeAllViews()
+        val blocks = Marked.parse(src)
+        var first = true
+        var prevKind = ""
+        var prevWasHead = false     // 上一块是不是一节的门牌
+        var prevWasGrouped = false  // 上一块是不是门牌带进子卡的列表（节的主体）
+        var drewLine = false        // 这一块前刚垫过分节线，自己的 top margin 让位
+        for ((bi, b) in blocks.withIndex()) {
+            val next = blocks.getOrNull(bi + 1)
+            val isHead = isSectionHead(b, next)
+            // 出节线：上一节的子卡列表完了、这一块回到普通叙述——节的边界两头都齐。
+            // 进下一节的情况由下面的进节线管，这里只管关门。
+            if (bi > 0 && prevWasGrouped && !isHead &&
+                b.kind != "hr" && b.kind != "ul" && b.kind != "ol") {
+                drawSectionLine(ref.inner)
+                drewLine = true
+            }
+            // 进节线：新一节的门牌前垫一条浅灰细线（首块前不垫、紧跟 hr 不垫）
+            if (bi > 0 && isHead && prevKind != "hr") {
+                drawSectionLine(ref.inner)
+                drewLine = true
+            }
+            val grouped = (b.kind == "ul" || b.kind == "ol") && prevWasHead
+            val v: View = when (b.kind) {
+                "h" -> Ui.text(act, "", 14.5f, Ui.INK).apply {
+                    text = spansOf(b)
+                    typeface = Typeface.DEFAULT_BOLD
+                    textSize = if (b.level <= 1) 16.5f else if (b.level == 2) 15f else 14.5f
+                    setLineSpacing(dp(3).toFloat(), 1f)
+                }
+                "code" -> TextView(act).apply {
+                    // 围栏内原样保留：行间补换行，缩进和空行都活着
+                    text = b.lines.joinToString("\n") { l -> l.joinToString("") { it.text } }
+                    setTextColor(Ui.CODE_FG)
+                    textSize = 12.5f
+                    typeface = Typeface.MONOSPACE
+                    setLineSpacing(dp(2).toFloat(), 1f)
+                    background = Ui.solid(act, Ui.CODE_BG, 12)
+                    setPadding(dp(12), dp(10), dp(12), dp(10))
+                }
+                "ul", "ol" -> listBlock(b, grouped)
+                "quote" -> Ui.text(act, "", 14f, Ui.INK2).apply {
+                    text = spansOf(b)
+                    background = Ui.solid(act, Ui.SOFT, 12)
+                    setLineSpacing(dp(5).toFloat(), 1f)
+                    setPadding(dp(12), dp(9), dp(12), dp(9))
+                }
+                "hr" -> View(act).apply { background = Ui.solid(act, Ui.CARD_LINE, 1) }
+                // p / table：span 渲染照旧（表格收成的紧凑行挂悬挂缩进）
+                else -> Ui.text(act, "", 14.5f, Ui.INK).apply {
+                    text = spansOf(b)
+                    setLineSpacing(dp(7).toFloat(), 1f)
+                }
+            }
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            // 块间空隙用 margin 给：比 \n\n 的自然行距稳，富渲染里行高不再被 span 撑乱
+            val top = when {
+                first || drewLine -> 0
+                b.gap >= 2 -> dp(10)
+                else -> dp(4)
+            }
+            lp.setMargins(0, top, 0, if (b.kind == "hr") dp(6) else 0)
+            ref.inner.addView(v, lp)
+            first = false
+            drewLine = false
+            prevWasHead = isHead
+            prevWasGrouped = grouped
+            prevKind = b.kind
+        }
+    }
+
+    /**
+     * 一节的门牌：`#` 标题，或下面三种段落写法——模型笔下都在承担「这里开始新的一节」：
+     * - 整行加粗的短段（提示词要求的「加粗小标题」）；
+     * - 加粗领句收在冒号上、正文接在同一行（「**购汇费：**蓝葵花主打…」问答体），
+     *   领句加粗 + 冒号收尾是极强的分节信号，后面带多少正文都算；
+     * - 短促带冒号且下面紧跟列表的素字领句（「国内能正常用的替代：」）。
+     */
+    private fun isSectionHead(b: Marked.Block, next: Marked.Block?): Boolean {
+        if (b.kind == "h") return true
+        if (b.kind != "p" || b.lines.size != 1) return false
+        val segs = b.lines[0]
+        if (segs.isEmpty()) return false
+        val text = segs.joinToString("") { it.text }.trim()
+        if (text.length < 2) return false
+        if (segs.all { it.bold && it.text.isNotBlank() } && text.length <= 60) return true
+        // 加粗领句收在冒号上，冒号在加粗里或紧随其后都算：
+        // 「**购汇费：**…」「**支付宝的钱能不能转进去**：可以。」
+        if (segs[0].bold) {
+            val lead = segs[0].text.trimEnd()
+            val after = if (text.startsWith(lead)) text.removePrefix(lead).trimStart() else ""
+            if (lead.endsWith("：") || lead.endsWith(":") ||
+                after.startsWith("：") || after.startsWith(":")) return true
+        }
+        return (text.endsWith("：") || text.endsWith(":")) && text.length <= 30 &&
+            (next?.kind == "ul" || next?.kind == "ol")
+    }
+
+    /**
+     * 一个列表块：[grouped] 时是门牌带的正文，收进浅灰子卡（分块清晰那一类）；
+     * 散落在叙述里的列表不穿底色，素净的圆点 + 留白，跟 Muse 的平铺一个气质。
+     */
+    private fun listBlock(b: Marked.Block, grouped: Boolean): View = Ui.column(act).apply {
+        if (grouped) {
+            background = Ui.solid(act, Ui.SOFT, 14)
+            setPadding(dp(12), dp(10), dp(12), dp(4))
+        }
+        for (segs in b.lines) {
+            addView(Ui.text(act, "", 14f, Ui.INK).apply {
+                val item = SpannableStringBuilder()
+                if (b.kind == "ul") item.append("•  ")
+                val start = item.length
+                appendSegs(item, segs)
+                // 悬挂缩进：折行后对齐文字而不是对齐圆点
+                item.setSpan(LeadingMarginSpan.Standard(0, dp(15)), start, item.length,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                text = item
+                setLineSpacing(dp(4).toFloat(), 1f)
+                setPadding(0, 0, 0, dp(6))
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+    }
+
+    /** 一条 Muse 式分节线：1dp 浅灰细线，上下各留一口呼吸。 */
+    private fun drawSectionLine(parent: LinearLayout) {
+        parent.addView(View(act).apply { background = Ui.solid(act, Ui.CARD_LINE, 1) },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 1).apply {
+                setMargins(0, dp(11), 0, dp(11))
+            })
+    }
+
+    /**
+     * 只在手指真压住链接时接管触摸。
+     *
+     * LinkMovementMethod 会把整个 TextView 的 DOWN/MOVE/UP 都吃掉，气泡的
+     * 长按菜单（复制/分享/引用）跟着一起废——这个是 2026-11-19 加链接时差点踩的坑。
+     * 这里先做命中测试：压的不是链接就返回 false，事件原样落回 TextView 自己的手势。
+     */
+    private class LinkOnlyMovement : LinkMovementMethod() {
+        override fun onTouchEvent(widget: TextView, buffer: Spannable, event: MotionEvent): Boolean {
+            val layout = widget.layout ?: return false
+            val x = event.x.toInt() + widget.scrollX - widget.totalPaddingLeft
+            val y = event.y.toInt() + widget.scrollY - widget.totalPaddingTop
+            if (x < 0 || y < 0 || x > layout.width || y > layout.height) return false
+            val line = layout.getLineForVertical(y)
+            val off = layout.getOffsetForHorizontal(line, x.toFloat())
+            val hit = buffer.getSpans(off, off, ClickableSpan::class.java)
+            return if (hit.isEmpty()) false else super.onTouchEvent(widget, buffer, event)
+        }
     }
 
     /** 一行里的段：粗体、行内代码各自上 span；baseColor 供引用行整体降调。 */
@@ -1253,6 +1495,29 @@ class ChatUi(
                 sb.setSpan(TypefaceSpan("monospace"), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 sb.setSpan(BackgroundColorSpan(Ui.SOFT), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
+            if (seg.link != null) {
+                // 主色 + 可点。ForegroundColorSpan 兜底给「选择文字」那类没挂
+                // movement method 的视图，不然链接文字还是黑的看不出是链接
+                val url = seg.link
+                sb.setSpan(ForegroundColorSpan(Ui.BRAND), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(object : ClickableSpan() {
+                    override fun onClick(widget: View) { openLink(url) }
+                    override fun updateDrawState(ds: TextPaint) {
+                        ds.color = Ui.BRAND
+                        ds.isUnderlineText = false
+                    }
+                }, start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+        }
+    }
+
+    /** 点正文里的链接：交给浏览器。没装浏览器或链接非法就弹个提示，别无声无息。 */
+    private fun openLink(url: String) {
+        val u = if (url.startsWith("http://") || url.startsWith("https://")) url else "https://$url"
+        try {
+            act.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+        } catch (e: Exception) {
+            android.widget.Toast.makeText(act, "打不开这个链接", android.widget.Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -1350,12 +1615,13 @@ class ChatUi(
     fun collapseTurn() {
         finishProcess()
         if (turnPieces.isEmpty()) return
-        // 最后一枚**回答**气泡 = 最终回答（思考行也是 TextView，靠 tag 区分，不能算进去）；
-        // 一枚都没有（纯工具轮 + 报错）就不留
+        // 最后一枚**回答**卡片 = 最终回答（tag=AnswerRef；思考行是 TextView+ThinkRef，
+        // 不能算进去）；一枚都没有（纯工具轮 + 报错）就不留
         var lastBubble = -1
         for (i in turnPieces.indices) {
             val p = turnPieces[i]
-            if (p is TextView && p.tag !is ThinkRef) lastBubble = i
+            if ((p is TextView && p.tag !is ThinkRef) ||
+                (p is ViewGroup && p.tag is AnswerRef)) lastBubble = i
         }
 
         var steps = 0
@@ -1363,6 +1629,7 @@ class ChatUi(
         var thinks = 0
         val removed = ArrayList<View>()
         val entries = ArrayList<View>()   // 收进折叠体的内容，按时间顺序
+        var answerRef: AnswerRef? = null
         for ((i, piece) in turnPieces.withIndex()) {
             when (piece) {
                 is ProcessGroup -> {
@@ -1382,9 +1649,21 @@ class ChatUi(
                         entries.add(piece)
                     }
                 }
+                is ViewGroup -> {
+                    // 回答卡（中途的说明段也是一张卡）：最后一枚留在折叠外，其余收进去
+                    if (i == lastBubble) answerRef = piece.tag as? AnswerRef
+                    else {
+                        notes++
+                        removed.add(piece)
+                        entries.add(piece)
+                    }
+                }
             }
         }
         turnPieces.clear()
+        // 最终回答换装成富渲染：小标题/列表子卡/代码深块（流式阶段只有一坨 span）。
+        // 放在收拢之后——此刻它就是折叠行下面那张留住的卡。
+        answerRef?.let { renderRich(it) }
         if (entries.isEmpty()) return
 
         // 插入点 = 被收内容末尾的下一个兄弟（产物卡 / 思考行 / 最终回答），保持它们在折叠行下面

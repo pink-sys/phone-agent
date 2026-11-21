@@ -99,6 +99,20 @@ internal object Ui {
     /** 用户气泡 */
     val BUBBLE = 0xFFD9E4FD.toInt()
 
+    /**
+     * 我方气泡：深蓝实底配白字（对照 Muse 的分层改法）。
+     * 旧版浅蓝灰泡泡贴在雾蓝底上几乎没对比——三层（雾蓝底 / 深蓝气泡 / 白卡片）分明后，
+     * 谁在说话一眼就能分清。
+     */
+    val BUBBLE_ME = 0xFF3F5DC2.toInt()
+
+    /** 回答白卡片的描边：比 GLASS_LINE 实一点的蓝灰细线，白卡才不至于糊进浅色里。 */
+    val CARD_LINE = 0xFFE1E6F2.toInt()
+
+    /** 代码块：深底浅字（对照 Muse 的改法——浅灰底代码在白卡里没有「这是代码」的信号）。 */
+    val CODE_BG = 0xFF2B3245.toInt()
+    val CODE_FG = 0xFFDCE2F5.toInt()
+
     // ══ 语义色（低饱和，不抢主色）═══════════════════════════
     val OK = 0xFF3E7D5B.toInt()
     val OK_BG = 0xFFE9F2EC.toInt()

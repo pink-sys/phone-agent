@@ -1,5 +1,6 @@
 package cn.wbphone.agent
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -12,14 +13,20 @@ import org.json.JSONObject
 object TranscriptText {
     // ------------------------------------------------------------ 快捷构造
 
-    fun user(text: String, withImage: Boolean = false): JSONObject =
+    /**
+     * 用户消息。流水账是「全量历史」的唯一数据源（模型视角的 history 会被压缩截断），
+     * 所以这里的上限按**聊天界面能完整显示**来定：长 prompt、贴的文件说明都不该被腰斩。
+     * [photos] 是随消息落盘的照片文件名（filesDir/photos/ 下），恢复会话时按名回显图片。
+     */
+    fun user(text: String, withImage: Boolean = false, photos: List<String> = emptyList()): JSONObject =
         JSONObject()
             .put("type", "user")
-            .put("text", text.take(2000))
+            .put("text", text.take(6000))
             .put("withImage", withImage)
+            .apply { if (photos.isNotEmpty()) put("photos", JSONArray(photos)) }
 
     fun assistant(text: String): JSONObject =
-        JSONObject().put("type", "assistant").put("text", text.take(4000))
+        JSONObject().put("type", "assistant").put("text", text.take(16000))
 
     fun tool(name: String, args: String, ok: Boolean, resultBrief: String): JSONObject =
         JSONObject()

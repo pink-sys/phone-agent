@@ -41,4 +41,10 @@ interface Toolbox {
 
     /** 连续被拒太多次，loop 该收手了。 */
     fun shouldAbort(): Boolean = false
+
+    /**
+     * 这个工作台路径是不是登记过的成品（见 Workbench.noteDelivery）。
+     * agent loop 用它决定要不要出产物卡——中间脚本不出卡，只出用户要的交付物。
+     */
+    fun isDelivered(path: String): Boolean = false
 }

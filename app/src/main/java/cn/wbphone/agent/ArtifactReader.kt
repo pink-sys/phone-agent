@@ -173,7 +173,10 @@ object ArtifactReader {
     // ══ Markdown 分块 ═════════════════════════════════════
 
     fun renderMarkdown(act: Context, md: String, into: LinearLayout) {
-        val lines = md.replace("\r\n", "\n").split('\n')
+        // 模型早年写坏的文件里躺着字面 \/（JSON 过度转义落了盘）。CommonMark 把 \/
+        // 当成 / 的合法转义来渲染，微信等阅读器都这么做——这里对齐口径。
+        // 工作台预览在读文件入口已归一，这里兜住其他调用方（office 提取等）。
+        val lines = md.replace("\\/", "/").replace("\r\n", "\n").split('\n')
         val n = lines.size
         var i = 0
         var first = true

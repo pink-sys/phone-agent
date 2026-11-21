@@ -15,6 +15,12 @@ data class ToolResult(
     val text: String,
     val imageDataUrl: String? = null,
     /**
+     * 带图时用户看不看得到。截图是给用户看的（他就是想知道屏幕什么样）；
+     * pdf_write 的排版预览图是给模型验收用的，聊天里再放一张大图很突兀（真机反馈），
+     * 所以只走模型的视觉通道、不进界面。
+     */
+    val showInChat: Boolean = true,
+    /**
      * 这个工具自己烧掉的 token（目前只有 task 会填）。
      *
      * 为什么必须报回 loop：子代理是用真实模型跑的，账单是真的。不把它算进本轮用量，
@@ -139,6 +145,27 @@ class PhoneToolbox(
     /** 连续被拒太多次，agent loop 该收手了。 */
     override fun shouldAbort(): Boolean = approval?.shouldAbort == true
 
+    /** 工作台的成品登记（聊天只给成品出卡，见 Workbench.noteDelivery）。 */
+    override fun isDelivered(path: String): Boolean =
+        workbench?.isDelivered(path) ?: false
+
+    /**
+     * pdf_write 结果里的 preview_path → data URL；临时文件读完即删。
+     * 没有就返回 null，不影响主流程。用 java.util.Base64（minSdk 26 就有），
+     * 不碰 android.util——这一层是纯 JVM，桌面 harness 也要能编译。
+     */
+    private fun previewOf(resultText: String): String? {
+        val p = runCatching { JSONObject(resultText).optString("preview_path") }.getOrNull()
+        if (p.isNullOrEmpty()) return null
+        val f = java.io.File(p)
+        if (!f.exists()) return null
+        return runCatching {
+            val bytes = f.readBytes()
+            f.delete()
+            "data:image/jpeg;base64," + java.util.Base64.getEncoder().encodeToString(bytes)
+        }.getOrNull()
+    }
+
     /**
      * 执行一个工具调用。
      * 失败也返回文本（带 ok:false），不要抛异常——抛出会让模型看不到原因。
@@ -168,7 +195,14 @@ class PhoneToolbox(
                     ?: return ToolResult(err("NO_WORKBENCH", "工作台没有启用"))
                 // onProgress 目前只有 python_run 用（运行中的秒数上报），透传给所有
                 // 工作台工具是安全的——其余工具的签名直接忽略它。
-                return ToolResult(bench.execute(name, args, onProgress))
+                val text = bench.execute(name, args, onProgress)
+                // pdf_write 的预览图：引擎渲染的前 3 页拼图落成了临时 .preview.jpg，
+                // 在这里编码成 data URL 回传（模型亲眼验收排版），回传后立刻删掉临时文件。
+                // 预览图只给模型验收排版，聊天里不显示（showInChat = false）
+                if (name == "pdf_write") {
+                    return ToolResult(text, imageDataUrl = previewOf(text), showInChat = false)
+                }
+                return ToolResult(text)
             }
 
             // 系统意图不碰屏幕：设闹钟、拨号盘、分享这类交给系统应用去办。不读序号、
@@ -353,7 +387,10 @@ class PhoneToolbox(
         val after = try { readScreen() } catch (e: Exception) { return text }
         // readScreen 成功时返回的是大纲文本（"1|设置" 这种），失败时才是 {"ok":false,...}。
         // 读屏失败不连坐：动作本身是成功的，别让核对失败把结果变成报错。
-        if (after.startsWith("{\"ok\":false") || after.isBlank()) return text
+        // 失败判定走解析（org.json 键序不定，ok 未必排在串首）；大纲文本不是 JSON，
+        // 解析失败按成功算。
+        val afterOk = runCatching { JSONObject(after).optBoolean("ok", true) }.getOrDefault(true)
+        if (!afterOk || after.isBlank()) return text
 
         // 界面零变化检测：动作前后的屏幕大纲一字不差，这个操作多半没生效。
         // WebView（学习通、微信公众号页）里无障碍 ACTION_CLICK 经常「报告成功、实际没反应」，
@@ -364,12 +401,26 @@ class PhoneToolbox(
         return JSONObject(text).put("screen_after", after).apply {
             if (unchanged) {
                 put("screen_changed", false)
-                put(
-                    "warning",
-                    "操作前后界面没有任何变化，这个操作大概率没有生效。不要原样或小改坐标重试：" +
-                        "换用 phone_tap 的序号点击、换一个明显不同的位置，" +
-                        "或先滑动/返回再看；连续无效就换一条路。"
-                )
+                // 答题类页面（学习通等）大纲恒定：选题、翻题大纲都一字不变，「零变化」
+                // 完全不代表没生效。对这种页面喊 warning 只会把模型逼得反复重截重试
+                // （2026-11-20 真机实录），降级成中性提示。
+                val quizPage = after.contains("单选题") || after.contains("多选题") ||
+                    after.contains("判断题") || after.contains("填空题") || after.contains("题干")
+                if (quizPage) {
+                    put(
+                        "note",
+                        "答题页大纲恒定，界面没变≠操作没生效。选项是否选中、是否翻了题，" +
+                            "用局部截图确认；没选中就调整坐标再点一次，选中了就继续下一题。"
+                    )
+                } else {
+                    put(
+                        "warning",
+                        "操作前后界面没有任何变化，这个操作大概率没有生效。不要原样或小改坐标重试：" +
+                            "换一个明显不同的位置，或先滑动/返回再看。WebView 页（学习通作业、公众号文章等）" +
+                            "序号点击经常无效，改走截图+phone_tap_at；且选中类操作（选选项、勾选）在大纲里" +
+                            "可能看不到变化，点一次就局部截图确认是否已生效。连续无效就换一条路。"
+                    )
+                }
             }
         }.toString()
     }
@@ -502,7 +553,16 @@ class PhoneToolbox(
         val result = d.launchApp(resolved)
         return if (result.optBoolean("ok", false)) {
             // note 可能带「启动成了小窗、已自动放大 / 需要手动放大」的关键提示，不能丢
-            val note = result.optString("note")
+            var note = result.optString("note")
+            // 微信的控件树对无障碍隐藏，普通输入路径全部失效。启动成功的这一刻模型正
+            // 准备输入，把三步工序卡直接挂在 note 上，不用先读一次空屏交学费
+            // （2026-11-20 真机实录；ScreenOutline 里还有一份读屏时的同款卡）。
+            if (resolved == "com.tencent.mm" || target.contains("微信")) {
+                note = (if (note.isEmpty()) "" else "$note ") +
+                    "微信控件树对无障碍隐藏，读屏无效：输入走剪贴板三步 phone_input(文字) → " +
+                    "phone_long_press(输入框/搜索栏中心坐标) → phone_tap_at 点「粘贴」，" +
+                    "盲操作、不验证、不重复。"
+            }
             val notePart = if (note.isNotEmpty()) ",\"note\":\"${escape(note)}\"" else ""
             "{\"ok\":true,\"package\":\"${escape(resolved)}\"$notePart}"
         } else {
@@ -697,7 +757,7 @@ class PhoneToolbox(
             "type": "function",
             "function": {
               "name": "phone_tap_at",
-              "description": "按截图上的像素坐标点按。只在 phone_read_screen 给不出序号、但截图能看清目标时用——微信、支付宝、游戏这类自绘界面。x/y 取自最近一次 phone_screenshot 返回图片的左上角原点；图上每 120px 有网格、每 240px 有刻度数字，**先读最近刻度的数字再数格子**，不要凭感觉估。如果这张图是局部放大图（phone_screenshot 带 x/y/w/h），就报放大图上的刻度坐标，手机会换算回真实屏幕。每次点按后旧截图作废，要继续操作必须重新截图。",
+              "description": "按截图上的像素坐标点按。只在 phone_read_screen 给不出序号、但截图能看清目标时用（微信、游戏这类自绘界面）。x/y 按最近一次 phone_screenshot 那张图上的刻度报，局部放大图就报放大图上的坐标，手机自己换算回真实屏幕。每次点按后旧截图作废，要再点必须重新截图。",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -712,7 +772,7 @@ class PhoneToolbox(
             "type": "function",
             "function": {
               "name": "phone_long_press",
-              "description": "在 (x,y) 坐标长按约 1 秒，唤出输入框的长按菜单（第一项通常是「粘贴」）。坐标口径与 phone_tap_at 相同：先 phone_screenshot，报那张图上输入框/搜索栏中心的像素坐标。用于微信这类读不到控件树的应用：phone_input 写剪贴板 → 本工具长按 → phone_tap_at 点「粘贴」。菜单没出现就重新截图、换个位置再长按一次。",
+              "description": "在 (x,y) 坐标长按约 1 秒，唤出输入框的长按菜单（第一项通常是「粘贴」）。坐标口径与 phone_tap_at 相同：先 phone_screenshot，报那张图上的像素坐标。菜单没出现就重新截图、换个位置再长按一次。微信输入流程的中间一步，完整流程见 phone_input 描述。",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -727,7 +787,7 @@ class PhoneToolbox(
             "type": "function",
             "function": {
               "name": "phone_input",
-              "description": "输入文本。普通应用：直接写进当前焦点输入框（先 phone_tap 点一下输入框确保聚焦）。微信这类读不到控件树的应用：本工具只把文字写进剪贴板，完整输入是三步——phone_input(文字) → phone_long_press(输入框坐标) 长按唤出菜单 → phone_tap_at 点菜单里的「粘贴」。同一段文字只写一次，重复调用不重复写；不做任何验证，调完直接做长按那一步。",
+              "description": "输入文本。普通应用：直接写进当前焦点输入框（先 phone_tap 点一下输入框确保聚焦）。微信这类读不到控件树的应用：本工具只把文字写进剪贴板，完整输入是三步——phone_input(文字) → phone_long_press(输入框中心坐标) → phone_tap_at 点菜单里的「粘贴」；盲操作不做验证，同一段文字只写一次。",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -765,7 +825,7 @@ class PhoneToolbox(
             "type": "function",
             "function": {
               "name": "phone_intent",
-              "description": "用系统接口一步完成「一句话的事」：设闹钟/计时器、建日程、打开拨号盘、写短信草稿、分享文字、启动导航、打开链接、跳设置页。**比在设置页里一层层点快十倍**，凡是有对应 action 的都优先用它。action 取值：alarm(hour,minute,message) / timer(seconds,message) / calendar(title,begin_ms,duration_min) / dial(number) / sms(number,text) / share(text) / navigate(query) / open_url(url) / settings(panel=wifi|bluetooth|apps|display|sound|battery|location|accessibility|storage) / app_info(package)。拨号只填号码不拨打；短信只打开草稿不发送——发送/拨出这一步留给用户自己按。",
+              "description": "用系统接口一步完成「一句话的事」：设闹钟/计时器、建日程、打开拨号盘、写短信草稿、分享文字、启动导航、打开链接、跳设置页——比逐页点按快十倍，有对应 action 就优先用它。拨号只填号码不拨打；短信只写草稿不发送，发送/拨出留给用户。各 action 的参数见下面字段说明。",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -806,7 +866,7 @@ class PhoneToolbox(
             "type": "function",
             "function": {
               "name": "phone_screenshot",
-              "description": "截取当前屏幕的画面，你会直接看到这张图，图上叠了坐标网格和刻度数字（数字就是图片像素坐标）。只在 phone_read_screen 给不出有用信息时使用——例如返回的元素很少、都没有文字、或明显是自绘界面（微信、支付宝、游戏）。截图比读屏贵约 15 倍，不要每次操作都截。**要看清小字、小按钮（比如长按后的「粘贴」菜单）时，用 x/y/w/h 只截那一块，图会被放大到 1080 宽**，坐标仍按放大后的图片像素报。",
+              "description": "截取当前屏幕，你会直接看到这张图，图上叠了坐标网格和刻度数字（数字就是图片像素坐标）。只在 phone_read_screen 给不出有用信息时用——自绘界面（微信、游戏）、要判断图标颜色布局。截图比读屏贵约 15 倍，不要每次操作都截。要看清小字、小按钮（如「粘贴」菜单）用 x/y/w/h 只截那一块放大到 1080 宽，坐标按放大后的图报。",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -836,11 +896,11 @@ class PhoneToolbox(
               "type": "function",
               "function": {
                 "name": "task",
-                "description": "派一个子代理去独立完成一件「读得多、产出少」的活：批量查资料、把一批页面/文件通读一遍挑出要点、对比多个来源。它在自己的上下文里干活，中间抓到的东西不会进你的上下文，你只拿到一份结论——所以它特别适合那种「要读十几个页面但最后只要几条结论」的任务。不要用它做：一句话就能答的事、需要操作手机的事（它碰不到屏幕）、需要写文件的事（它只能读，内容让它写进结论里你自己落盘）。它看不到当前对话，goal 必须写成能独立看懂的一句话。",
+                "description": "派一个子代理独立完成「读得多、产出少」的活：批量查资料、通读一批页面/文件挑出要点、对比多个来源。它在自己的上下文里干活，你只拿到一份结论。不要用于一句话能答的事、需要操作手机的事（它碰不到屏幕）、需要写文件的事（它只能读，内容让它写进结论里你自己落盘）。它看不到当前对话，goal 必须写成能独立看懂的一句话。",
                 "parameters": {
                   "type": "object",
                   "properties": {
-                    "goal": {"type": "string", "description": "子任务目标，一句话说清要查什么、到什么程度算完成。子代理看不到当前对话，别用「上面那个」「刚才说的」这类指代。"},
+                    "goal": {"type": "string", "description": "子任务目标，一句话说清要查什么、到什么程度算完成。子代理看不到当前对话，别用「上面那个」「刚才说的」这类指代。一个子代理只查一小块（3–5 个对象）：十几家厂商、几十个仓库这种范围，分几次派，别塞给一个。"},
                     "focus": {"type": "string", "description": "可选：只要哪几个字段 / 只回答哪几个问题。比如「每个项目只要：名称、最新版本号、下载地址」。填了它结论会更短、更准。"}
                   },
                   "required": ["goal"]
@@ -853,9 +913,13 @@ class PhoneToolbox(
         /**
          * 一个任务里最多派几次子代理。
          *
-         * 三次是权衡的结果：常见任务（比价、批量查 release、通读几个文件）一两次够用；
-         * 再多通常说明任务本身没想清楚，该回到主线重新规划，而不是继续撒钱。
+         * 五次是按「并行派发」的实际情况定的：模型经常把一个调研拆成 3–4 个
+         * 相互独立的方向并排派出去（真案：国内外厂商+云厂商+活动，一次 4 个）——
+         * 这是**一个决策、一次往返**，不是三次串行撒钱；子代理本身又压得很紧
+         * （10 轮、无续跑、4 分钟墙钟），单次成本有硬上限。卡在 3 的时候，
+         * 并排的第 4 个当场被拒，用户看着一条莫名的红卡片，任务还得主线自己补。
+         * 再多（>5）通常说明任务没想清楚，该回到主线重新规划。
          */
-        const val MAX_SUB_TASKS = 3
+        const val MAX_SUB_TASKS = 5
     }
 }

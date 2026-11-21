@@ -39,6 +39,8 @@ import cn.wbphone.agent.ShotText
 import cn.wbphone.agent.ChartText
 import cn.wbphone.agent.XlsxWriter
 import cn.wbphone.agent.TarGz
+import cn.wbphone.agent.Toolbox
+import cn.wbphone.agent.ToolResult
 import kotlin.math.abs
 import cn.wbphone.agent.Skill
 import cn.wbphone.agent.TokenInfo
@@ -271,7 +273,7 @@ class Recorder : AgentLoop.Listener {
         tools.add(name)
     }
 
-    override fun onToolEnd(name: String, result: String, ok: Boolean) {
+    override fun onToolEnd(name: String, args: org.json.JSONObject, result: String, ok: Boolean) {
         results.add(result)
     }
 
@@ -582,6 +584,21 @@ private fun scenarioTranscriptRender() {
     val day2 = TranscriptText.user("今天说的").put("ts", 1762172800000L)
     val multi = TranscriptText.render(listOf(day1, day2))
     result("tr_groups_by_day", multi.split("## ").size - 1 == 2, multi.take(100))
+
+    // 全量历史的显示源就是流水账：用户长句（>2000）不能被腰斩，照片文件名要跟着走
+    val longText = "很长的需求".repeat(600)  // 2400 字，旧版 take(2000) 会截
+    val withPhotos = TranscriptText.user(longText, true, listOf("s1-123-0.jpg", "s1-123-1.jpg"))
+    result("tr_user_full_text", withPhotos.optString("text").length == longText.length,
+        "len=" + withPhotos.optString("text").length)
+    val ph = withPhotos.optJSONArray("photos")
+    result("tr_user_photos_field", ph != null && ph.length() == 2 && ph.optString(0) == "s1-123-0.jpg",
+        ph?.toString() ?: "null")
+    // 没照片时不写 photos 字段：老渲染器（流水账导出）不用知道它存在
+    result("tr_user_no_photos_key", !TranscriptText.user("hi").has("photos"), "")
+    // 回答的上限按界面完整显示来定：长 Markdown（旧版 4000 截断）要完整
+    val longAns = "答案".repeat(5000)  // 10000 字
+    result("tr_assistant_full_text", TranscriptText.assistant(longAns).optString("text").length == longAns.length,
+        "len=" + TranscriptText.assistant(longAns).optString("text").length)
 }
 
 /**
@@ -661,6 +678,33 @@ private fun scenarioErrors() {
     val r2 = ScreenOutline.render(single)
     result("outline_single_unwrapped", !r2.text.contains("──") && r2.labels.values.contains("设置"),
         r2.text.take(120))
+
+    // 学习通：大纲要带答题页工序卡（固定循环、大纲恒定、不必反复权衡——不提禁忌词）
+    val cx = ScreenOutline.render(JSONObject()
+        .put("ok", true)
+        .put("screen", JSONObject().put("width", 1080).put("height", 2400).put("package", "com.chaoxing.mobile"))
+        .put("tree", n("FrameLayout", "", 0, 0, 1080, 2400,
+            children = JSONArray().put(n("TextView", "21.2课堂练习", 0, 100, 1080, 200, clickable = true)))))
+    result("outline_chaoxing_hint",
+        cx.text.contains("〔学习通答题页〕") && cx.text.contains("phone_tap_at")
+            && cx.text.contains("不必反复权衡"),
+        cx.text.take(220))
+    // 其他应用不带这句，免得每屏都烧 token
+    result("outline_chaoxing_hint_scoped", !r2.text.contains("〔学习通"), r2.text.take(80))
+
+    // 微信：控件树对无障碍隐藏，大纲要带剪贴板三步工序卡（v1.4.5 起主提示词不再
+    // 常驻微信三步，这张卡 + phone_input 描述是仅有的两份拷贝）
+    val wx = ScreenOutline.render(JSONObject()
+        .put("ok", true)
+        .put("screen", JSONObject().put("width", 1080).put("height", 2400).put("package", "com.tencent.mm"))
+        .put("tree", n("FrameLayout", "", 0, 0, 1080, 2400)))
+    result("outline_wechat_hint",
+        wx.text.contains("〔微信〕") && wx.text.contains("phone_input")
+            && wx.text.contains("phone_long_press") && wx.text.contains("phone_tap_at")
+            && wx.text.contains("盲操作"),
+        wx.text.take(200))
+    // 普通应用不带微信卡
+    result("outline_wechat_hint_scoped", !r2.text.contains("〔微信〕"), r2.text.take(80))
 }
 
 /** 令牌过期：401 → 刷新 → 重试一次，不打扰用户。 */
@@ -1614,6 +1658,16 @@ private fun scenarioWorkbench(base: String) {
     val w1 = call("fs_write", "path" to "notes/a.md", "content" to "# 标题\n第一行\n第二行\n")
     result("bench_write_created", w1.optBoolean("ok") && w1.optBoolean("created"), w1.toString())
 
+    // ---- fs_write 转义兜底：content 里带字面 \/ 的（模型 JSON 双重转义落盘，真案：
+    //      shizuku-companion-apps.md 27 处斜线）写盘前归一，并附 note 让模型改掉习惯 ----
+    val w2 = call("fs_write", "path" to "escw.md", "content" to "官网 https:\\/\\/gkd.li\\/guide\\/\n")
+    result("bench_write_escape_note",
+        w2.optBoolean("ok") && w2.optString("note").contains("归一"), w2.toString())
+    result("bench_write_escape_clean",
+        !call("fs_read", "path" to "escw.md").optString("content").contains("\\"), "")
+    result("bench_write_escape_url",
+        call("fs_read", "path" to "escw.md").optString("content").contains("https://gkd.li/guide/"), "")
+
     val r1 = call("fs_read", "path" to "notes/a.md")
     result("bench_read_numbered", r1.optString("content").startsWith("1|# 标题"), r1.optString("content").take(40))
     result("bench_read_total", r1.optInt("total") == 3, r1.optInt("total").toString())
@@ -1624,6 +1678,24 @@ private fun scenarioWorkbench(base: String) {
 
     val e2 = call("fs_edit", "path" to "notes/a.md", "old" to "不存在的行", "new" to "x")
     result("bench_edit_no_match", !e2.optBoolean("ok") && e2.optString("code") == "NO_MATCH", e2.toString())
+
+    // ---- fs_edit 转义兜底：模型把 JSON 里的 / 过度转义成 \/，解析后 old 带字面反斜杠，
+    //      原样匹配必败（真案：连续 6 次 NO_MATCH）。两档归一都要能改上并注明。----
+    call("fs_write", "path" to "esc1.md", "content" to "黑阈 | 官网 / 酷安\n")
+    val e4 = call("fs_edit", "path" to "esc1.md", "old" to "黑阈 | 官网 \\/ 酷安", "new" to "黑阈 | 官网、酷安")
+    result("bench_edit_escape_old_normalized",
+        e4.optBoolean("ok") && e4.optString("note").contains("归一"), e4.toString())
+    result("bench_edit_escape_old_applied",
+        call("fs_read", "path" to "esc1.md").optString("content").contains("官网、酷安"), "")
+
+    // fs_write 现在会把 content 里的 \/ 归一（上一条已验），要造「文件已被污染」的
+    // 历史样本（模型双重转义落盘的老文件）得绕过它直接写盘
+    File(dir, "esc2.md").writeText("黑阈 | 官网 \\/ 酷安\n")
+    val e5 = call("fs_edit", "path" to "esc2.md", "old" to "黑阈 | 官网 / 酷安", "new" to "黑阈 | 官网、酷安")
+    result("bench_edit_escape_file_normalized",
+        e5.optBoolean("ok") && e5.optString("note").contains("归一"), e5.toString())
+    result("bench_edit_escape_file_cleaned",
+        !call("fs_read", "path" to "esc2.md").optString("content").contains("\\"), "")
 
     call("fs_write", "path" to "dup.txt", "content" to "a\na\n")
     val e3 = call("fs_edit", "path" to "dup.txt", "old" to "a", "new" to "b")
@@ -1747,6 +1819,37 @@ private fun scenarioWorkbench(base: String) {
     // 预览回读：OfficeText 的 docx 提取器读得懂自己写的文件（产物卡能直接展示正文）
     val docxMd = OfficeText.docxToMarkdown(docxFile) ?: ""
     result("doc_docx_preview_roundtrip", docxMd.contains("总体情况") && docxMd.contains("要点甲"), docxMd.take(120))
+
+    // ---- docx_write table 块：三线表 + 数字右对齐 + 表头跨页重复 + 回读管道表 ----
+    // 动机：真机上模型拿「项目|内容」两列表当封面，全黑网格盖在标题下被用户骂丑。
+    // 表格样式现在在写入端定死（三线表），模型只给数据。
+    val docxTbl = call("docx_write", "path" to "季报.docx", "title" to "季度营收",
+        "blocks" to JSONArray().put(JSONObject()
+            .put("type", "table")
+            .put("caption", "表 1 各季度营收")
+            .put("head", JSONArray().put("季度").put("营收").put("同比"))
+            .put("rows", JSONArray()
+                .put(JSONArray().put("第一季度").put("1,234").put("+8%"))
+                .put(JSONArray().put("第二季度").put("1,580").put("+12%"))
+                .put(JSONArray().put("第三季度").put("").put("-3%")))))
+    result("doc_docx_table_ok", docxTbl.optBoolean("ok"), docxTbl.toString())
+    val tblFile = File(dir, "季报.docx")
+    val tblXml = zipText(tblFile, "word/document.xml")
+    result("doc_docx_table_grid", tblXml.contains("<w:tbl>") && tblXml.contains("<w:gridCol"), "表结构")
+    result("doc_docx_table_threeline", tblXml.contains("w:insideV w:val=\"nil\"") &&
+        tblXml.contains("w:insideH w:val=\"single\""), "无竖线、有横线")
+    result("doc_docx_table_header", tblXml.contains("<w:tblHeader/>") &&
+        tblXml.contains("w:fill=\"F2F2F2\""), "表头跨页重复 + 浅灰底")
+    result("doc_docx_table_numeric_right", tblXml.contains("<w:jc w:val=\"right\"/>"), "数字列右对齐")
+    result("doc_docx_table_caption", tblXml.contains("表 1 各季度营收"), "表题")
+    val tblReadBack = OfficeText.docxToMarkdown(tblFile) ?: ""
+    result("doc_docx_table_empty_cell", tblReadBack.contains("| 第三季度 |  | -3% |"), "空单元格占位")
+    result("doc_docx_table_roundtrip",
+        tblReadBack.contains("| 季度 | 营收 | 同比 |") && tblReadBack.contains("| 第一季度 | 1,234 | +8% |"),
+        tblReadBack.take(200))
+    // 配色收口：正文/标题/表线不再带品牌蓝（真机反馈：正式文档彩色标题突兀）
+    result("doc_docx_no_brand_blue", !tblXml.contains("1F4E79") && !tblXml.contains("14395B") &&
+        !zipText(tblFile, "word/styles.xml").contains("1F4E79"), "全文黑色")
 
     val docxEmpty = call("docx_write", "path" to "x.docx", "blocks" to JSONArray())
     result("doc_docx_empty_rejected", !docxEmpty.optBoolean("ok") && docxEmpty.optString("code") == "BAD_ARGS", docxEmpty.toString())
@@ -1951,6 +2054,10 @@ private fun scenarioCompactImageGoal(base: String) {
         .put(JSONObject().put("type", "text").put("text", "帮我搜集这个手机root的相关资料"))
         .put(JSONObject().put("type", "image_url").put("image_url",
             JSONObject().put("url", "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ" + "A".repeat(2000))))
+        // 真实历史里带图消息还挂着一条图说（AgentLoop.attachImageNote 写的）：
+        // 压进摘要后图只剩占位，但题目原文必须靠这段活下来。
+        .put(JSONObject().put("type", "text").put("text",
+            "\n\n" + AgentLoop.IMG_NOTE_HEAD + "\nRedmi 8A 已解锁 BL，刷了 Magisk，问还能装哪些模块"))
     val hist = JSONArray().put(JSONObject().put("role", "user").put("content", parts))
     for (i in 1..40) {
         hist.put(
@@ -1978,6 +2085,109 @@ private fun scenarioCompactImageGoal(base: String) {
     result("compact_image_no_base64", !s0.contains("base64") && !s0.contains("image_url"),
         s0.take(80))
     result("compact_image_placeholder", s0.contains("[附一张图片]"), s0.take(80))
+    // 图里的内容不能跟着占位一起没：摘要必须留一行「- 图：…」
+    result("compact_image_note_kept", s0.contains("- 图：") && s0.contains("Magisk"), s0.take(200))
+}
+
+/**
+ * 压缩计账不能把 base64 截图算进去（2026-11-20 真机事故）。
+ *
+ * historyChars 之前用 history.toString().length：一张 1080×2400 截图的 base64 有
+ * 15~30 万字符，阈值才 4.8 万——截图一进历史就永远超阈值，「上下文压缩」每轮一条，
+ * 模型的计划每轮被压掉，真机表现就是反复点同一个搜索图标（微信 34 轮没发出去一条消息）。
+ * 计账必须和 buildMessages 的口径一致：只有最后一张图真发出，旧图降级成一行占位。
+ */
+private fun scenarioCompactNoBase64Inflation(base: String) {
+    // 纯函数：一张 20 万字符的 base64 在计账里只折 3000
+    fun shotMsg(b64: String) = JSONObject().put("role", "user").put("content", JSONArray()
+        .put(JSONObject().put("type", "text").put("text", "（这是当前屏幕的截图）"))
+        .put(JSONObject().put("type", "image_url").put("image_url",
+            JSONObject().put("url", "data:image/jpeg;base64,$b64"))))
+    val imgHist = JSONArray()
+        .put(JSONObject().put("role", "user").put("content", "打开微信给小罗发个你好"))
+        .put(shotMsg("A".repeat(200_000)))
+    val cost = AgentLoop.historyChars(imgHist)
+    result("histchars_ignores_base64",
+        cost < 10_000 && cost >= 3_000, "cost=$cost")
+
+    // 端到端：14 轮截图往返（旧口径下 toString 长度 >300 万字符，必压），
+    // 真实文本量很小——不该触发任何一次压缩
+    val device = FakeDevice()
+    val toolbox = PhoneToolbox({ device }, { null })
+    val loop = AgentLoop(CloudClient("$base/NB", "hy3", FakeTokens("t0", null)), toolbox, 2)
+    val hist = JSONArray().put(JSONObject().put("role", "user").put("content", "打开微信给小罗发个你好"))
+    for (i in 1..14) {
+        hist.put(
+            JSONObject().put("role", "assistant").put("content", JSONObject.NULL).put(
+                "tool_calls",
+                JSONArray().put(
+                    JSONObject().put("id", "nb$i").put("type", "function")
+                        .put("function", JSONObject().put("name", "phone_screenshot").put("arguments", "{}"))
+                )
+            )
+        )
+        hist.put(
+            JSONObject().put("role", "tool").put("tool_call_id", "nb$i")
+                .put("content", "{\"ok\":true,\"width\":1080,\"height\":2400,\"imageBytes\":230000,\"note\":\"截图已附在随后一条消息里\"}")
+        )
+        hist.put(shotMsg("B".repeat(200_000)))
+    }
+    loop.restoreHistory(hist)
+    result("histchars_screenshot_history_small",
+        AgentLoop.historyChars(loop.exportHistory()) < AgentLoop.COMPACT_AT_CHARS,
+        AgentLoop.historyChars(loop.exportHistory()).toString())
+    val recN = Recorder()
+    loop.run("继续", recN)
+    result("compact_not_thrashed_by_images",
+        recN.error.isEmpty() && loop.compactions == 0,
+        "compactions=${loop.compactions} err=${recN.error}")
+}
+
+/**
+ * 收到图先让模型把图说一遍。
+ *
+ * 为什么要有这一步：图片只活在内存里（落盘前 base64 被剥），压缩只留文字——
+ * 真机上用户发一张作业截图 +「学号后三位是002」，压缩完模型连作业是什么都不知道了。
+ */
+private fun scenarioImageNote(base: String) {
+    val device = FakeDevice()
+    val toolbox = PhoneToolbox({ device }, { null })
+    // 落盘出口用假的：真实宿主写到工作台 images/ 下，这里只记下「写了什么」。
+    var savedTo: String? = null
+    val loop = AgentLoop(CloudClient("$base/IM", "hy3", FakeTokens("t0", null)), toolbox, 4,
+        saveNote = { name, text ->
+            savedTo = "$name|$text"
+            "images/$name"
+        })
+    val rec = Recorder()
+    loop.run("我的学号后三位是002，按图里的要求做", rec,
+        listOf("data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ" + "B".repeat(800)))
+
+    result("img_note_no_error", rec.error.isEmpty(), rec.error)
+    val hist = loop.exportHistory()
+    val user = hist.optJSONObject(0)
+    val parts = user?.optJSONArray("content")
+    var texts = ""
+    if (parts != null) {
+        for (i in 0 until parts.length()) {
+            val p = parts.optJSONObject(i) ?: continue
+            if (p.optString("type") == "text") texts += p.optString("text")
+        }
+    }
+    result("img_note_attached", texts.contains(AgentLoop.IMG_NOTE_HEAD), texts.take(80))
+    result("img_note_has_content", texts.contains("学号后三位 002"), texts.take(160))
+    // 路径必须在最前面：摘要截断时先保住「去哪儿拿全文」
+    result("img_note_saved_path",
+        texts.contains(AgentLoop.IMG_NOTE_HEAD + "\n全文 images/"), texts.take(200))
+    val saved = savedTo
+    result("img_note_written", saved != null && saved.contains("题目：用学号后三位选一只股票"),
+        saved?.take(120) ?: "没落盘")
+    // 气泡里不能出现图说：用户自己没打过这些字
+    val shown = AgentLoop.visibleUserText(texts)
+    result("img_note_hidden_in_ui",
+        shown.contains("我的学号后三位是002") && !shown.contains(AgentLoop.IMG_NOTE_HEAD),
+        shown.take(80))
+    result("img_note_reply", rec.finalText.contains("好的"), rec.finalText)
 }
 
 /**
@@ -2371,6 +2581,90 @@ private fun scenarioOfficeText() {
     result("office_docx_unescaped", docMd != null && docMd.contains("带 & 转义"), "")
     result("office_docx_skips_empty", docMd != null && !docMd.contains("   "), "")
 
+    // 2b) docx 表格：整块转管道表，不再把单元格拍成一竖条（真机实录：股票报告封面表）
+    val docxTbl = File(dir, "报告.docx")
+    java.util.zip.ZipOutputStream(docxTbl.outputStream()).use { z ->
+        z.putNextEntry(java.util.zip.ZipEntry("word/document.xml"))
+        val xml = """<?xml version="1.0"?><w:document xmlns:w="w"><w:body>
+<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>股票数据分析报告</w:t></w:r></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>项目</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>内容</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>姓名</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>罗|唯珍</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>学号</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+<w:p><w:r><w:t>表后的正文。</w:t></w:r></w:p>
+</w:body></w:document>"""
+        z.write(xml.toByteArray(Charsets.UTF_8))
+        z.closeEntry()
+    }
+    val tblMd = OfficeText.docxToMarkdown(docxTbl)
+    // 居中标题成为 H2；管道表保留行列结构；单元格里的 | 要转义
+    result("office_docx_table", tblMd != null && tblMd.contains("| 项目 | 内容 |") &&
+        tblMd.contains("| 姓名 | 罗\\|唯珍 |"), tblMd?.take(200) ?: "null")
+    result("office_docx_table_empty_cell", tblMd != null && tblMd.contains("| 学号 |  |"),
+        tblMd?.take(300) ?: "null")
+    result("office_docx_table_after", tblMd != null && tblMd.contains("表后的正文。"), "")
+    // 正文已有居中标题，不再把文件名重复当 H1
+    result("office_docx_no_dup_title", tblMd != null && !tblMd.contains("# 报告.docx"), tblMd?.take(60) ?: "null")
+    // Heading 样式映射成对应层级
+    val docxH = File(dir, "样式.docx")
+    java.util.zip.ZipOutputStream(docxH.outputStream()).use { z ->
+        z.putNextEntry(java.util.zip.ZipEntry("word/document.xml"))
+        val xml = """<?xml version="1.0"?><w:document xmlns:w="w"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>研究方法</w:t></w:r></w:p>
+<w:p><w:pPr><w:numPr/></w:pPr><w:r><w:t>列表项甲</w:t></w:r></w:p>
+</w:body></w:document>"""
+        z.write(xml.toByteArray(Charsets.UTF_8))
+        z.closeEntry()
+    }
+    val hMd = OfficeText.docxToMarkdown(docxH)
+    result("office_docx_heading_style", hMd != null && hMd.contains("## 研究方法"), hMd?.take(120) ?: "null")
+    result("office_docx_numpr_list", hMd != null && hMd.contains("- 列表项甲"), hMd ?: "null")
+
+    // 2c) code 块：逐行等宽写进去、预览转围栏读出来（真机实录：附录源码被压成一坨）
+    val codeDocx = File(dir, "附录代码.docx")
+    val codeBlocks = org.json.JSONArray()
+        .put(org.json.JSONObject().put("type", "h2").put("text", "附录 A 完整源代码"))
+        .put(org.json.JSONObject().put("type", "code")
+            .put("text", "import os\nimport pandas as pd\n\ndef load(p):\n\treturn pd.read_csv(p)"))
+    val codeRes = org.json.JSONObject(DocxWriter.write(codeDocx, "分析报告", codeBlocks))
+    result("office_docx_code_ok", codeRes.optBoolean("ok"), codeRes.optString("error"))
+    val codeMd = OfficeText.docxToMarkdown(codeDocx) ?: ""
+    result("office_docx_code_fence", codeMd.contains("## 附录 A 完整源代码") &&
+        codeMd.contains("import os\nimport pandas as pd\n\ndef load(p):"), codeMd.take(200))
+    // tab 缩进折成 4 空格且原样保留；空行不吞（围栏里的代码还是那门语言的样子）
+    result("office_docx_code_indent", codeMd.contains("\n    return pd.read_csv(p)"), codeMd.take(300))
+    // 标题围栏之间只有一对 ```：连续代码段落并进同一围栏，不逐段各开各的
+    result("office_docx_code_one_fence", codeMd.split("```").size - 1 == 2, codeMd.take(400))
+    // 正文里夹一小段 `行内代码` 的段落是普通正文，不能误判成代码围栏
+    val mixDocx = File(dir, "正文夹码.docx")
+    val mixBlocks = org.json.JSONArray().put(org.json.JSONObject().put("type", "p")
+        .put("text", "先运行 `pip install pandas` 装依赖，再跑脚本。"))
+    org.json.JSONObject(DocxWriter.write(mixDocx, "说明", mixBlocks))
+    val mixMd = OfficeText.docxToMarkdown(mixDocx) ?: ""
+    result("office_docx_inline_code_not_fence",
+        mixMd.contains("pip install pandas") && !mixMd.contains("```"), mixMd.take(120))
+
+    // 2d) hr 分隔线 + indent:false 顶格段（对照交付稿：封面署名区与摘要之间一条线，关键词顶格左对齐）
+    val hrDocx = File(dir, "封面.docx")
+    val hrBlocks = org.json.JSONArray()
+        .put(org.json.JSONObject().put("type", "subtitle").put("text", "——以万科 A 为例"))
+        .put(org.json.JSONObject().put("type", "hr"))
+        .put(org.json.JSONObject().put("type", "h2").put("text", "摘要"))
+        .put(org.json.JSONObject().put("type", "p").put("indent", false)
+            .put("text", "关键词：涨跌预测；技术指标"))
+    val hrRes = org.json.JSONObject(DocxWriter.write(hrDocx, "数据报告", hrBlocks))
+    result("office_docx_hr_ok", hrRes.optBoolean("ok"), hrRes.optString("error"))
+    val hrXml = java.util.zip.ZipFile(hrDocx).use { zip ->
+        zip.getInputStream(zip.getEntry("word/document.xml")).readBytes().toString(Charsets.UTF_8)
+    }
+    result("office_docx_hr_line", hrXml.contains("<w:pBdr><w:bottom"), "")
+    val kwP = Regex("<w:p>.*?</w:p>").findAll(hrXml)
+        .firstOrNull { it.value.contains("关键词") }?.value ?: ""
+    // 顶格段：不再有 firstLineChars（缩进的「关键词」和「摘要」左边缘对不上）
+    result("office_docx_kw_no_indent", kwP.isNotEmpty() && !kwP.contains("firstLineChars"), kwP.take(160))
+    // 副标题默认宋体：等线的破折号字形中间断开，宋体才是连续一条线
+    result("office_docx_sub_song", hrXml.contains("w:eastAsia=\"宋体\""), "")
+
     // 3) zip 清单 + 坏文件退 null
     val zipF = File(dir, "包.zip")
     java.util.zip.ZipOutputStream(zipF.outputStream()).use { z ->
@@ -2591,15 +2885,22 @@ private fun scenarioSkill() {
     }
 
     // 7c) 升级播种：老标记（"1"）+ 老技能删了一个 → 只补这一版新增的，删掉的不复活
+    // 受管技能（NEW_SEEDS）的旧内容必须被覆盖：真机实录——doc-format 补了「用工具别手搓/
+    // 封面克制」却不升种子版本，老用户永远读到旧规则，照样拿 python-docx 手搓丑表格。
     val up = File(System.getProperty("java.io.tmpdir") ?: ".", "wb-skill-up-" + System.nanoTime())
     File(up, Skill.DIR).mkdirs()
     File(up, Skill.DIR + "/weekly-report.md").writeText("---\nname: weekly-report\ntitle: 周报\n---\n旧版内容\n", Charsets.UTF_8)
+    File(up, Skill.DIR + "/doc-format.md").writeText("---\nname: doc-format\ntitle: 文档排版\n---\n旧版规则：没有生成约束\n", Charsets.UTF_8)
     File(up, Skill.DIR + "/.seeded").writeText("1", Charsets.UTF_8)
     val added = Skill.install(up)
     val upNames = Skill.scan(up).map { it.name }
     result("skill_upgrade_adds_new", added == 4 && upNames.containsAll(listOf("doc-format", "slides", "doc-coauthor", "skill-craft")),
         "$added / $upNames")
     result("skill_upgrade_keeps_old", Skill.body(Skill.scan(up).first { it.name == "weekly-report" }).contains("旧版内容"), "")
+    result("skill_upgrade_overwrites_managed",
+        Skill.body(Skill.scan(up).first { it.name == "doc-format" }).contains("别手搓") &&
+            Skill.body(Skill.scan(up).first { it.name == "doc-format" }).contains("封面克制"),
+        "受管技能内容已更新")
     result("skill_upgrade_no_deleted_revive", "resume" !in upNames, upNames.joinToString(","))
     result("skill_upgrade_marker", File(up, Skill.DIR + "/.seeded").readText().trim() == Skill.SEED_VERSION.toString(),
         File(up, Skill.DIR + "/.seeded").readText())
@@ -2768,13 +3069,6 @@ private fun scenarioWebSearch() {
         </ol></body></html>
     """.trimIndent()
 
-    val ddg = """
-        <html><body>
-        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.example.org%2Fx&amp;rut=1">标题甲</a>
-        <a class="result__snippet" href="x">摘要甲，讲的是赛制</a>
-        </body></html>
-    """.trimIndent()
-
     // 百度：h3 + /link?url= 跳转链接，摘要混在正文里，还夹着「翻译此页」这类样板噪声
     val baidu = """
         <html><body>
@@ -2831,23 +3125,117 @@ private fun scenarioWebSearch() {
     result("search_unwrap_ddg", bench.unwrapRedirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.example.org%2Fx")
         == "https://b.example.org/x", bench.unwrapRedirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.example.org%2Fx"))
 
-    // 前两个引擎（百度/必应）500，第三个给 DDG 页面：要自动退过去，而不是直接失败
+    // 搜狗移动版：类名带构建哈希（title__titleText_287f），真实地址藏在 href 的 url= 参数里，
+    // 页面上的 ./id=… 是统计跳转。（2026-11 实测：中文结果质量明显好于必应）
+    val sogouM = """
+        <html><body>
+        <a href="./id=abc&amp;url=https%3A%2F%2Fzol.com.cn%2Fx.html&amp;vrid=1" class="link__saLink">
+          <h3 class="sa-text-clamp2 title__titleContainer_287f"><span class="title__titleText_287f">2026年<em>免费AI API</em>清单</span></h3></a>
+        <div>正文摘要：十大平台实测。</div>
+        <a href="./id=def&amp;url=https%3A%2F%2Fb.example.org%2Fy&amp;vrid=2" class="link__saLink">
+          <h3 class="sa-text-clamp2 title__titleContainer_287f"><span class="title__titleText_287f">第二条</span></h3></a>
+        </body></html>
+    """.trimIndent()
+    val ps = bench.parseHits(sogouM, 5)
+    result("search_parse_sogou_count", ps.size == 2, ps.size.toString())
+    result("search_parse_sogou_url", ps.firstOrNull()?.url == "https://zol.com.cn/x.html",
+        ps.firstOrNull()?.url ?: "null")
+    result("search_parse_sogou_title", ps.firstOrNull()?.title == "2026年免费AI API清单",
+        ps.firstOrNull()?.title ?: "null")
+    result("search_parse_sogou_snippet", ps.firstOrNull()?.snippet?.contains("十大平台") == true,
+        ps.firstOrNull()?.snippet ?: "null")
+
+    // 微信搜索：标题后面要拼公众号名（同一篇转来转去时，谁写的决定可不可信），相对链接补域名
+    val weixin = """
+        <html><body><ul class="news-list">
+        <li><div class="txt-box">
+          <h3><a target="_blank" href="/link?url=dn9a&amp;type=2&amp;query=免费 AI 额度">10个开源仓库拼<b>AI</b>内容工厂</a></h3>
+          <p class="txt-info">免费 API 额度总表，附领取步骤。</p>
+          <div class="s-p"><a class="account">幺叁幺肆</a></div>
+        </div></li>
+        <li><div class="txt-box">
+          <h3><a href="/link?url=xyz&amp;type=2">2026 全球 AI 免费 API 攻略</a></h3>
+          <p class="txt-info">25 个平台能领的全在这了。</p>
+          <div class="s-p"><a class="account">松枝裁云</a></div>
+        </div></li>
+        </ul></body></html>
+    """.trimIndent()
+    val pw = bench.parseHits(weixin, 5)
+    result("search_parse_weixin_count", pw.size == 2, pw.size.toString())
+    result("search_parse_weixin_title_has_account",
+        pw.firstOrNull()?.title == "10个开源仓库拼AI内容工厂 · 幺叁幺肆", pw.firstOrNull()?.title ?: "null")
+    result("search_parse_weixin_abs_url",
+        pw.firstOrNull()?.url?.startsWith("https://weixin.sogou.com/link?url=") == true,
+        pw.firstOrNull()?.url ?: "null")
+    result("search_parse_weixin_snippet", pw.firstOrNull()?.snippet?.contains("总表") == true,
+        pw.firstOrNull()?.snippet ?: "null")
+    // 搜狗给的链接里 query 带裸空格（实测），不编码的话 HttpURLConnection 直接抛异常
+    result("search_parse_weixin_url_encoded",
+        pw.firstOrNull()?.url?.contains("%20") == true && pw.firstOrNull()?.url?.contains(" ") == false,
+        pw.firstOrNull()?.url ?: "null")
+
+    // 360 搜索：li.res-list + h3.res-title，真实落地页在 data-mdurl（href 是 so.com/link 跳转串）
+    val so360 = """
+        <html><body><ul class="result">
+        <li class="res-list" data-result-type="normal" data-result-pos="1">
+          <h3 class="res-title "><a href="https://www.so.com/link?m=abc" data-mdurl="https://c.example.com/t4">河南省大赛<em>主题四</em>说明</a></h3>
+          <p class="res-desc"><span class="gray g-c-gray">2026年4月30日&nbsp;-&nbsp;</span>慧智银行数字化运营，分上下半场。</p>
+        </li>
+        <li class="res-list"><h3 class="res-title"><a href="https://www.so.com/link?m=def" data-mdurl="https://c.example.com/t3">往届主题三</a></h3>
+          <p class="res-desc">另一条</p></li>
+        </ul></body></html>
+    """.trimIndent()
+    val p360 = bench.parseHits(so360, 5)
+    result("search_parse_360_count", p360.size == 2, p360.size.toString())
+    result("search_parse_360_title", p360.firstOrNull()?.title == "河南省大赛主题四说明",
+        p360.firstOrNull()?.title ?: "null")
+    result("search_parse_360_real_url_not_jump",
+        p360.firstOrNull()?.url == "https://c.example.com/t4", p360.firstOrNull()?.url ?: "null")
+    result("search_parse_360_snippet", p360.firstOrNull()?.snippet?.contains("慧智银行") == true,
+        p360.firstOrNull()?.snippet ?: "null")
+
+    // source=weixin：只打微信搜索一个站，不浪费往返去试百度/必应
+    val wxUrls = ArrayList<String>()
+    val wxOnly = Workbench(dir, searchFetcher = { url, _ ->
+        wxUrls.add(url)
+        if (url.contains("weixin.sogou.com")) FetchResult(200, "text/html", weixin)
+        else FetchResult(200, "text/html", bing)
+    })
+    val rw = JSONObject(wxOnly.execute("web_search", JSONObject().put("query", "免费 API").put("source", "weixin")))
+    result("search_source_weixin_engine", rw.optBoolean("ok") && rw.optString("engine") == "微信搜索",
+        rw.optString("engine"))
+    result("search_source_weixin_only_weixin_host",
+        wxUrls.isNotEmpty() && wxUrls.all { it.contains("weixin.sogou.com") }, wxUrls.joinToString(","))
+
+
+    // 前面的引擎（百度/搜狗）500，360 给结果页：要自动退过去，而不是直接失败
     val urls = ArrayList<String>()
+    val logs = ArrayList<String>()
     val fallback = Workbench(dir, searchFetcher = { url, _ ->
         urls.add(url)
-        if (url.contains("baidu.com") || url.contains("bing.com")) FetchResult(500, "text/html", "")
-        else FetchResult(200, "text/html", ddg)
-    })
+        when {
+            url.contains("baidu.com") || url.contains("m.sogou.com") -> FetchResult(500, "text/html", "")
+            url.contains("so.com") -> FetchResult(200, "text/html", so360)
+            else -> FetchResult(200, "text/html", bing)
+        }
+    }, logger = { logs.add(it) })
     val r1 = JSONObject(fallback.execute("web_search", JSONObject().put("query", "主题四 赛制")))
     result("search_fallback_ok", r1.optBoolean("ok"), r1.toString().take(120))
-    result("search_fallback_engine", r1.optString("engine") == "DuckDuckGo", r1.optString("engine"))
-    // 引擎数量增加后按「不同站点」判断：www/m.baidu、bing、ddg 都试过了
+    result("search_fallback_engine", r1.optString("engine") == "360搜索", r1.optString("engine"))
+    // 引擎数量增加后按「不同站点」判断：m.baidu、m.sogou、www.so 都试过了
+    // （360 已出结果就不该再打必应——这里是「退让到成功即停」的断言）
     result("search_fallback_tried_all_engines",
-        urls.map { it.substringAfter("://").substringBefore("/") }.distinct().size == 4,
+        urls.map { it.substringAfter("://").substringBefore("/") }.distinct().size == 3
+            && urls.none { it.contains("bing.com") },
         urls.map { it.substringAfter("://").substringBefore("/") }.distinct().joinToString(","))
     result("search_query_encoded", urls.firstOrNull()?.contains("%E4%B8%BB%E9%A2%98%E5%9B%9B") == true,
         urls.firstOrNull() ?: "")
-    result("search_ddg_snippet", r1.optString("results").contains("摘要甲"), r1.optString("results").take(120))
+    result("search_360_snippet", r1.optString("results").contains("慧智银行"), r1.optString("results").take(120))
+    // 降级链路要进运行日志：流水账只留结果前 300 字，fallbacks 会被截掉，
+    // 用户问「为什么这次全是必应」时只能靠这一行
+    result("search_fallback_logged",
+        logs.any { it.contains("360搜索") && it.contains("先试过") && it.contains("百度移动版") },
+        logs.joinToString(" | ").take(160))
 
     // 全挂：必须是「查不到」的明确失败，不能返回空成功（空成功会让模型以为搜过了、没结果）
     val dead = Workbench(dir, searchFetcher = { _, _ -> FetchResult(503, "text/html", "") })
@@ -2883,6 +3271,40 @@ private fun scenarioWebSearch() {
     result("search_fallback_reason", r4.optBoolean("ok") && r4.optString("fallbacks").contains("百度"),
         r4.optString("fallbacks"))
 
+    // 反爬页必须认出来：百度桌面版被 302 到 855KB 的「安全验证」壳，按体积判断会当成
+    // 「读到 855 KB、0 条」，看着像查询没结果（2026-11 实测，排查卡在这）。
+    val captchaBench = Workbench(dir, searchFetcher = { url, _ ->
+        if (url.contains("baidu.com")) FetchResult(
+            200, "text/html",
+            "<html><body>" + "x".repeat(120 * 1024) +
+                "<script>window.location.replace('https://www.baidu.com/_____tmd_____/punish?x5secdata=abc')</script>" +
+                "</body></html>"
+        )
+        else FetchResult(200, "text/html", bing)
+    })
+    val rc = JSONObject(captchaBench.execute("web_search", JSONObject().put("query", "主题四")))
+    result("search_captcha_detected",
+        rc.optBoolean("ok") && rc.optString("fallbacks").contains("反爬"), rc.optString("fallbacks"))
+
+    // 手机流量下百度只回 1.5KB 的「百度安全验证」页：认出来之后不该再重试第二遍
+    // （每次重试都是一次真实往返，用户看到的就是「搜索怎么这么慢」）
+    var verifyCalls = 0
+    val verifyBench = Workbench(dir, searchFetcher = { url, _ ->
+        if (url.contains("baidu.com")) {
+            verifyCalls += 1
+            FetchResult(200, "text/html", "<html><head><title>百度安全验证</title></head><body></body></html>")
+        } else FetchResult(200, "text/html", bing)
+    })
+    val rv = JSONObject(verifyBench.execute("web_search", JSONObject().put("query", "主题四")))
+    result("search_verify_no_retry",
+        rv.optBoolean("ok") && verifyCalls == 1 && rv.optString("fallbacks").contains("反爬"),
+        "calls=$verifyCalls fallbacks=" + rv.optString("fallbacks"))
+    // 冷却：同一次任务里连搜几次时，不该每次先去撞一遍同一个反爬引擎（每次都是一趟往返）
+    val rv2 = JSONObject(verifyBench.execute("web_search", JSONObject().put("query", "主题五")))
+    result("search_captcha_cooldown",
+        rv2.optBoolean("ok") && verifyCalls == 1 && rv2.optString("fallbacks").contains("跳过"),
+        "calls=$verifyCalls fallbacks=" + rv2.optString("fallbacks"))
+
     // 转义过的 HTML（真机百度摘要里的形态：&lt;div class="…"&gt;正文）不能漏进摘要
     val escaped = "&lt;div class=&quot;cos-color-text-tiny&quot;&gt;正文在这里&lt;/div&gt;"
     val cleaned = Workbench.htmlToText(escaped)
@@ -2897,17 +3319,18 @@ private fun scenarioWebSearch() {
     result("align_tag_end", long.substring(0, aligned).endsWith(">"), aligned.toString())
     result("align_tag_end_noop", Workbench.alignToTagEnd("abc", 2) == 2, "")
 
-    // 百度偶发回 1KB 的「安全验证」页：要重试一次，重试成了就用百度（而不是立刻退到必应）
+    // 百度偶发回一个 1KB 的空壳页（没有反爬标记）：这种可能是瞬时的，要重试一次，
+    // 重试成了就用百度，而不是立刻退到搜狗/必应
     var baiduCalls = 0
     val retry = Workbench(dir, searchFetcher = { url, _ ->
         if (url.contains("baidu.com")) {
             baiduCalls++
-            if (baiduCalls == 1) FetchResult(200, "text/html", "<html>百度安全验证</html>")
+            if (baiduCalls == 1) FetchResult(200, "text/html", "<html><body>" + "x".repeat(900) + "</body></html>")
             else FetchResult(200, "text/html", baidu)
         } else FetchResult(200, "text/html", bing)
     })
     val r5 = JSONObject(retry.execute("web_search", JSONObject().put("query", "主题四")))
-    result("search_retry_after_verify", r5.optString("engine") == "百度" && baiduCalls == 2,
+    result("search_retry_after_verify", r5.optString("engine") == "百度移动版" && baiduCalls == 2,
         r5.optString("engine") + "/calls=" + baiduCalls)
 
     // 验证页一直存在：要写明「反爬」，不能让模型/用户以为「这个查询没结果」
@@ -2917,6 +3340,28 @@ private fun scenarioWebSearch() {
     })
     val r6 = JSONObject(blocked.execute("web_search", JSONObject().put("query", "主题四")))
     result("search_verify_labeled", r6.optString("fallbacks").contains("反爬"), r6.optString("fallbacks"))
+
+    // 热门填充检测：不同 query 返回同一批 URL = 引擎没匹配上，拿热门页凑数。
+    // 真机实录（GTA6 悬赏调研）：模型连发引号短语查询，必应三次不同查询回一模一样的
+    // 四条（AI 工具集导航 / IBM / Google / Kimi）——URL 集重合就是铁证。
+    val fillLogs = ArrayList<String>()
+    val fill = Workbench(dir, searchFetcher = { url, _ ->
+        if (url.contains("bing.com")) FetchResult(200, "text/html", bing)
+        else FetchResult(500, "text/html", "")
+    }, logger = { fillLogs.add(it) })
+    val rf1 = JSONObject(fill.execute("web_search", JSONObject().put("query", "AI judges bounty platform")))
+    result("search_fill_first_soft", rf1.optBoolean("ok") && rf1.optString("engine") == "必应"
+        && rf1.optString("warning").contains("核实"), rf1.optString("warning"))
+    val rf2 = JSONObject(fill.execute("web_search", JSONObject().put("query", "micro prize entry fee")))
+    result("search_fill_detected", rf2.optString("warning").contains("热门填充")
+        && rf2.optString("warning").contains("别堆关键词"), rf2.optString("warning"))
+    result("search_fill_logged", fillLogs.any { it.contains("疑似热门填充") },
+        fillLogs.joinToString(" | ").take(200))
+    // 同一个查询词重搜返回同样结果：那是正常缓存，不算填充
+    val rf3 = JSONObject(fill.execute("web_search", JSONObject().put("query", "micro prize entry fee")))
+    result("search_fill_same_query_not_flagged",
+        rf3.optString("warning").contains("核实") && !rf3.optString("warning").contains("热门填充"),
+        rf3.optString("warning"))
 
     dir.deleteRecursively()
 }
@@ -3029,6 +3474,41 @@ private fun scenarioMarked() {
     val plain = Marked.parse("就一句话")
     result("md_plain", plain.size == 1 && plain[0].kind == "p"
         && plain[0].lines[0][0].text == "就一句话", plain.toString())
+
+    // 表格：真机翻车现场（GitHub 榜单四列）——管道符和 ---: 不许再裸奔，
+    // 收成「表头加粗 · 数据行首列加粗」的紧凑行，分隔行直接扔掉
+    val tbl = Marked.parse(
+        "| 项目 | 简介 | 语言 | 今日 +Star |\n" +
+        "|---:|---|---|\n" +
+        "| [obra/superpowers](https://github.com/obra/superpowers) | 可落地的 Agent 技能框架 | Shell | +2,029 |\n" +
+        "| [anthropics/Claude-BugHunter](https://github.com/anthropics/h) | 红队技能包 | Python | +1,353 |"
+    )
+    result("md_table_block", tbl.size == 1 && tbl[0].kind == "table" && tbl[0].lines.size == 3
+        && !tbl[0].lines.joinToString("|") { l -> l.joinToString() { it.text } }.contains("---"),
+        tbl.map { it.kind }.toString())
+    result("md_table_header_bold", tbl[0].lines[0].all { it.bold || it.text == " · " }
+        && tbl[0].lines[0][0].text == "项目", dump(tbl[0]))
+    result("md_table_first_cell_bold", tbl[0].lines[1][0].bold && tbl[0].lines[1][0].link != null
+        && tbl[0].lines[1][0].text == "obra/superpowers", dump(tbl[0]))
+    result("md_table_link_url", tbl[0].lines[1][0].link == "https://github.com/obra/superpowers"
+        && tbl[0].lines[1].any { it.text == " · " }
+        && tbl[0].lines[1].last().text == "+2,029", dump(tbl[0]))
+
+    // 不是表格的 | 行（没有分隔行）不误伤，照旧是段落
+    val notTbl = Marked.parse("| 这只是个竖线 | 别当表格 |")
+    result("md_table_no_sep", notTbl.size == 1 && notTbl[0].kind == "p", notTbl.map { it.kind }.toString())
+
+    // 行内链接：文字剥出来挂 url，文字里的粗体也活着（链接文字按粗体边界拆成两段）
+    val link = Marked.inline("去 [**GitHub** Trending](https://github.com/trending) 看看")
+    result("md_link_seg", link.size == 4 && link[1].link == "https://github.com/trending"
+        && link[1].bold && link[1].text == "GitHub"
+        && link[2].link == "https://github.com/trending" && link[2].text == " Trending"
+        && link[0].text == "去 " && link[3].text == " 看看",
+        link.joinToString("|") { it.text })
+    // 伪链接（方括号后面没跟着圆括号）不误伤
+    val noLink = Marked.inline("数组[0]取值")
+    result("md_link_no_false_hit", noLink.size == 1 && noLink[0].text == "数组[0]取值"
+        && noLink[0].link == null, noLink.joinToString("|") { it.text })
 }
 
 /**
@@ -3330,7 +3810,7 @@ private fun scenarioSubAgent(base: String) {
     loop.run("帮我查一下 A 的下载地址", object : AgentLoop.Listener {
         override fun onText(delta: String) {}
         override fun onToolStart(name: String, args: JSONObject) { toolNames.add(name) }
-        override fun onToolEnd(name: String, result: String, ok: Boolean) {}
+        override fun onToolEnd(name: String, args: org.json.JSONObject, result: String, ok: Boolean) {}
         override fun onTurnEnd(turn: Int) {}
         override fun onFinished(finalText: String, turns: Int, toolCalls: Int) { answer = finalText }
         override fun onError(message: String) { error = message }
@@ -3358,7 +3838,71 @@ private fun scenarioSubAgent(base: String) {
     )
     result("sub_incomplete_reported", stuck.text.contains("SUB_INCOMPLETE"), stuck.text.take(160))
 
+    // ---- 连续失败熔断：真机实录 GitHub 不可达时子代理连抓 39 步，用户干等 14 分钟。
+    // 现在失败连击到 FAIL_STREAK_LIMIT 引擎直接收，主线收到 SUB_STUCK + 换路提示。
+    val deadDir = java.io.File(System.getProperty("java.io.tmpdir"), "subagent-dead-" + System.nanoTime())
+    deadDir.mkdirs()
+    val deadBench = Workbench(deadDir, fetcher = { _, _ ->
+        throw java.io.IOException("failed to connect to github.com after 15000ms")
+    })
+    var giveUpNote = ""
+    val notes = ArrayList<String>()
+    // 探针：先单发一次，确认死站点返回的确实是 ok:false 的失败 JSON
+    // （断言用解析而不是 startsWith——org.json 键序是 HashMap 序，ok 不保证在开头）
+    val probe = ReadOnlyToolbox(deadBench).execute(
+        "web_fetch", JSONObject().put("url", "https://github.com/x0").put("max_chars", 1000))
+    result("sub_dead_probe",
+        !runCatching { JSONObject(probe.text).optBoolean("ok", true) }.getOrDefault(true),
+        probe.text.take(150))
+    val dead = SubAgent.run(
+        client = CloudClient("$base/SUBF", "glm-5.3", FakeTokens("t0", null)),
+        bench = deadBench,
+        goal = "抓 github.com 上的应用清单（站点是死的，怎么抓都超时）",
+        onProgress = { notes.add(it); giveUpNote = it },
+    )
+    result("sub_circuit_breaker",
+        dead.text.contains("SUB_STUCK") && dead.text.contains("fail_streak"),
+        dead.text.take(200) + " || notes=" + notes.joinToString("|"))
+    result("sub_giveup_progress", giveUpNote.contains("提前收工"), giveUpNote)
+
+    // ---- 子代理不自动续跑：真机实录里 3 个子代理各跑 10 轮，被自动续成 30 轮，
+    //      并排跑了 19 分钟才一起失败。这里用「永远给工具调用、永远不给结论」的
+    //      假服务端：必须正好停在 maxTurns，回到主线的是 SUB_INCOMPLETE，不是 3 倍时长。
+    val loopDir = java.io.File(System.getProperty("java.io.tmpdir"), "subagent-loop-" + System.nanoTime())
+    loopDir.mkdirs()
+    val loopBench = Workbench(loopDir)
+    val loopNotes = ArrayList<String>()
+    val endless = SubAgent.run(
+        client = CloudClient("$base/SUBL", "glm-5.3", FakeTokens("t0", null)),
+        bench = loopBench,
+        goal = "把所有文件列一遍（这是个永远做不完的活）",
+        maxTurns = 4,
+        onProgress = { loopNotes.add(it) },
+    )
+    val maxTurn = loopNotes.mapNotNull {
+        Regex("第 (\\d+) 轮").find(it)?.groupValues?.get(1)?.toIntOrNull()
+    }.maxOrNull() ?: -1
+    result("sub_no_autocontinue_turns", maxTurn == 4, "maxTurn=$maxTurn notes=${loopNotes.joinToString("|")}")
+    result("sub_no_autocontinue_incomplete",
+        endless.text.contains("SUB_INCOMPLETE") && endless.text.contains("4 轮"), endless.text.take(200))
+
+    // ---- 墙钟到点收工：每轮慢 0.4 秒、永远不收敛，预算 1.2 秒必须触发 SUB_TIMEOUT，
+    //      而不是让用户等到 4 分钟上限。
+    val slowNotes = ArrayList<String>()
+    val slow = SubAgent.run(
+        client = CloudClient("$base/SUBSLOW", "glm-5.3", FakeTokens("t0", null)),
+        bench = loopBench,
+        goal = "把所有文件列一遍（每轮都很慢）",
+        maxTurns = 20,
+        maxWallMs = 1_200,
+        onProgress = { slowNotes.add(it) },
+    )
+    result("sub_wall_clock_timeout", slow.text.contains("SUB_TIMEOUT"), slow.text.take(200))
+    result("sub_wall_clock_progress", slowNotes.any { it.contains("已 ") }, slowNotes.joinToString("|").take(160))
+
+    loopDir.deleteRecursively()
     dir.deleteRecursively()
+    deadDir.deleteRecursively()
 }
 
 /**
@@ -3428,7 +3972,7 @@ private fun scenarioHtmlPreview(base: String) {
     loop.run("给一个网页", object : AgentLoop.Listener {
         override fun onText(delta: String) {}
         override fun onToolStart(name: String, args: JSONObject) {}
-        override fun onToolEnd(name: String, result: String, ok: Boolean) {}
+        override fun onToolEnd(name: String, args: org.json.JSONObject, result: String, ok: Boolean) {}
         override fun onTurnEnd(turn: Int) {}
         override fun onFinished(finalText: String, turns: Int, toolCalls: Int) { answer = finalText }
         override fun onError(message: String) { error = message }
@@ -3923,6 +4467,36 @@ private fun gzip(raw: ByteArray): ByteArray {
     return out.toByteArray()
 }
 
+/**
+ * 同一回合多工具并行：模型经常「派子代理 + 自己搜」一起发（嘴上说同时，引擎以前是
+ * 串行的——task 独占九十秒，搜索干等）。两个各睡 400ms 的假工具并行跑，
+ * 总耗时必须明显小于串行的 800ms；结果仍按原调用顺序入账。
+ */
+private fun scenarioParallel(base: String) {
+    val toolbox = object : Toolbox {
+        override fun schemas() = JSONArray()
+        override fun beginTask(owner: String) {}
+        override fun execute(
+            name: String, args: JSONObject, owner: String,
+            onProgress: (String) -> Unit, isCancelled: () -> Boolean,
+        ): ToolResult {
+            Thread.sleep(400)
+            return ToolResult(text = "{\"ok\":true,\"tool\":\"$name\"}")
+        }
+    }
+    val loop = AgentLoop(CloudClient("$base/PA", "hy3", FakeTokens("t0", null)), toolbox, 4)
+    val rec = Recorder()
+    val t0 = System.currentTimeMillis()
+    loop.run("两个活一起干", rec)
+    val elapsed = System.currentTimeMillis() - t0
+
+    result("par_no_error", rec.error.isEmpty(), rec.error)
+    result("par_both_ran", rec.tools == listOf("web_search", "web_fetch") && rec.results.size == 2,
+        rec.tools.joinToString(","))
+    result("par_in_order", rec.tools == listOf("web_search", "web_fetch"), rec.tools.joinToString(","))
+    result("par_concurrent", elapsed < 800, "${elapsed}ms（串行要 800ms+）")
+}
+
 fun main(args: Array<String>) {
     val base = args.firstOrNull() ?: "http://127.0.0.1:8799"
     // 第二个参数是可用的 shell 路径，由 test_agent.py 探测后传入
@@ -3981,6 +4555,8 @@ fun main(args: Array<String>) {
         scenarioCompact(base)
         scenarioCompactKeepsAsks(base)
         scenarioCompactImageGoal(base)
+        scenarioCompactNoBase64Inflation(base)
+        scenarioImageNote(base)
         scenarioCompactNesting(base)
         scenarioSummaryGoal()
         scenarioArtifact(base)
@@ -3988,6 +4564,7 @@ fun main(args: Array<String>) {
         scenarioGatewayPlan()
         scenarioGatewayWire()
         scenarioGatewaySocket()
+        scenarioParallel(base)
     } catch (e: Exception) {
         result("harness_crash", false, e.message ?: e.javaClass.simpleName)
     }

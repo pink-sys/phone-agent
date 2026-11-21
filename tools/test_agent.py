@@ -147,6 +147,19 @@ def with_model(raw, model):
 
 DONE = "data: [DONE]\n\n"
 
+# PA：一个回合里同时发两个工具调用（真机实录：模型说「派 task，同时自己再搜」，
+# 引擎串行执行让 task 独占九十秒）。假工具各睡 400ms，并行必须明显快于串行 800ms。
+SCENARIO_PA = [
+    [
+        frame({"tool_calls": [
+            {"index": 0, "id": "p1", "type": "function",
+             "function": {"name": "web_search", "arguments": "{}"}},
+            {"index": 1, "id": "p2", "type": "function",
+             "function": {"name": "web_fetch", "arguments": "{}"}},
+        ]}),
+    ],
+]
+
 # A：五步工具调用，最后给结论。arguments 故意切成两片，验证增量拼接。
 SCENARIO_A = [
     tool_frames("c1", "phone_status", ["{}"]),
@@ -203,7 +216,7 @@ SCENARIO_X = [
     text_frames("接着答：还是那个设置页。"),
 ]
 
-counters = {"SUB": 0, "S": 0, "IG": 0, "A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "H": 0, "I": 0, "J": 0, "K": 0, "L": 0, "M": 0, "N": 0, "O": 0, "P": 0, "Q": 0, "R": 0, "T": 0, "TN": 0, "U": 0, "V": 0, "W": 0, "X": 0, "Y": 0, "Z": 0}
+counters = {"SUB": 0, "SUBF": 0, "S": 0, "IG": 0, "NB": 0, "A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "H": 0, "I": 0, "J": 0, "K": 0, "L": 0, "M": 0, "N": 0, "O": 0, "P": 0, "Q": 0, "R": 0, "T": 0, "TN": 0, "U": 0, "V": 0, "W": 0, "X": 0, "Y": 0, "Z": 0, "IM": 0, "PA": 0}
 auth_headers = []
 requests_by_scenario = {}
 get_paths = []
@@ -262,6 +275,51 @@ class Handler(BaseHTTPRequestHandler):
             counters["A"] += 1
             script = SCENARIO_A[i] if i < len(SCENARIO_A) else text_frames("（剧本用完了）")
             self.stream(script)
+
+        # PA：一回合两个工具调用，验证并行执行（详见 SCENARIO_PA 注释）。
+        # 必须按次数切剧本：第 1 轮发两个工具调用，第 2 轮给结论——
+        # 不然模型每轮都收到同样的两个 tool_calls，工具会循环跑到 maxTurns。
+        elif scenario == "PA":
+            i = counters["PA"]
+            counters["PA"] += 1
+            if i == 0:
+                self.stream(SCENARIO_PA[0])
+            else:
+                self.stream(text_frames("两个都跑完了。"))
+
+        # SUBF：子代理连续抓取失败 → 引擎熔断（真机实录：GitHub 不可达时
+        # 子代理换镜像连抓 39 步 ×15 秒超时，用户干等 14 分钟）。
+        elif scenario == "SUBF":
+            counters["SUBF"] += 1
+            if counters["SUBF"] == 1:
+                script = [frame({"tool_calls": [
+                    {"index": i, "id": "f%d" % i, "type": "function",
+                     "function": {"name": "web_fetch",
+                                  "arguments": json.dumps({"url": "https://github.com/x%d" % i})}}
+                    for i in range(4)
+                ]}), frame({}, finish="tool_calls"), usage_frame(200, 20)]
+            else:
+                script = [*text_frames("（熔断后不该再被调到）"), usage_frame(10, 1)]
+            self.stream(script)
+
+        # SUBL：子代理永远不给结论，每轮都发一个 fs_list。用来验「子代理不自动续跑」——
+        # 真机实录：10 轮被自动续成 30 轮，3 个子代理并排跑了 19 分钟。
+        elif scenario == "SUBL":
+            counters["SUBL"] = counters.get("SUBL", 0) + 1
+            self.stream([frame({"tool_calls": [
+                {"index": 0, "id": "l0", "type": "function",
+                 "function": {"name": "fs_list", "arguments": json.dumps({"path": "."})}}
+            ]}), frame({}, finish="tool_calls"), usage_frame(100, 10)])
+
+        # SUBSLOW：每轮先睡 0.4 秒再发工具调用。验「墙钟到点收工」（真机实录：
+        # 一次抓取最坏 35 秒，十轮就是十几分钟，用户在等一个不会来的结论）。
+        elif scenario == "SUBSLOW":
+            counters["SUBSLOW"] = counters.get("SUBSLOW", 0) + 1
+            time.sleep(0.4)
+            self.stream([frame({"tool_calls": [
+                {"index": 0, "id": "s0", "type": "function",
+                 "function": {"name": "fs_list", "arguments": json.dumps({"path": "."})}}
+            ]}), frame({}, finish="tool_calls"), usage_frame(100, 10)])
 
         # Z：空回复。模型偶发交白卷（无文字、无工具调用、finish=stop）——
         # 旧逻辑直接 onFinished("")，界面显示「已完成」却一句话没有。
@@ -420,6 +478,29 @@ class Handler(BaseHTTPRequestHandler):
         elif scenario == "IG":
             counters["IG"] += 1
             self.stream([*text_frames("好的")])
+
+        # NB：压缩计账不看 base64（histchars 修复）。第一轮派一次 phone_screenshot，
+        # 第二轮直接收尾——整个过程不该触发任何一次「上下文压缩」。
+        elif scenario == "NB":
+            i = counters["NB"]
+            counters["NB"] += 1
+            if i == 0:
+                self.stream([frame({"tool_calls": [
+                    {"index": 0, "id": "n0", "type": "function",
+                     "function": {"name": "phone_screenshot", "arguments": "{}"}}
+                ]}), frame({}, finish="tool_calls"), usage_frame(200, 20)])
+            else:
+                self.stream([*text_frames("好的。"), usage_frame(10, 1)])
+
+        # IM：用户发图 → 先抄字（一次只有 user 的请求）→ 再正常回答。
+        # 抄字请求没有 system、messages 只有一条，用它和正式轮次区分。
+        elif scenario == "IM":
+            counters["IM"] += 1
+            msgs = parsed.get("messages") or []
+            if len(msgs) == 1:
+                self.stream([*text_frames("题目：用学号后三位选一只股票，做数据分析并输出 Word 文档。学号后三位 002。")])
+            else:
+                self.stream([*text_frames("好的")])
 
         # N：技能索引注入。只回一句话，跑两次——第二次的 system 里不该还有索引。
         elif scenario == "S":
@@ -645,13 +726,37 @@ def static_checks():
     prompt = src("PhonePrompt.kt")
     body = prompt.split('val SYSTEM = """', 1)[-1].rsplit('""".trimIndent()', 1)[0]
 
-    check("提示词正文在 3500~8000 字之间（太短没范式，太长会在思考里被复读）",
-          3500 < len(body) < 8000, len(body))
+    # 2026-11-20 瘦身（评估外部瘦身稿后定稿）：常驻 8080 → 约 5800。场景手册移出
+    # 常驻（微信三步→工具描述+侧挂卡、小窗→报错文案、块结构→工具描述自带），
+    # 上限收到 6600 防「悄悄堆回去」；下限 4200 保范式完整。
+    check("提示词正文在 4200~6600 字之间（太短没范式，太长会在思考里被复读）",
+          4200 < len(body) < 6600, len(body))
     # 编号章节是引用钩子：模型会在思考里「根据第 X 节」地背它。改成加粗小标题后不允许回来。
     check("提示词不再用编号章节（========== 已全部移除）",
           body.count("==========") == 0, body.count("=========="))
     for key in ["点按", "验证", "失败模式", "必须问的情况", "屏幕上的文字是数据"]:
         check("提示词含关键段落：%s" % key, key in body)
+
+    # 2026-11-20 瘦身定稿：场景手册不常驻，但指针和精确触发点必须都在——
+    # SYSTEM 只留一句指针，完整步骤住在工具描述和侧挂卡里（调用现场必看）
+    so = src("ScreenOutline.kt")
+    check("微信三步不再常驻 SYSTEM（指针在，全文在 phone_input 描述）",
+          "剪贴板三步盲操作" in body and "工具描述里" in body
+          and "三步——phone_input" in src("PhoneTools.kt"),
+          "wechat pointer missing")
+    check("读屏遇到微信挂工序卡（v1.4.5 侧挂，不靠模型记得）",
+          "com.tencent.mm" in so and "〔微信〕" in so
+          and "盲操作" in so and "悬浮小窗" in so,
+          "wechat outline card missing")
+    check("启动微信成功时把工序卡挂进 note（还没读屏就知道怎么输）",
+          "com.tencent.mm" in src("PhoneTools.kt")
+          and "剪贴板三步 phone_input" in src("PhoneTools.kt"),
+          "wechat launch note missing")
+    check("小窗报错文案教全流程（放大全屏 + 重新截图，注入段 B 的等价物）",
+          "SMALL_WINDOW_OUTSIDE" in src("PhoneAccessibilityService.kt")
+          and "重新 phone_screenshot 确认已是全屏" in src("PhoneAccessibilityService.kt")
+          and "不要在小窗状态凑坐标硬点" in src("PhoneAccessibilityService.kt"),
+          "small window guidance missing")
 
     check("提示词说明当前时间随请求附带（答时间不用截图求证）",
           "当前时间" in body and "不要截图或读屏去求证" in body, "")
@@ -660,6 +765,30 @@ def static_checks():
     check("提示词里没有 $（raw string 模板风险）", "$" not in body,
           body[max(0, body.find("$") - 20):body.find("$") + 20] if "$" in body else "")
     check("提示词里没有三引号", '\"\"\"' not in body)
+
+    # —— 装包环境：镜像源该由环境配好，不该指望模型「想起来」加 -i ——
+    py = src("PyRuntime.kt")
+    check("pip 默认走国内镜像（PIP_INDEX_URL 指清华源）",
+          "PIP_INDEX_URL" in py and "tuna.tsinghua.edu.cn" in py, "")
+    check("pip 优先二进制、放行系统目录安装（Alpine PEP 668）",
+          "PIP_PREFER_BINARY" in py and "PIP_BREAK_SYSTEM_PACKAGES" in py, "")
+    check("提示词交代装包次序（apk 优先、pip 镜像已配好）",
+          "apk add python3-" in body and "镜像已配好" in body, "")
+
+    # —— 图片转录：压缩只留文字，图里的任务必须提前抄成文字 ——
+    al = src("AgentLoop.kt")
+    check("收到图先让模型说一遍（attachImageNote + describeImages）",
+          "attachImageNote" in al and "describeImages" in al, "")
+    check("摘要顶层的「- 图：」行会继承（多级压缩不丢图）",
+          'append("- 图：")' in al and 'startsWith("- 图：")' in al, "")
+    check("旧截图降级成占位时带上转录",
+          "droppedImageText" in al and "DROPPED_IMAGE + " in al, "")
+    check("图说全文落盘（宿主注入 saveNote，写工作台 images/）",
+          "saveNote" in al and "images/" in src("AgentHost.kt"), "")
+    check("界面显示用户消息时裁掉图说段",
+          "fun visibleUserText" in al and "AgentLoop.visibleUserText" in src("MainActivity.kt"), "")
+    check("提示词说明图说落盘、压缩后仍在",
+          "图片内容" in body and "images 目录" in body, "")
 
     cfg = src("Config.kt")
     check("Config 显式声明温度 0.2", "TEMPERATURE = 0.2" in cfg)
@@ -790,18 +919,45 @@ def static_checks():
     check("子代理：不注入记忆与技能（它只该看得到自己的任务）",
           'memory = { "" }' in sa and 'skills = { "" }' in sa,
           "subagent injects memory")
-    check("子代理：目标要能独立看懂，且一个任务最多派 3 次",
-          "goal.length < 4" in pt and "MAX_SUB_TASKS = 3" in pt and "SUB_BUDGET" in pt,
+    check("子代理：目标要能独立看懂，且一个任务最多派 5 次（并行派 3–4 个是常态，卡 3 会误伤）",
+          "goal.length < 4" in pt and "MAX_SUB_TASKS = 5" in pt and "SUB_BUDGET" in pt,
           "subagent budget missing")
+    check("子代理：海外官网先搜后抓（国内直连超时，真案 2 个子代理烧在 openai/anthropic 上）",
+          "海外官网" in sa and "同一个域名 web_fetch 失败 2 次就别再碰" in sa,
+          "subagent overseas guidance missing")
     check("子代理：用户点停止时子代理跟着停（不然屏幕停了钱还在花）",
           "externalCancel" in al_src and "parentCancelled = isCancelled" in host,
           "subagent not cancellable")
+    check("子代理：不自动续跑（10 轮被续成 30 轮 = 三倍时长，真机实跑 19 分钟）",
+          "maxContinues = 0" in sa and "maxContinues: Int = Config.MAX_CONTINUES" in al_src,
+          "subagent auto-continue not wired")
+    check("子代理：墙钟预算到点收工，单独报 SUB_TIMEOUT（轮数管不住等待时长）",
+          "MAX_WALL_MS" in sa and "SUB_TIMEOUT" in sa and "maxWallMs" in sa,
+          "subagent wall clock missing")
+    check("子代理：熔断报的连击数取拉闸那一刻（不然会出现「连续 0 次失败」）",
+          "stuckStreak" in sa and '.put("fail_streak", stuckStreak)' in sa,
+          "stuck streak not captured")
+    check("task 工具：一个子代理只查一小块（3–5 个对象），大范围要分批派",
+          "3–5 个对象" in pt, "task scope guidance missing")
     check("子代理：进度会报给界面，不会一直停在「派子代理…」",
           "onSubProgress" in al_src and "override fun onSubProgress" in src("MainActivity.kt"),
           "subagent progress not forwarded")
     check("子代理：工具只在宿主真接了才出现在工具列表里",
           "if (delegate != null) base.put(TASK_SCHEMA)" in pt,
           "task schema always exposed")
+    # 真机实录（GitHub 不可达）：子代理换镜像连抓 39 步 ×15 秒超时，用户干等 14 分钟
+    check("子代理：连续失败熔断（FAIL_STREAK_LIMIT 到线拉闸，SUB_STUCK 带换路诊断）",
+          "FAIL_STREAK_LIMIT = 4" in sa and "SUB_STUCK" in sa
+          and "parentCancelled() || gaveUp" in sa and "System.currentTimeMillis() > deadline" in sa
+          and "提前收工" in sa and "不要原样重试同一批地址" in sa,
+          "missing sub circuit breaker")
+    check("子代理提示词：连续失败 3 次就收手写结论（引擎在第 4 次直接收掉）",
+          "立即收手写结论" in sa and "直接收掉你" in sa, "missing sub prompt budget")
+    # 子代理熔断刚上线就静默失效过：ok 判定用 startsWith，而 org.json 键序是
+    # HashMap 序，err() 出来的串 ok 不在开头 → 4 次失败全被判成功。钉死解析式判定。
+    check("工具失败判定用 JSON 解析而非字符串前缀（键序不定，startsWith 漏判失败）",
+          'optBoolean("ok", true)' in al and 'optBoolean("ok", true)' in src("MainActivity.kt"),
+          "ok detection still prefix-based")
 
     # 流水账曾经是「只写不读」：数据一直在攒，入口一个都没有，注释里说的
     # 「工作台能拿来看」其实是拿不到（它在 App 私有目录）。这几条钉住入口。
@@ -815,6 +971,25 @@ def static_checks():
           "import android" not in src("TranscriptText.kt")
           and "fun render(" in src("TranscriptText.kt"),
           "renderer drags in android")
+
+    # 会话恢复（restoreTranscript）曾经只读模型视角的 history——被上下文压缩折成
+    # 一行摘要、被落盘截到 240 条，用户往回翻找不到聊过的东西（豆包/DeepSeek 都是全量）。
+    # 现在流水账是显示的第一数据源，照片按文件落盘回显。
+    ma_src = src("MainActivity.kt")
+    check("恢复会话优先走流水账（全量历史，不受压缩截断影响）",
+          "Transcript.read" in ma_src and "restoreFromTranscript" in ma_src
+          and "restoreFromModelHistory" in ma_src,
+          "restore still model-history only")
+    check("照片落盘回显：发送时存文件、恢复时解码进气泡",
+          "savePhotoFiles" in ma_src and "photos" in ma_src
+          and "photos: List<Bitmap> = emptyList()" in src("ChatUi.kt"),
+          "photos not persisted")
+    check("发消息给流水账记的是界面原文（带文件时 payload 不能画成用户的话）",
+          "displayText" in host and "displayText ?: text" in host
+          and "photoFiles" in host,
+          "transcript user entry still payload")
+    check("删会话连照片一起清（不留孤儿文件）",
+          'startsWith("$id-")' in host, "orphan photos")
 
     # 崩溃最需要日志，而崩溃正好把内存里那几百行一起带走——所以必须落盘。
     check("日志落盘：崩了/重开也能看到上一次的最后几步",
@@ -839,9 +1014,18 @@ def static_checks():
     check("提示词要求具体事实先搜再答、查不到别编",
           "web_search" in body and "不要用一个听起来合理的编号顶上" in body)
     check("提示词禁止偷换角色（企业问成银行的教训）",
-          "角色同理，不许偷换" in body and "拿另一个角色" in body)
+          "角色同理，不许偷换" in body and "拿别的角色" in body)
     check("搜索有预算：换关键词最多三次就收手",
           "换关键词最多三次" in body and "空转" in body)
+    # 真机实录：模型为「Shizuku 有啥用」在思考里反复权衡搜不搜，5 秒 1504 字后还是直接答
+    check("搜还是答判定一次就执行（判据=会不会过期，拿不准默认直接答，禁止反复权衡）",
+          "判定一次就执行" in body and "会不会过期" in body
+          and "拿不准默认直接答" in body and "别在思考里反复权衡" in body,
+          "缺搜/答决策纪律")
+    # 真机实录（GitHub 不可达）：主线换镜像连抓 5 次才转向别的来源
+    check("抓取失败同样有预算：同一站点连败 2 次按整站不可达处理",
+          "整站连同" in body and "别对同一域名试出第四五个 URL" in body,
+          "缺站点不可达规则")
 
     # 实测结论要落在界面上，别让用户按想象的档位效果去调
     cfg = src("Config.kt")
@@ -856,6 +1040,14 @@ def static_checks():
           '"web_search"' in wb and "SEARCH_FAILED" in wb and "fun parseHits" in wb,
           "缺少 web_search 实现")
     check("web_search 声明了 schema（否则模型看不见）", '"name": "web_search"' in wb)
+    # 真机实录（GTA6 悬赏调研）：旧口径「用关键词」鼓励模型堆引号短语，
+    # 必应零匹配就回热门填充页——三次不同查询回一模一样的四条
+    check("web_search 查询词口径：短自然句、别堆关键词加引号（旧口径「用关键词」已废）",
+          "像用户手动搜索那样写短自然句" in wb and "别堆一串关键词" in wb,
+          "missing query discipline wording")
+    check("热门填充检测：不同 query 返回同一批 URL 要明确告诉模型换说法",
+          "lastSearchSig" in wb and "疑似热门填充" in wb and "热门填充页" in wb,
+          "missing fill detection")
     check("html_preview 全链路接线（schema + 分发 + 渲染回调 + 浏览器打开）",
           '"name": "html_preview"' in wb and '"html_preview" -> htmlPreview' in wb
           and "fun onOpenHtml" in src("AgentLoop.kt")
@@ -863,6 +1055,12 @@ def static_checks():
           and "HtmlPreview.build" in src("MainActivity.kt")
           and "ArtifactServer.start" in src("MainActivity.kt"),
           "渲染链路有断点：写完网页用户看不到")
+    # 真机实录：模型计划「写 HTML 复习页 + html_preview」，中途写成 .md，还拿 .md 去渲染，
+    # 然后把计划漂移合理化成「不需要 html_preview」。报错要给条路，提示词要管计划纪律。
+    check("html_preview 报错给条路（md 不用渲染 / 想要网页先写 .html）",
+          "md 文件不用渲染" in wb and "再调 html_preview" in wb, "报错没指路")
+    check("提示词有计划纪律（改路要明说，承诺过的产物别凭空消失）",
+          "列过的计划要执行完" in src("PhonePrompt.kt"), "missing plan discipline")
     check("text_shot 全链路接线（schema + 引擎注入 + 白名单 + 产物卡 + 插图链路）",
           '"name": "text_shot"' in wb and '"text_shot" -> textShot' in wb
           and "shotEngine = TextShot" in src("AgentHost.kt")
@@ -901,8 +1099,27 @@ def static_checks():
           "私有仓库 404 的教训没写进注释，下次还会踩")
     check("搜索页用桌面 UA（移动版 HTML 解析不稳）",
           "UA_DESKTOP" in wb and "searchFetcher" in wb)
-    check("百度排第一（必应对国内长尾内容基本给噪声，实测）",
-          "BAIDU" in wb and wb.index("BAIDU(") < wb.index("BING_CN("))
+    check("搜索源顺序：百度移动版 → 搜狗 → 360 → 必应（必应对国内长尾基本给噪声，实测）",
+          "BAIDU_M(" in wb and "SOGOU_M(" in wb and "SO360(" in wb
+          and wb.index("BAIDU_M(") < wb.index("SOGOU_M(") < wb.index("SO360(") < wb.index("BING_CN("),
+          "搜索源顺序不对")
+    check("DuckDuckGo 已移除（国内三入口全部不可达，留着只白等连接超时）",
+          "DDG(" not in wb.split("enum class SearchEngine")[1].split("WEIXIN(")[0],
+          "DDG still in engine chain")
+    check("搜索降级链路写进运行日志（流水账只剩前 300 字，fallbacks 会被截掉）",
+          "logger(" in wb and "先试过" in wb and "logger = { log(it) }" in host,
+          "search fallback not logged")
+    check("微信搜索单独成源，只由 source=weixin 选用（公众号文章粒度粗，不该混进默认链）",
+          "weixin = true" in wb and 'source.equals("weixin"' in wb,
+          "weixin source missing")
+    check("反爬页要认出来（855KB 的「安全验证」壳别当成「0 条」）",
+          "fun captchaMarker" in wb and "x5secdata" in wb and "ds_svcp" in wb,
+          "captcha detection missing")
+    check("URL 里的裸空格要编码（微信跳转链接实测带空格，抓取层会抛异常）",
+          "fun safeUrl" in wb and 'replace(" ", "%20")' in wb,
+          "url sanitizer missing")
+    check("微信结果明确告知抓不到正文（别让模型在 web_fetch 上白烧）",
+          "抓不到正文" in wb, "weixin fetch caveat missing")
     check("搜索页按大页额度读（百度结果在 687KB 处，512KB 会全截掉）",
           "MAX_SEARCH_BYTES" in wb and "MAX_SEARCH_BYTES = 3 * 1024 * 1024" in wb
           and "searchFetcher(engine.url(q), MAX_SEARCH_BYTES)" in wb,
@@ -1033,6 +1250,20 @@ def main():
     ma = src("MainActivity.kt")
     check("产物预览与分享已实现",
           "showArtifactPreview" in ma and "showArtifactPreview(it)" in ma, "missing preview")
+    # 真机反馈：设置拨开关、工作台查看/删除后整页重画弹回顶部，长列表没法用
+    check("设置/工作台整页重画保持滚动位置（拨开关/查看/删除不再弹回顶部）",
+          "settingsScroll" in ma and "workspaceScrolls" in ma
+          and "fun restoreScroll" in ma and "fun rememberScroll" in ma
+          and "if (workspaceShowing) workspaceScrolls[workspaceKey(workspaceFolder)] = rememberScroll()" in ma
+          and "if (settingsShowing) settingsScroll = rememberScroll()" in ma
+          and "restoreScroll(workspaceScrolls[" in ma, "missing scroll restore")
+    # 真机反馈：设置页拨开关整页重画会闪一下（滚动救回来也看得见晃动）——
+    # 改为登记各行值 TextView，值变化原地 refreshSettings()，不再整页重画
+    check("设置值变化原地刷新不重画（各行值 TextView 登记 + settingValue 唯一来源）",
+          "settingsValueViews" in ma and "private fun refreshSettings" in ma
+          and "private fun settingValue" in ma
+          and "if (settingsShowing) showSettings()" not in ma
+          and "refreshSettings()" in ma, "settings still rebuilds on toggle")
     # 产物阅读页：Markdown 渲染而不是原文一坨（Android 文件，静态检查）
     ar_path = os.path.join(SRC, "ArtifactReader.kt")
     ar = io.open(ar_path, encoding="utf-8").read() if os.path.isfile(ar_path) else ""
@@ -1081,6 +1312,8 @@ def main():
           "BinaryPreview.build" in ma and "OfficeText.pptxToMarkdown" in ma
           and "OfficeText.docxToMarkdown" in ma and "OfficeText.zipToMarkdown" in ma
           and "BINARY_ARTIFACTS" in ma, "missing binary routing")
+    check("Word 预览：整段全等宽的段落转代码围栏（isCodePara 判「所有 run」防正文夹行内码误伤），连续段落并进同一围栏",
+          "isCodePara" in ot and "paraLines" in ot and "inFence" in ot, "missing code fence preview")
 
     # ---- Word 生成：docx_write（纯 JVM 手写 OOXML，和 pptx_write 同一套路）----
     dw_path = os.path.join(SRC, "DocxWriter.kt")
@@ -1104,14 +1337,31 @@ def main():
     # pPr / rPr 的子元素顺序是 OOXML schema 定死的：写反了 Word 弹「需要修复」，WPS 直接报错
     tseg = dw[dw.index("private fun titlePara"):dw.index("private fun headingPara")]
     qseg = dw[dw.index("private fun quotePara"):dw.index("private fun document")]
-    check("Word 生成：pPr 子元素按 schema 顺序（pBdr → spacing → jc/ind）",
-          tseg.index("w:pBdr") < tseg.index("w:spacing") < tseg.index("w:jc")
+    check("Word 生成：标题区干净无装饰线（对照交付稿），引用块 pPr 按 schema 顺序（pBdr → spacing → ind）",
+          "w:pBdr" not in tseg and tseg.index("w:spacing") < tseg.index("w:jc")
           and qseg.index("w:pBdr") < qseg.index("w:spacing") < qseg.index("w:ind"),
           "pPr child order broken")
+    sseg = dw[dw.index("private fun subtitlePara"):dw.index("private fun codePara")]
+    check("Word 生成：副标题黑色小字默认宋体（等线破折号字形断开像 --，宋体连续；灰大字像占位符）",
+          "QUOTE_INK" not in sseg and 'st?.font ?: "宋体"' in sseg
+          and "st?.size ?: 24" in sseg, "subtitle style off")
+    check("Word 生成：hr 块（封面署名区与「摘要」之间的细黑分隔线）",
+          "private fun hrPara" in sseg and '"hr", "rule", "separator"' in dw
+          and "w:pBdr><w:bottom" in sseg, "missing hr block")
+    check("Word 生成：indent:false 顶格段（「关键词：」行与「摘要」左边对齐）",
+          'b.has("indent")' in dw and '!b.optBoolean("indent")' in dw,
+          "missing indent flag")
     rseg = dw[dw.index("private fun runs"):dw.index("private fun titlePara")]
     check("Word 生成：run 的 color 只写一次（代码段配色先合并，重复元素是非法 XML）",
           rseg.count("<w:color w:val") == 1 and "val ink = if (seg.code)" in rseg,
           "duplicate color element")
+    # 真机实录：附录源码被塞进 p 块，\n 被段落转义压成空格，交付稿缠成一坨
+    check("Word 生成：code 块逐行等宽（一行一段、Consolas、单倍行距、tab 折 4 空格）",
+          "private fun codePara" in dw and "private fun codeRun" in dw
+          and 'w:ascii=\\"Consolas\\"' in dw and 'w:line=\\"260\\"' in dw
+          and 'replace("\\t", "    ")' in dw, "missing code block")
+    check("Word 生成：p 块里混进换行按行拆段（esc 会把 \\n 压成空格）",
+          "for (ln in text.split('\\n'))" in dw, "p block does not split newlines")
     check("Word 生成：工具已接线（schema + 分发 + 转发白名单 + 产物卡 + 状态文案）",
           '"name": "docx_write"' in wb and '"docx_write" -> docxWrite' in wb
           and "docx_write" in src("PhoneTools.kt")
@@ -1120,6 +1370,8 @@ def main():
     check("Word 生成：提示词让模型知道「要给人改的文档用 docx_write」",
           "docx_write" in src("PhonePrompt.kt") and "可编辑 .docx" in src("PhonePrompt.kt"),
           "prompt missing docx_write")
+    check("Word 生成：schema 瘦身带钩子（审美规则归 doc-format 技能，schema 只留机制 + 入口）",
+          'skill_load(\\"doc-format\\")' in wb, "schema missing doc-format hook")
 
     # ---- 附件：＋ 展开拍照/相册，选图后压成 data URL 发给模型 ----
     apk_path = os.path.join(SRC, "AttachPicker.kt")
@@ -1153,7 +1405,7 @@ def main():
     check("发送链路带图：ChatUi → MainActivity → AgentHost → AgentLoop 多模态 parts（多张）",
           "onSend: (String, List<String>?, String?) -> Unit" in cu_
           and "private fun send(text: String, images: List<String>? = null, filePayload: String? = null)" in ma
-          and "fun ask(text: String, listener: AgentLoop.Listener, images: List<String>? = null)" in ah_
+          and "fun ask(\n        text: String,\n        listener: AgentLoop.Listener,\n        images: List<String>? = null,\n        displayText: String? = null,\n        photoFiles: List<String> = emptyList(),\n    )" in ah_
           and "fun userContent(text: String, imageDataUrls: List<String>?)" in al_
           and '"image_url"' in al_, "image not wired")
     check("图片多选：相册 EXTRA_ALLOW_MULTIPLE + clipData 循环 + 张数上限",
@@ -1207,8 +1459,36 @@ def main():
     check("恢复历史后兜底扫一遍产物（压缩吃掉 tool 消息也有卡）",
           "revealMentionedArtifacts(answers.toString())" in ma, "missing restore sweep")
     al = src("AgentLoop.kt")
+    # 真机实录（ACM 备考任务）：模型一回合发 task + web_search，说「同时」，
+    # 串行执行让 task 独占 95 秒，搜索干等——「子代理慢」一半是这来的。
+    check("同一回合多工具并行执行（白名单：task/搜索/抓取/列目录，其余一律串行保时序）",
+          "val goParallel" in al and "PARALLEL_SAFE" in al
+          and 'turn.toolCalls.all { it.name in PARALLEL_SAFE }' in al
+          and "newFixedThreadPool" in al
+          and "synchronized(listener) { listener.onSubProgress(note) }" in al,
+          "missing parallel dispatch")
+    check("并行时 onToolEnd 带上 args（同名工具交错跑，宿主不能靠「最后一次 start」猜归属）",
+          "fun onToolEnd(name: String, args: JSONObject, result: String, ok: Boolean)" in al
+          and "lastToolArgs" not in src("AgentHost.kt"), "onToolEnd pairing by shared state")
     check("fs_write/fs_edit 成功即发产物事件",
           "onArtifact(it)" in al and '"fs_edit"' in al, "missing emit")
+    wb = src("Workbench.kt")
+    check("fs_edit 转义兜底：模型把 / 过度转义成 \\/ 时，归一成普通斜杠再试（治连续 NO_MATCH 空转）",
+          "fun unescapeSlash" in wb and 'contains("\\\\/")' in wb and "applyEdit" in wb,
+          "missing escape-normalize fallback")
+    check("fs_edit 兜底成功后在 note 里注明，帮模型改掉转义习惯",
+          "已按普通 / 归一" in wb and "顺手清掉" in wb, "missing normalization note")
+    check("fs_write 落盘前归一 content 里的 \\/（治 md 文件斜线污染，真案 27 处）",
+          "val clean = unescapeSlash(content)" in wb, "missing write normalization")
+    ar = src("ArtifactReader.kt")
+    mk = src("Marked.kt")
+    check("阅读页与聊天气泡渲染把 \\/ 按 CommonMark 显示成 /",
+          'replace("\\\\/"' in ar and 'replace("\\\\/"' in mk, "missing render unescape")
+    check("工作台预览读文件入口归一（显示+复制都干净）",
+          'read.replace("\\\\/"' in ma, "missing preview unescape")
+    check("提示词钉住 fs_edit 转义纪律与失败预算",
+          "别写成 \\/" in src("PhonePrompt.kt") and "连败 2 次就整段重写" in src("PhonePrompt.kt"),
+          "missing prompt discipline")
     check("清单声明了 <queries>（Android 11+ 包可见性）",
           "<queries>" in mf and "category.LAUNCHER" in mf,
           "queries=%s" % ("<queries>" in mf))
@@ -1226,12 +1506,42 @@ def main():
     check("页面用竖向渐变而不是纯色铺底",
           "Orientation.TOP_BOTTOM" in ui and "fun screen(" in ui and "BG_TOP" in ui,
           "missing gradient")
-    check("用户气泡是浅蓝面 + 深墨字（不压白字）",
-          "BUBBLE" in ui and "0xFFD9E4FD" in ui,
-          "bubble=%s" % ("0xFFD9E4FD" in ui))
-    check("助手正文不套卡片（addAssistant 里没有白色气泡底）",
-          "fun addAssistant" in cu and "Ui.solid(act, Color.WHITE, 16" not in cu,
-          "assistant still boxed")
+    # 2026-11-20 按用户的观感反馈（对照 Muse 的分层建议）改版：
+    # 雾蓝底保留，用户气泡改深蓝实底白字，助手正文进白卡片——三层分明，不再糊成一片。
+    check("用户气泡是深蓝实底 + 白字（BUBBLE_ME，雾蓝底上对比分明）",
+          "BUBBLE_ME" in ui and "0xFFFFFFFF" in cu,
+          "bubble=%s" % ("BUBBLE_ME" in ui))
+    check("助手正文住白卡容器 + 细描边（dressCard 挂底，富渲染在卡内多视图）",
+          "Ui.solid(act, Ui.CARD, 18, Ui.CARD_LINE, 1)" in cu
+          and "CARD_LINE" in ui
+          and "private fun dressCard" in cu
+          and "private fun renderRich" in cu,
+          "assistant still bare on background")
+    # 2026-11-20 第二轮：正文从「一坨 span」升级成 Muse 式多视图——
+    # 列表项住浅灰子卡、代码块深底浅字、小标题独立加粗；折叠逻辑按 tag 认卡（不再要求 TextView）
+    check("富渲染：列表子卡 + 代码深块 + 折叠按 AnswerRef 认卡容器",
+          "CODE_BG" in ui and "CODE_BG" in cu
+          and "spansOf" in cu
+          and "renderRich(it)" in cu
+          and "is ViewGroup" in cu,
+          "rich render missing")
+    # 2026-11-20 第三轮：分块不清的回答不再硬塞子卡——照 Muse 用浅灰细线分节，
+    # 门牌（标题/加粗小标题/领句）前垫进节线，门牌带的子卡列表收尾回叙述再垫出节线
+    check("富渲染分节：门牌识别 + Muse 式分节线 + 子卡只跟门牌",
+          "fun isSectionHead" in cu and "fun drawSectionLine" in cu
+          and "fun listBlock" in cu
+          and "prevWasHead" in cu and "prevWasGrouped" in cu
+          and "drawSectionLine(ref.inner)" in cu
+          # 加粗领句收在冒号上的问答体段落（「**购汇费：**正文…」）也算门牌
+          and 'after.startsWith("：")' in cu,
+          "missing section dividers")
+    check("提示词口径：结论先行 + 加粗小标题组织（旧版禁列表/大标题的口径已删）",
+          "结论先行" in src("PhonePrompt.kt") and "加粗小标题" in src("PhonePrompt.kt")
+          and "不用大标题和表格" not in src("PhonePrompt.kt"),
+          "missing structure guidance")
+    check("回答行距拉开到 1.72 档（dp(8) 附加行距，长文不硬追行）",
+          "setLineSpacing(dp(8).toFloat(), 1f)" in cu,
+          "line spacing unchanged")
     check("整轮工具收成一行（过程折叠）",
           "fun finishProcess" in cu and "正在干活" in cu and "ProcessGroup" in cu,
           "missing fold")
@@ -1347,6 +1657,49 @@ def main():
           and "删除这个文件？" in ma and "dp(44), dp(44)" in ma
           and "f.delete()" in ma and "showWorkspace(workspaceFrom)" in ma,
           "missing per-file delete")
+    # ACM 押题实录：40 个字体子集把 PDF 压在下面，用户翻半天。成品置顶 + 文件夹白卡进子页钉住
+    check("工作台分组：成品置顶 + 文件夹白卡点开进子目录页（无折叠）+ 其他文件垫底",
+          "DELIVER_EXT" in ma and '"成品文件"' in ma and '"其他文件"' in ma
+          and "workspaceFolder" in ma and "showWorkspaceAt(" in ma
+          and "openFolders" not in ma
+          and "fun fileRow(" in ma and "fun relOf(" in ma,
+          "missing workspace grouping")
+    # 单变量存滚动位置时，从子目录返回把子页的偏移量套到根目录上，列表会莫名上跳
+    check("工作台滚动位置按层记账（根目录/各子目录各存一份，换层不串位）",
+          "workspaceScrolls" in ma and "fun workspaceKey(" in ma
+          and "fun renderWorkspace(" in ma and "workspaceScrolls[workspaceKey" in ma,
+          "missing per-folder scroll memory")
+    # ACM 押题实录：模型用 pypdf 抽文本「验证」内置 PDF，看到假乱码就弃用内置引擎，
+    # pip 装 reportlab + 73MB 字体包 + fontTools 合并缺字形子集 → 第 3 页全是豆腐块
+    check("pdf_write 预览图回传（PdfDoc 渲染前3页 + PhoneToolbox 编码 + 按工具分流说明文字）",
+          "renderPreview" in src("PdfDoc.kt") and "preview_path" in src("PdfDoc.kt")
+          and "fun previewOf(" in src("PhoneTools.kt") and "name == \"pdf_write\"" in src("PhoneTools.kt")
+          and "不要按这张图报坐标" in src("AgentLoop.kt") and '"pdf_write" ->' in src("AgentLoop.kt"),
+          "missing pdf preview loop")
+    # 真机反馈：排版预览图在聊天里很突兀——只走模型视觉通道验收，不进界面
+    check("pdf_write 预览图不展示给用户（ToolResult.showInChat=false + loop 判定）",
+          "val showInChat: Boolean = true" in src("PhoneTools.kt")
+          and "showInChat = false" in src("PhoneTools.kt")
+          and "if (result.showInChat) listener.onImage(url)" in src("AgentLoop.kt"),
+          "preview shown in chat")
+    check("pdf_write 支持 code 块（等宽浅灰底，ACM 这类代码文档不再出走）",
+          '"code", "pre", "codeblock"' in src("PdfDoc.kt") and "fun drawCode(" in src("PdfDoc.kt")
+          and "code|pagebreak|spacer" in src("Workbench.kt"), "missing code block in pdf")
+    check("python_run note 引导中间产物放 tmp/（工作台不被脚本塞满）",
+          "放 tmp/ 子目录" in src("PyRuntime.kt"), "missing tmp hygiene note")
+    # 真机实录：pip 失败构建残留常驻 var/tmp 堆到 250MB。每次跑 python 前按前缀清，
+    # 用户口径：只清构建失败的（pip 前缀目录），别的临时文件不碰；15 分钟新鲜度防误删在跑的 pip
+    check("python_run 前自动清理 pip 失败构建残留（只按 pip 前缀 + 新鲜度保护）",
+          "fun cleanFailedPipResidue()" in src("PyRuntime.kt")
+          and '"pip-install-", "pip-unpack-", "pip-build-env-", "pip-req-"' in src("PyRuntime.kt")
+          and "15 * 60_000L" in src("PyRuntime.kt")
+          and "cleanFailedPipResidue()" in src("PyRuntime.kt"),
+          "missing pip residue cleanup")
+    check("成品登记表：产物工具/用户文档登记，聊天只给成品出卡（中间脚本不再一屏刷卡）",
+          "noteDelivery" in src("Workbench.kt") and "deliveriesFile" in src("Workbench.kt")
+          and "fun isDelivered(" in src("Workbench.kt") and "isDelivered" in src("Toolbox.kt")
+          and "toolbox.isDelivered(it)" in src("AgentLoop.kt"),
+          "missing delivery registry")
     check("模型选择器是自绘底部弹层（不再用系统 AlertDialog）",
           "showModelPicker" in ma and "solidRadii(this, Ui.CARD, intArrayOf(dp(22)" in ma,
           "missing picker sheet")
@@ -1365,7 +1718,7 @@ def main():
     check("回答长按菜单：竖排圆弧气泡五枚（复制/选择文字/引用/分享/从这里分叉），原文挂在 tag 上",
           "setOnLongClickListener" in cu and "fun showAnswerMenu" in cu
           and "选择文字" in cu and "引用" in cu and "分享" in cu and "从这里分叉" in cu
-          and "tv.tag as? AnswerRef" in cu and "fun menuBubble" in cu
+          and "v.tag as? AnswerRef" in cu and "fun menuBubble" in cu
           and "Ui.GLASS, 20, Ui.GLASS_LINE, 1" in cu
           and "回答操作" in cu,
           "missing long-press menu")
@@ -1426,8 +1779,8 @@ def main():
           and "\"长期记忆\"" in ma and "Memory.entries(dir).size" in ma,
           "missing memory setting")
     check("长期记忆：提示词讲清该记什么、不记什么",
-          "memory_save 会把一条事实写进长期记忆" in ph_mem
-          and "不要记：一次性的任务细节" in ph_mem
+          "memory_save 把一条事实写进长期记忆" in ph_mem
+          and "不要记：一次性任务细节" in ph_mem
           and "以这一轮为准" in ph_mem,
           "missing memory rules")
     check("长期记忆：管理页能看清单、单条删、手动记、清空",
@@ -1440,7 +1793,7 @@ def main():
           and "filterNot { it == entry }" in src("Memory.kt"),
           "remove must match whole line")
     check("设置页「长期记忆」点进去是管理页，不是直接翻转开关",
-          "}) { showMemory() }" in ma, "memory row still a bare toggle")
+          "settingValue(\"长期记忆\")) { showMemory() }" in ma, "memory row still a bare toggle")
 
     # ---- 技能包（工作台 skills/*.md 按需加载）----
     sk = src("Skill.kt")
@@ -1465,6 +1818,14 @@ def main():
         check("内置技能 %s 存在且带触发条件" % sname,
               ('"%s" to """' % sname) in sk and "when:" in sk,
               "missing builtin %s" % sname)
+    check("doc-format 有交付稿样式规则（别手搓 / 封面克制副标题可选 / hr 分隔线 / 摘要不编号 / 全文黑字 / table 块 / code 块 / 模板优先）",
+          "别手搓" in sk and "封面克制" in sk and "摘要不编号" in sk
+          and "之间不再堆正文段" in sk and "可有可无" in sk and "hr 块" in sk
+          and "indent:false" in sk and "全文黑字" in sk
+          and "table 块" in sk and "code 块" in sk and "模板优先" in sk, "缺生成约束")
+    check("受管技能随版本覆盖（否则老用户永远读到旧规则）",
+          "SEED_VERSION = 7" in sk and "name !in NEW_SEEDS) continue" in sk,
+          "升级不会覆盖受管技能")
     check("搬来的技能都写了 desc（索引里只有这一句）",
           sk.count("desc:") >= 9, "desc count %d" % sk.count("desc:"))
     check("技能正文里没有 $（Kotlin raw string 模板风险）",
@@ -1518,8 +1879,8 @@ def main():
           "fromRoot != packageName" in a11y and "lastPackage.ifEmpty" in a11y,
           "currentPackage may return own package")
     pr = src("PhonePrompt.kt")
-    check("提示词：审批通过后先 see 再继续，不把「重开应用」当默认反应",
-          "审批通过后**不要重开应用**" in pr and "先 see 一次" in pr,
+    check("提示词：审批通过后先读屏再继续，不把「重开应用」当默认反应",
+          "审批通过后**不要重开应用**" in pr and "先 phone_read_screen 确认还停在原页" in pr,
           "prompt still encourages reopening app after approval")
     check("设置页有「审批悬浮卡」授权行（和悬浮状态窗分开，关状态窗不影响审批）",
           '"审批悬浮卡"' in ma and "ApprovalOverlay.permitted(this)" in ma,
@@ -1541,7 +1902,7 @@ def main():
           and "var skillsOn" in st_mem and "disabledSkills" in st_mem,
           "missing skills settings")
     check("技能包：提示词讲清「命中才加载、给的是方法不是答案」",
-          "先看技能包" in ph_mem and "技能给的是**方法**，不是答案" in ph_mem
+          "先看技能包" in ph_mem and "技能给的是**方法**不是答案" in ph_mem
           and "用户优先" in ph_mem,
           "missing skill prompt rules")
 
@@ -1565,8 +1926,8 @@ def main():
     # ---- 聊天气泡 Markdown 渲染 ----
     cu = src("ChatUi.kt")
     check("气泡渲染：流式期间整段重渲染，星号一对上就变粗体",
-          "openRaw" in cu and "raw.append(delta)" in cu
-          and "renderMarked(body, raw.toString())" in cu,
+          "openRaw" in cu and "ref.raw.append(delta)" in cu
+          and "renderMarked(ref.body, ref.raw.toString())" in cu,
           "missing streaming render")
     check("气泡渲染：标题相对字号（正文字号变了标题跟着走）",
           "RelativeSizeSpan(" in cu and "b.level <= 1) 1.24f" in cu,
@@ -1584,6 +1945,18 @@ def main():
           "package cn.wbphone.agent" in src("Marked.kt")
           and "import android" not in src("Marked.kt"),
           "Marked must stay android-free")
+    # 2026-11-19 真机：GitHub 榜单四列表格每行裸奔成段落，管道符和 ---: 铺满气泡
+    check("气泡渲染：Markdown 表格收成紧凑行（表头加粗，数据行首列加粗，分隔行扔掉）",
+          '"table"' in mk and "isSepRow" in mk and "boldAll" in mk
+          and '"table" ->' in cu,
+          "missing table block")
+    check("气泡渲染：显式链接 [文字](url) 剥成可点文字，裸 URL 不自动识别",
+          'Regex("\\\\[([^\\\\[\\\\]]*)\\\\]\\\\(([^\\\\s)]+)\\\\)")' in mk and "seg.link" in cu,
+          "missing inline link")
+    # LinkMovementMethod 会吞掉整个 TextView 的触摸，长按菜单（复制/分享/引用）跟着废
+    check("气泡渲染：只有压住链接才接管触摸（长按菜单不被 movement method 吞掉）",
+          "class LinkOnlyMovement" in cu and "getSpans(off, off, ClickableSpan::class.java)" in cu,
+          "missing link-only touch filter")
     # 思考块展开：收起只是折叠不是销毁，用户要能回看「它当时在想什么」
     check("思考块：收起时全文留在 ThinkRef 里（点击可展开回看）",
           "class ThinkRef" in cu and "toggleThinking" in cu
@@ -1688,6 +2061,7 @@ def main():
     al = src("AgentLoop.kt")
     cf = src("Config.kt")
     pt = src("PhoneTools.kt")
+    so = src("ScreenOutline.kt")
     pa = src("PhoneAccessibilityService.kt")
     check("轮数上限 24→48，到上限自动替用户说「继续」最多续 2 次（不再硬停晾任务）",
           "MAX_TURNS = 48" in cf and "MAX_CONTINUES = 2" in cf
@@ -1703,6 +2077,19 @@ def main():
     check("无效操作检测：动作前后大纲一致时给 screen_changed:false + 改道提示",
           "beforeActionOutline" in pt and "screen_changed" in pt and "warning" in pt,
           "missing unchanged signal")
+    check("零变化警告不再推荐「换序号点击」（WebView 页上正是这条在打转）",
+          "换用 phone_tap 的序号点击" not in pt and "phone_tap_at" in pt,
+          "warning text regressed")
+    check("答题页零变化降级为中性 note（大纲恒定，warning 会把模型逼疯）",
+          "quizPage" in pt and "答题页大纲恒定" in pt,
+          "missing quiz-page note")
+    check("学习通大纲带答题页工序卡（按包名挂，不带学术诚信字眼）",
+          "com.chaoxing" in so and "〔学习通答题页〕" in so
+          and "不必反复权衡" in so and "学术诚信" not in so,
+          "missing chaoxing hint")
+    check("WebView 窗口的坐标点按跳过 ACTION_CLICK 直接走真手势（学习通点不住的根因）",
+          "hasWebView" in pa and "webViewWindow" in pa and "GestureDescription" in pa,
+          "missing webview gesture routing")
     check("卡死检测口径三：连续几轮「有动作但界面零变化」先提醒再止损",
           "STALL_INEFFECTIVE_ROUNDS = 3" in cf and "ineffectiveRounds" in al
           and "STALL_INEFFECTIVE_NUDGE" in al,
@@ -2006,8 +2393,11 @@ def main():
         "search_parse_baidu_count", "search_parse_baidu_title", "search_parse_baidu_snippet",
         "search_parse_baidu_noise_dropped", "search_parse_baidu_keeps_jump_link",
         "search_parse_bing_count", "search_parse_bing_title", "search_parse_bing_snippet",
+        "search_parse_360_count", "search_parse_360_title", "search_parse_360_real_url_not_jump",
+        "search_parse_360_snippet",
         "search_unwrap_ddg", "search_fallback_ok", "search_fallback_engine",
-        "search_fallback_tried_all_engines", "search_query_encoded", "search_ddg_snippet",
+        "search_fallback_tried_all_engines", "search_query_encoded", "search_360_snippet",
+        "search_fallback_logged",
         "search_all_fail_code", "search_all_fail_tells_model_not_to_guess", "search_blank_query",
         "search_reads_large_page", "search_byte_budget_ge_2mb", "search_parses_hits_after_700kb",
         "search_fallback_reason", "html_escaped_tags_stripped", "html_truncated_tag_dropped", "align_tag_end", "align_tag_end_noop", "search_retry_after_verify", "search_verify_labeled",

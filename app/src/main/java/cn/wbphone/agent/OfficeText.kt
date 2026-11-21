@@ -61,27 +61,181 @@ object OfficeText {
 
     // ══ DOCX ══════════════════════════════════════════════
 
-    /** Word 正文段落 → Markdown。失败返回 null。 */
+    /** Word 正文 → Markdown。失败返回 null。 */
     fun docxToMarkdown(f: File): String? = try {
         ZipFile(f).use { z ->
             val entry = z.getEntry("word/document.xml") ?: return null
             val xml = z.getInputStream(entry).readBytes().toString(Charsets.UTF_8)
-            val paras = extractParagraphs(xml, "w:p", "w:t")
-            if (paras.all { it.isBlank() }) return null
-            val sb = StringBuilder("# ${f.name}\n\n")
-            for (p in paras) {
-                if (p.isBlank()) continue
-                // 约定俗成：全角方括号编号的行当小标题（用户文档里常见），其余为正文
-                if (p.length <= 30 && Regex("^[（(]?[一二三四五六七八九十0-9]+[）)、.:：]").containsMatchIn(p)) {
-                    sb.append("## $p\n\n")
+            val sb = StringBuilder()
+            var anyHeading = false   // 正文里出没出现过标题（决定要不要补文件名当 H1）
+            var anyText = false
+            // 按书写顺序逐块走。表格必须整块拿走——表格单元格里也是 w:p，逐段抠的
+            // 结果就是每个单元格变成一行，两列的封面表被排成一竖条（真机实录，
+            // 股票报告的封面表预览成了十几行互不相干的短句）。
+            var i = 0
+            // 代码段落连排时并进同一个 ``` 围栏，不逐段各开一个
+            var inFence = false
+            while (i < xml.length) {
+                val pOpen = nextOpen(xml, i, "w:p")
+                val tOpen = nextOpen(xml, i, "w:tbl")
+                if (pOpen < 0 && tOpen < 0) break
+                if (tOpen >= 0 && (pOpen < 0 || tOpen < pOpen)) {
+                    val tClose = xml.indexOf("</w:tbl>", tOpen)
+                    if (tClose < 0) break
+                    if (inFence) { sb.append("```\n\n"); inFence = false }
+                    sb.append(docxTable(xml.substring(tOpen, tClose + "</w:tbl>".length)))
+                    anyText = true
+                    i = tClose + "</w:tbl>".length
                 } else {
-                    sb.append(p).append("\n\n")
+                    val pClose = xml.indexOf("</w:p>", pOpen)
+                    if (pClose < 0) break
+                    val block = xml.substring(pOpen, pClose + "</w:p>".length)
+                    val p = docxParagraph(block)
+                    if (p.code) {
+                        if (!inFence) { sb.append("```\n"); inFence = true }
+                        sb.append(p.md)
+                        if (p.md.isNotEmpty()) anyText = true
+                    } else {
+                        if (inFence) { sb.append("```\n\n"); inFence = false }
+                        if (p.md.isNotEmpty()) {
+                            sb.append(p.md)
+                            anyText = true
+                            if (p.heading) anyHeading = true
+                        }
+                    }
+                    i = pClose + "</w:p>".length
                 }
             }
+            if (inFence) sb.append("```\n\n")
+            if (!anyText) return null
+            // 正文有自己的标题就不补文件名：顶栏已经有文件名了，正文再放一遍是重复
+            if (!anyHeading) sb.insert(0, "# ${f.name}\n\n")
             sb.toString().trimEnd() + "\n"
         }
     } catch (e: Exception) {
         null
+    }
+
+    /** 往后找某个标签的下一个开标签（`<tag>` 或 `<tag ...>`；`<w:pPr>` 不会误中 `<w:p`）。 */
+    private fun nextOpen(xml: String, from: Int, tag: String): Int {
+        val a = xml.indexOf("<$tag>", from)
+        val b = xml.indexOf("<$tag ", from)
+        return when {
+            a < 0 -> b
+            b < 0 -> a
+            else -> minOf(a, b)
+        }
+    }
+
+    /** 一个 w:p 块的解析结果：Markdown 片段、是不是标题、是不是代码段落。 */
+    private class Para(val md: String, val heading: Boolean, val code: Boolean)
+
+    /**
+     * 一个 w:p 块 → 解析结果。正文三级判断：显式标题样式（Heading1-3/Title）>
+     * 居中的短行（文档封面的大标题、副标题）> 约定俗成的编号行（「一、」「(二)」）。
+     * 项目符号段落转成 Markdown 列表。整段全等宽的段落转成代码围栏（附录源代码）。
+     */
+    private fun docxParagraph(block: String): Para {
+        if (isCodePara(block)) {
+            // 缩进与空行都原样保留（xml:space=preserve 写进去的段首空格还在）——
+            // 空行是代码的一部分，吞了它，围栏里的代码就不再是那门语言的样子
+            return Para(paraLines(block).joinToString("") { it + "\n" }, false, true)
+        }
+        val text = Regex("<w:t[ >].*?</w:t>", RegexOption.DOT_MATCHES_ALL)
+            .findAll(block)
+            .map { it.value.substringAfter('>').substringBeforeLast('<') }
+            .joinToString("")
+            .let { xmlUnescape(it) }
+            .trim()
+        if (text.isEmpty()) return Para("", false, false)
+        val pPr = Regex("<w:pPr>.*?</w:pPr>", RegexOption.DOT_MATCHES_ALL)
+            .find(block)?.value ?: ""
+        val style = Regex("w:pStyle w:val=\"([^\"]*)\"").find(pPr)?.groupValues?.get(1) ?: ""
+        val md = when {
+            // 内置标题样式：作者（我们自己的 DocxWriter、Word/WPS）都会用
+            style.matches(Regex("(Heading|标题)\\d?", RegexOption.IGNORE_CASE)) ->
+                (listOf("# ", "## ", "### ", "#### ").getOrElse(
+                    style.filter { it.isDigit() }.toIntOrNull()?.coerceIn(1, 3)?.minus(1) ?: 0
+                ) { "# " }) + text + "\n\n"
+            // 居中的短行是封面的标题/副标题，不是正文——拍成标题层级
+            pPr.contains("w:jc w:val=\"center\"") && text.length <= 40 ->
+                "## " + text + "\n\n"
+            // 项目符号段落 → Markdown 列表（渲染端有自己的列表块）
+            pPr.contains("<w:numPr") -> "- " + text + "\n"
+            // 没有样式信息的旧文档：编号行当小标题（用户文档里常见）
+            text.length <= 30 && Regex("^[（(]?[一二三四五六七八九十0-9]+[）)、.:：]").containsMatchIn(text) ->
+                "## $text\n\n"
+            else -> text + "\n\n"
+        }
+        val isHeading = md.startsWith("#") || md.startsWith("##")
+        return Para(md, isHeading, false)
+    }
+
+    /**
+     * 是不是代码段落：显式代码样式，或**所有带字的 run 都是等宽字体**（Consolas/
+     * Courier）。判「所有」是刻意的——正文里夹一小段 `行内代码` 的段落是普通正文，
+     * 整段都是代码（DocxWriter 的 code 块、python-docx 手搓的旧附录）才是代码。
+     */
+    private fun isCodePara(block: String): Boolean {
+        if (Regex("w:pStyle w:val=\"(?:Code|HTMLPreformatted)\"").find(block) != null) return true
+        var withText = 0
+        var mono = 0
+        for (m in Regex("<w:r[ >].*?</w:r>", RegexOption.DOT_MATCHES_ALL).findAll(block)) {
+            val r = m.value
+            val t = Regex("<w:t[ >].*?</w:t>", RegexOption.DOT_MATCHES_ALL).findAll(r)
+                .map { it.value.substringAfter('>').substringBeforeLast('<') }.joinToString("")
+            if (t.isEmpty()) continue
+            withText++
+            if (Regex("w:ascii=\"(?:Consolas|Courier|等宽)", RegexOption.IGNORE_CASE).find(r) != null) mono++
+        }
+        return withText > 0 && mono == withText ||
+            // 没有字的段落：带等宽 rPr 的算代码（code 块里的空行——rPr 在 run 上，
+            // 文字是空的）；纯 spacer（连 rPr 都没有）不算
+            withText == 0 &&
+                Regex("w:ascii=\"(?:Consolas|Courier)", RegexOption.IGNORE_CASE).find(block) != null
+    }
+
+    /** 段落 → 行列表：`<w:br/>` 是行界。代码块和带硬换行的段靠它保住分行。 */
+    private fun paraLines(block: String): List<String> {
+        val re = Regex("<w:t[ >].*?</w:t>|<w:br[^>]*/?>", RegexOption.DOT_MATCHES_ALL)
+        val lines = ArrayList<String>()
+        val cur = StringBuilder()
+        for (m in re.findAll(block)) {
+            val v = m.value
+            if (v.startsWith("<w:br")) { lines.add(cur.toString()); cur.setLength(0) }
+            else cur.append(v.substringAfter('>').substringBeforeLast('<'))
+        }
+        lines.add(cur.toString())
+        return lines.map { xmlUnescape(it) }
+    }
+
+    /** 一个 w:tbl 块 → Markdown 管道表。行/列都按 XML 实际结构，空单元格用空串占位保住列对齐。 */
+    private fun docxTable(tbl: String): String {
+        val rows = ArrayList<List<String>>()
+        for (tr in Regex("<w:tr[ >].*?</w:tr>", RegexOption.DOT_MATCHES_ALL).findAll(tbl)) {
+            val cells = ArrayList<String>()
+            for (tc in Regex("<w:tc[ >].*?</w:tc>", RegexOption.DOT_MATCHES_ALL).findAll(tr.value)) {
+                val text = Regex("<w:t[ >].*?</w:t>", RegexOption.DOT_MATCHES_ALL)
+                    .findAll(tc.value)
+                    .map { it.value.substringAfter('>').substringBeforeLast('<') }
+                    .joinToString("")
+                    .let { xmlUnescape(it).replace("\n", " ").replace("|", "\\|").trim() }
+                    .take(160)
+                cells.add(text)
+            }
+            if (cells.isNotEmpty()) rows.add(cells)
+        }
+        if (rows.isEmpty()) return ""
+        val width = rows.maxOf { it.size }
+        val pad = { r: List<String> -> List(width) { r.getOrNull(it) ?: "" } }
+        val sb = StringBuilder("\n")
+        // 只有表头一行就没有「表」的必要，直接一行加粗；多行才是真表格
+        if (rows.size == 1) return "\n**" + pad(rows[0]).joinToString(" · ") + "**\n\n"
+        sb.append("| ").append(pad(rows[0]).joinToString(" | ")).append(" |\n")
+        sb.append("|").append(List(width) { " --- " }.joinToString("|")).append("|\n")
+        for (r in rows.drop(1)) sb.append("| ").append(pad(r).joinToString(" | ")).append(" |\n")
+        sb.append("\n")
+        return sb.toString()
     }
 
     // ══ XLSX ═══════════════════════════════════════════════

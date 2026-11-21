@@ -111,6 +111,8 @@ object AgentHost {
             // 引擎常驻注入（isPyOn 挡住开关），status/下载由引擎自己管。
             pyEngine = PyRuntime(appContext, workDir()),
             pyEnabled = { isPyOn() },
+            // 搜索降级链路写进运行日志（「为什么这次全是必应」只能靠这一行回答）
+            logger = { log(it) },
         )
 
         toolbox = PhoneToolbox(
@@ -311,7 +313,15 @@ object AgentHost {
             // 人情味开关：开着就带语气段，关了整段不出现（不是留个「语气：正常」占位）。
             // 每次请求现取——设置里一拨，下一条消息就生效，不用重建会话。
             if (settings?.emotionOn == true) PhonePrompt.WARM_TONE else ""
-        }, owner = id)
+        }, owner = id, saveNote = { name, text ->
+            // 图说全文落盘：消息里只挂前几百字，压缩后靠这个路径 fs_read 拿回细节。
+            // 写失败不抛——落不了盘只是少一份备份，图说本身还挂在消息里。
+            runCatching {
+                val dir = java.io.File(workDir(), "images").apply { mkdirs() }
+                java.io.File(dir, name).writeText(text)
+                "images/" + name
+            }.getOrNull()
+        })
         runCatching { sessions.load(id) }?.getOrNull()?.let { saved ->
             if (saved.length() > 0) l.restoreHistory(saved)
         }
@@ -331,8 +341,21 @@ object AgentHost {
         runtimes.filterValues { it.busy }.keys.toSet()
     }
 
-    /** 跑一个任务。阻塞，内部自己切线程；不同会话可以同时各跑各的。 */
-    fun ask(text: String, listener: AgentLoop.Listener, images: List<String>? = null) {
+    /**
+     * 跑一个任务。阻塞，内部自己切线程；不同会话可以同时各跑各的。
+     *
+     * [displayText] 是界面上那条用户气泡的原文；带文件附件时 [text] 是含文件正文的
+     * payload（给模型的），流水账里记 payload 会把整份文件画成用户的话——
+     * 恢复会话、导出流水账都按 displayText 来。
+     * [photoFiles] 是这次附带照片落盘后的文件名（filesDir/photos/ 下），流水账按名回显。
+     */
+    fun ask(
+        text: String,
+        listener: AgentLoop.Listener,
+        images: List<String>? = null,
+        displayText: String? = null,
+        photoFiles: List<String> = emptyList(),
+    ) {
         val rt = currentRuntime()
         if (rt.busy) {
             listener.onError("这个会话还有任务在跑，先等它结束、点停止，或者开个新会话并行")
@@ -347,7 +370,7 @@ object AgentHost {
         FloatStatus.taskStart(appContext, rt.id)
         setState(State.RUNNING, "执行中")
         // 流水账先记下用户说了什么：模型上下文怎么压缩、截断，这里都是完整原文
-        Transcript.append(appContext, rt.id, TranscriptText.user(text, !images.isNullOrEmpty()))
+        Transcript.append(appContext, rt.id, TranscriptText.user(displayText ?: text, !images.isNullOrEmpty(), photoFiles))
         // 任务临开始前再看一眼：上一句话之后可能刚被系统摘掉开关。
         A11yKeeper.check(appContext, force = true)
         worker.execute {
@@ -379,9 +402,6 @@ object AgentHost {
 
     /** 包一层，把 onFinished/onError 也同步到宿主状态上；带会话身份（token 用量是按会话算的）。 */
     private fun inner(rt: Runtime, t: AgentLoop.Listener) = object : AgentLoop.Listener {
-        /** onToolStart 记下的参数，onToolEnd 写流水账时合进去。 */
-        private var lastToolArgs = ""
-        private var lastToolName = ""
 
         override fun onText(delta: String) {
             // 模型在吐字 = 在回答。悬浮窗只认状态不认内容，同一句话不会重复刷。
@@ -397,8 +417,6 @@ object AgentHost {
         }
         override fun onToolStart(name: String, args: JSONObject) {
             log("→ $name ${args.toString().take(120)}")
-            lastToolName = name
-            lastToolArgs = args.toString()
             FloatStatus.status(appContext, FloatStatus.toolStatus(name))
             t.onToolStart(name, args)
         }
@@ -412,14 +430,15 @@ object AgentHost {
             t.onSubProgress(note)
         }
 
-        override fun onToolEnd(name: String, result: String, ok: Boolean) {
+        override fun onToolEnd(name: String, args: JSONObject, result: String, ok: Boolean) {
             log("← $name ${if (ok) "完成" else "失败"} ${result.length}字")
             // 流水账：压缩和截断动不到这里，事后想查「它当时点了哪儿、结果如何」全靠这份。
+            // args 随调用带来——并行执行时 start/end 会交错，不能靠「最后一次 start」猜归属。
             Transcript.append(
                 appContext, rt.id,
-                TranscriptText.tool(name, lastToolArgs, ok, result)
+                TranscriptText.tool(name, args.toString(), ok, result)
             )
-            t.onToolEnd(name, result, ok)
+            t.onToolEnd(name, args, result, ok)
         }
 
         override fun onImage(dataUrl: String) {
@@ -677,12 +696,20 @@ object AgentHost {
     }
 
     /** 删会话。正在跑任务的会话不能删（任务还在往里写），删了返回 false。 */
-    fun deleteSession(id: String): Boolean {        if (isBusy(id)) {
+    fun deleteSession(id: String): Boolean {
+        if (isBusy(id)) {
             log("会话 $id 有任务在跑，不能删")
             return false
         }
         sessions.delete(id)
         Transcript.delete(appContext, id)
+        // 随会话落盘的照片一起清（文件名以会话 id 开头，见 MainActivity.savePhotoFiles）
+        runCatching {
+            val photos = File(appContext.filesDir, "photos")
+            photos.listFiles()?.forEach { f ->
+                if (f.name.startsWith("$id-")) f.delete()
+            }
+        }
         synchronized(runtimeLock) { runtimes.remove(id) }
         if (id == currentSessionId()) setCurrentSession(null)
         log("已删除会话 $id")
