@@ -4,9 +4,13 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
@@ -119,7 +123,7 @@ class ChatUi(
     private lateinit var plusButton: TextView
 
     /** 输入条里的麦克风：点一下开始听，再点一下结束。 */
-    private lateinit var micButton: TextView
+    private lateinit var micButton: MicIconView
 
     /** 轮末的朗读按钮 + 是否在念（文案在「朗读/停止」之间切）。 */
     private var speakChip: TextView? = null
@@ -325,8 +329,7 @@ class ChatUi(
         inputRow.background = Ui.solid(act, Ui.GLASS, 28, Ui.GLASS_LINE, 1)
 
         // ＋：展开附件底栏（拍照 / 相册 / 文件）。展开时变成 ✕，再点收起。
-        // 字号故意放大：44dp 的格子里 16f 的「＋」小得像标点，撑不满自己的格子。
-        plusButton = Ui.text(act, "＋", 22f, Ui.INK).apply {
+        plusButton = Ui.text(act, "＋", 24f, Ui.INK).apply {
             gravity = Gravity.CENTER
             contentDescription = "添加附件"
             background = Ui.solid(act, Ui.GLASS_SOFT, 19)
@@ -352,8 +355,8 @@ class ChatUi(
         inputRow.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         // 麦克风：语音输入。放在输入框和发送键之间，手指够得到、不挤输入区。
-        micButton = Ui.text(act, "🎤", 15f, Ui.INK2).apply {
-            gravity = Gravity.CENTER
+        // 图标是 Canvas 描边话筒——emoji 版是彩色位图，跟白灰底条完全不搭（真机反馈）
+        micButton = MicIconView(act).apply {
             contentDescription = "语音输入"
             background = Ui.solid(act, Ui.GLASS_SOFT, 19)
             setOnClickListener { onVoice() }
@@ -511,10 +514,9 @@ class ChatUi(
 
     // ------------------------------------------------------------ 语音
 
-    /** 麦克风状态：在听时按钮变实心、提示文案换掉，用户一眼知道它在听。 */
+    /** 麦克风状态：在听时图标换停字块、底变实心品牌色，用户一眼知道它在听。 */
     fun setListening(on: Boolean) {
-        micButton.text = if (on) "■" else "🎤"
-        micButton.setTextColor(if (on) Color.WHITE else Ui.INK2)
+        micButton.listening = on
         micButton.background = if (on) Ui.circle(act, Ui.BRAND, 19) else Ui.solid(act, Ui.GLASS_SOFT, 19)
         input.hint = if (on) "正在听…说完点 ■" else "给月溯发消息…"
     }
@@ -1956,5 +1958,63 @@ class ChatUi(
 
     companion object {
         private const val HINT = "它会在动手前先读屏 · 付款、密码这类操作会先问你"
+    }
+}
+
+/**
+ * 语音输入键的图标：Canvas 手绘的描边话筒（对照 Muse 截图定的稿）。
+ * 为什么不用 emoji 话筒：那是彩色位图，跟输入条的白灰底不搭，大小也钉死在字体上。
+ * 待机画描边话筒（胶囊 + 弧形支架 + 竖杆 + 底座）；录音中画白色实心停字块。
+ * 24×24 的名义坐标盒，实际按 View 尺寸等比缩放，任何分辨率都锐利。
+ */
+private class MicIconView(context: Context) : View(context) {
+
+    /** 在听中：图标换停字块。set() 里 invalidate 驱动重画。 */
+    var listening: Boolean = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onDraw(c: Canvas) {
+        val color = if (listening) Color.WHITE else Ui.INK2
+        stroke.color = color
+        fill.color = color
+        val cx = width / 2f
+        val cy = height / 2f
+        if (listening) {
+            // 录音中：实心圆角小方块 = 停
+            val s = width * 8f / 30f
+            c.drawRoundRect(cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2,
+                s / 4f, s / 4f, fill)
+            return
+        }
+        // 名义坐标盒 24，但按 30 等分缩放：图标只占按钮的 80%，四周留白，
+        // 和「+」「↑」的视觉分量一致——画满 44dp 会顶到边，看着很挤（真机反馈）
+        val u = width / 30f
+        stroke.strokeWidth = 1.6f * u
+        // 图标在盒里实际占 y=4..19.5（视觉中心 11.75u）——直接从盒顶画会整体偏上，
+        // 先把视觉中心对齐到按钮中心再落笔（真机反馈：看着不在正中间）
+        val yOff = cy - 11.75f * u
+        // 胶囊：宽 7 高 10，顶在 y=4
+        val r = 3.5f * u
+        val left = cx - r
+        val top = 4f * u + yOff
+        val bottom = 14f * u + yOff
+        c.drawRoundRect(left, top, left + 7 * u, bottom, r, r, stroke)
+        // 弧形支架：圆心 (cx, 11u) 半径 5.5u 的下半圆（从右侧 0° 扫到 180°）
+        val arc = Path()
+        arc.addArc(cx - 5.5f * u, 5.5f * u + yOff, cx + 5.5f * u, 16.5f * u + yOff, 0f, 180f)
+        c.drawPath(arc, stroke)
+        // 竖杆 + 底座
+        c.drawLine(cx, 16.5f * u + yOff, cx, 19.5f * u + yOff, stroke)
+        c.drawLine(cx - 3.5f * u, 19.5f * u + yOff, cx + 3.5f * u, 19.5f * u + yOff, stroke)
     }
 }

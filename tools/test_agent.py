@@ -2007,8 +2007,9 @@ def main():
     check("语音朗读：引擎/语音包缺失时说人话",
           "没有可用的语音引擎" in vo and "中文语音包" in vo,
           "missing tts fallback message")
-    check("语音接线：麦克风按钮 + 朗读按钮 + 轮末自动朗读",
-          '"🎤"' in cu and "fun setListening" in cu and "🔊 朗读" in cu
+    check("语音接线：麦克风按钮（Canvas 描边话筒，不用 emoji 🎤）+ 朗读按钮 + 轮末自动朗读",
+          "class MicIconView" in cu and "micButton.listening = on" in cu
+          and "🎤" not in cu and "fun setListening" in cu and "🔊 朗读" in cu
           and "settings.voiceOn" in ma and "speakAnswer" in ma,
           "missing voice wiring")
     # 清单不在 SRC 目录下，单独读一次
