@@ -2041,8 +2041,8 @@ private class PlusIconView(context: Context) : View(context) {
 
     override fun onDraw(c: Canvas) {
         p.color = Ui.INK
-        p.strokeWidth = width * 2f / 30f
-        val half = width * 8f / 30f
+        p.strokeWidth = width * 1.7f / 30f
+        val half = width * 5.5f / 30f
         val cx = width / 2f
         val cy = height / 2f
         if (!open) {
