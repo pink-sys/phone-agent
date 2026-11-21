@@ -94,8 +94,8 @@ def write_secrets(dest=SECRETS_KT, enabled=True):
 PKG = "cn.wbphone.agent"
 MIN_SDK = "26"
 TARGET_SDK = "34"
-VERSION_CODE = "49"
-VERSION_NAME = "1.5.5"
+VERSION_CODE = "50"
+VERSION_NAME = "1.5.6"
 
 
 def die(msg):
